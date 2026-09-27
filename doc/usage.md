@@ -298,6 +298,13 @@ python3 scripts/nvx.py run
     [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]
     [--net IPV4/PREFIX]
     [--network-profile {portable}]
+    [--network-egress {allow,deny}]
+    [--network-ingress {allow,deny}]
+    [--network-egress-allow CIDR[:PROTOCOL:PORT]]...
+    [--network-egress-deny CIDR[:PROTOCOL:PORT]]...
+    [--host-loopback {allow,deny}]
+    [--network-proxy IPV4:TCP-PORT]
+    [--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT]...
     [--cmdline TEXT]
     [--restore-snapshot PATH]
     [--restore-processors {1,2,4,8}]
@@ -317,6 +324,13 @@ python3 scripts/nvx.py run
 | `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Expose one host directory to the absolute guest target. Active snapshot restore requires the same canonical path, target, and mode; a dormant-slot restore may attach a new mapping that the resumed guest mounts explicitly. |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with the static guest IPv4 address and prefix. |
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
+| `--network-egress {allow,deny}` | `allow` | Set the default guest egress policy. |
+| `--network-ingress {allow,deny}` | `deny` | Set the default host ingress policy. |
+| `--network-egress-allow CIDR[:PROTOCOL:PORT]` | none | Allow matching guest egress; repeat to add rules. |
+| `--network-egress-deny CIDR[:PROTOCOL:PORT]` | none | Deny matching guest egress; repeat to add rules. Deny rules take precedence. |
+| `--host-loopback {allow,deny}` | existing mapping | Control guest access to host loopback services. |
+| `--network-proxy IPV4:TCP-PORT` | none | Allow one explicit host TCP proxy endpoint. |
+| `--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT` | none | Publish one TCP or UDP localhost port to the guest; repeat to add forwards. |
 | `--cmdline TEXT` | empty | Append kernel parameters; `nvx_*` and `tsc=` tokens are reserved. |
 | `--restore-snapshot PATH` | none | Restore the immutable machine contract and saved state from a snapshot directory. |
 | `--restore-processors {1,2,4,8}` | none | Bring this contiguous processor prefix online before restore readiness. Requires an opt-in microVM snapshot and cannot exceed `--processors` capacity. |
