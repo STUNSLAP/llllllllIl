@@ -51,7 +51,7 @@ from nvx_tools.build_constants import (
     BuildConstants,
     OpenVMMBuildConstants,
 )
-from nvx_tools.common import ScriptError
+from nvx_tools.common import ScriptError, require_tool
 from nvx_tools.release import verify_source_tree
 
 COPILOT_CREDIT_RESERVATION = 30
@@ -191,13 +191,11 @@ class CopilotController:
         model: str | None,
         credit_budget: int,
     ) -> None:
-        executable = shutil.which("copilot")
-        if executable is None:
-            raise ScriptError(
-                "Copilot CLI is required but was not found on PATH; "
-                "install and authenticate it before running the campaign"
-            )
-        self._executable = executable
+        self._executable = require_tool(
+            "copilot",
+            "Copilot CLI is required but was not found on PATH; "
+            "install and authenticate it before running the campaign",
+        )
         self._run_dir = run_dir.resolve()
         self._work_dir = self._run_dir / "controller"
         self._work_dir.mkdir(parents=True, exist_ok=False)
