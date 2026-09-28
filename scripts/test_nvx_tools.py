@@ -7623,7 +7623,7 @@ class ReleaseTests(unittest.TestCase):
                 ),
                 patch.object(
                     release,
-                    "_openvmm_git_state",
+                    "openvmm_git_state",
                     return_value=(revision, True),
                 ),
                 patch("sys.stderr", stderr),
@@ -7694,7 +7694,7 @@ class ReleaseTests(unittest.TestCase):
             with (
                 patch.object(
                     release,
-                    "_openvmm_git_state",
+                    "openvmm_git_state",
                     return_value=(revision, False),
                 ),
                 self.assertRaisesRegex(
@@ -7884,7 +7884,7 @@ class ReleaseTests(unittest.TestCase):
                     ),
                     patch.object(
                         release,
-                        "_openvmm_git_state",
+                        "openvmm_git_state",
                         return_value=(revision, True),
                     ),
                     patch("sys.stderr", io.StringIO()),
@@ -7947,7 +7947,7 @@ class ReleaseTests(unittest.TestCase):
                 ),
                 patch.object(
                     release,
-                    "_openvmm_git_state",
+                    "openvmm_git_state",
                     return_value=(revision, True),
                 ),
                 patch.object(

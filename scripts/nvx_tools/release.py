@@ -48,9 +48,8 @@ from .common import (
     credential_safe_opener,
     download,
     openvmm_binary_path,
+    openvmm_git_state,
     require_file,
-    require_success,
-    run_capture,
     sha256_file,
     verify_sha256_sums,
     write_sha256_sums,
@@ -836,34 +835,12 @@ def _read_json_object(path: Path, description: str) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def _openvmm_git_state() -> tuple[str, bool]:
-    head = run_capture(
-        ["git", "-C", OpenVMMBuildConstants.DIRECTORY, "rev-parse", "HEAD"]
-    )
-    require_success(head, "OpenVMM revision query")
-    gitlink = run_capture(
-        ["git", "-C", BuildConstants.REPO_ROOT, "rev-parse", ":openvmm"]
-    )
-    require_success(gitlink, "OpenVMM gitlink query")
-    status = run_capture(
-        ["git", "-C", OpenVMMBuildConstants.DIRECTORY, "status", "--porcelain"]
-    )
-    require_success(status, "OpenVMM status query")
-    revision = head.stdout.decode("ascii").strip()
-    expected_revision = gitlink.stdout.decode("ascii").strip()
-    if revision != expected_revision:
-        raise ScriptError(
-            f"OpenVMM submodule is at {revision}, expected {expected_revision}"
-        )
-    return revision, not status.stdout.strip()
-
-
 def _validate_openvmm_provenance(
     binary: Path,
     provenance_path: Path,
 ) -> dict[str, object]:
     provenance = _read_json_object(provenance_path, "OpenVMM build provenance")
-    revision, source_clean = _openvmm_git_state()
+    revision, source_clean = openvmm_git_state(OpenVMMBuildConstants.DIRECTORY)
     if (
         provenance.get("format") != OpenVMMBuildConstants.PROVENANCE_FORMAT
         or provenance.get("source_revision") != revision
