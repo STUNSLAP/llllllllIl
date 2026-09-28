@@ -296,6 +296,7 @@ python3 scripts/nvx.py run
     [--memory-capacity-mib MIB]
     [--processors {1,2,4,8}]
     [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]
+    [--mount-deny HOST_PATH]...
     [--net IPV4/PREFIX]
     [--network-profile {portable}]
     [--network-egress {allow,deny}]
@@ -322,6 +323,7 @@ python3 scripts/nvx.py run
 | `--memory-capacity-mib MIB` | none | Reserve an immutable, 128 MiB-aligned RAM capacity for a fresh microVM snapshot. |
 | `--processors {1,2,4,8}` | `1` | Select the microVM processor count. |
 | `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Expose one host directory to the absolute guest target. Active snapshot restore requires the same canonical path, target, and mode; a dormant-slot restore may attach a new mapping that the resumed guest mounts explicitly. |
+| `--mount-deny HOST_PATH` | none | Hide one existing file or directory inside the mounted host root; repeat to deny multiple paths. |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with the static guest IPv4 address and prefix. |
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
 | `--network-egress {allow,deny}` | `allow` | Set the default guest egress policy. |
