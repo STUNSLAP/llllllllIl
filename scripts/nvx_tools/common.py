@@ -102,6 +102,24 @@ def run_capture(
     return CommandResult(command, result.returncode, result.stdout, result.stderr)
 
 
+def openvmm_git_state(directory: Path) -> tuple[str, bool]:
+    head = run_capture(["git", "-C", directory, "rev-parse", "HEAD"])
+    require_success(head, "OpenVMM revision query")
+    gitlink = run_capture(
+        ["git", "-C", BuildConstants.REPO_ROOT, "rev-parse", ":openvmm"]
+    )
+    require_success(gitlink, "OpenVMM gitlink query")
+    status = run_capture(["git", "-C", directory, "status", "--porcelain"])
+    require_success(status, "OpenVMM status query")
+    revision = head.stdout.decode("ascii").strip()
+    expected_revision = gitlink.stdout.decode("ascii").strip()
+    if revision != expected_revision:
+        raise ScriptError(
+            f"OpenVMM submodule is at {revision}, expected {expected_revision}"
+        )
+    return revision, not status.stdout.strip()
+
+
 def require_file(path: Path, description: str) -> Path:
     if not path.is_file():
         raise ScriptError(f"{description} not found: {path}")
