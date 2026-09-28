@@ -7305,7 +7305,7 @@ class ReleaseTests(unittest.TestCase):
         response = io.BytesIO(json.dumps(releases).encode("utf-8"))
 
         with patch(
-            "nvx_tools.release.urllib.request.urlopen",
+            "nvx_tools.release.urllib.request.OpenerDirector.open",
             return_value=response,
         ):
             asset = release._latest_release_asset(
@@ -7333,7 +7333,10 @@ class ReleaseTests(unittest.TestCase):
         )
 
         with (
-            patch("nvx_tools.release.urllib.request.urlopen", side_effect=error),
+            patch(
+                "nvx_tools.release.urllib.request.OpenerDirector.open",
+                side_effect=error,
+            ),
             self.assertRaises(release.ScriptError) as context,
         ):
             release._latest_release_asset("example/nvx", "linux-kvm", "token")
@@ -7353,7 +7356,10 @@ class ReleaseTests(unittest.TestCase):
         )
 
         with (
-            patch("nvx_tools.release.urllib.request.urlopen", side_effect=error),
+            patch(
+                "nvx_tools.release.urllib.request.OpenerDirector.open",
+                side_effect=error,
+            ),
             self.assertRaisesRegex(release.ScriptError, "set GH_TOKEN"),
         ):
             release._latest_release_asset("example/nvx", "linux-kvm", None)
@@ -7370,7 +7376,10 @@ class ReleaseTests(unittest.TestCase):
         )
 
         with (
-            patch("nvx_tools.release.urllib.request.urlopen", side_effect=error),
+            patch(
+                "nvx_tools.release.urllib.request.OpenerDirector.open",
+                side_effect=error,
+            ),
             self.assertRaisesRegex(release.ScriptError, "rate limit is exhausted"),
         ):
             release._latest_release_asset("example/nvx", "linux-kvm", "token")
@@ -7407,9 +7416,9 @@ class ReleaseTests(unittest.TestCase):
 
         with (
             patch(
-                "nvx_tools.release.urllib.request.urlopen",
+                "nvx_tools.release.urllib.request.OpenerDirector.open",
                 side_effect=[error, public_response],
-            ) as urlopen,
+            ) as opener_open,
             patch("sys.stderr", io.StringIO()) as stderr,
         ):
             asset, download_token = release._latest_release_asset_with_fallback(
@@ -7418,9 +7427,9 @@ class ReleaseTests(unittest.TestCase):
                 "token",
             )
 
-        self.assertEqual(urlopen.call_count, 2)
-        authenticated_request = urlopen.call_args_list[0].args[0]
-        public_request = urlopen.call_args_list[1].args[0]
+        self.assertEqual(opener_open.call_count, 2)
+        authenticated_request = opener_open.call_args_list[0].args[0]
+        public_request = opener_open.call_args_list[1].args[0]
         self.assertIsNotNone(authenticated_request.get_header("Authorization"))
         self.assertIsNone(public_request.get_header("Authorization"))
         self.assertEqual(asset.tag, "v1.2.3")
