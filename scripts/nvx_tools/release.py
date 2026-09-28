@@ -173,7 +173,7 @@ def _latest_release_asset(
         headers=_github_headers(token, "application/vnd.github+json"),
     )
     try:
-        with urllib.request.urlopen(request) as response:
+        with credential_safe_opener().open(request) as response:
             releases: object = json.load(response)
     except urllib.error.HTTPError as error:
         message = _github_error_message(error)
