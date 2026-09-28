@@ -428,9 +428,11 @@ contract remains backend-independent:
 
 MSHV creates application processors lazily while binding their VP runners, so
 discarding suffix binders before that boundary avoids creating processors that
-this restore will not run. KVM and WHP deliberately retain their existing
-full-capacity construction path, including when an explicit online target is
-sent to the guest.
+this restore will not run. Restored-TSC alignment on MSHV therefore covers only
+the created VPs; the hypervisor rejects register access to a VP that was never
+created. KVM and WHP deliberately retain their existing full-capacity
+construction path, including when an explicit online target is sent to the
+guest.
 
 Saved state remains authoritative despite the narrower MSHV runtime. Before
 filtering, restore requires exactly one VP state entry for every index in
@@ -554,12 +556,13 @@ KVM advances each VP's TSC through its TSC offset rather than a counter write,
 because KVM can discard a sub-second counter write as a synchronization
 attempt; a host without TSC-offset control fails restore explicitly. KVM also
 saves and restores the paravirtual-clock MSRs exactly. For restored SMP on
-MSHV and WHP, partition time is frozen while VP counters are aligned before
-execution, avoiding skew introduced by sequential host register writes. WHP
-additionally uses a partition-reference-time-based TSC model for restored SMP
-timestamp reads, including `RDTSC`/`RDTSCP` and TSC MSR reads. An intentional
-guest TSC adjustment returns that VP to its guest-programmed hardware counter.
-This backend repair is not general cross-host TSC-frequency conversion.
+MSHV and WHP, partition time is frozen while the instantiated VP counters are
+aligned before execution, avoiding skew introduced by sequential host register
+writes. WHP additionally uses a partition-reference-time-based TSC model for
+restored SMP timestamp reads, including `RDTSC`/`RDTSCP` and TSC MSR reads. An
+intentional guest TSC adjustment returns that VP to its guest-programmed
+hardware counter. This backend repair is not general cross-host TSC-frequency
+conversion.
 
 Replaying a snapshot also replays the guest's in-memory random-number-generator
 state. Tiered restore, processor activation, and an explicit RAM target each
