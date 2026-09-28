@@ -1521,7 +1521,7 @@ class CopilotContainmentTests(unittest.TestCase):
     def test_missing_copilot_is_a_preflight_failure(self) -> None:
         with (
             tempfile.TemporaryDirectory() as temporary,
-            patch("nvx_tools.adversarial.shutil.which", return_value=None),
+            patch("nvx_tools.common.shutil.which", return_value=None),
         ):
             with self.assertRaisesRegex(ScriptError, "required"):
                 CopilotController(
@@ -1533,7 +1533,7 @@ class CopilotContainmentTests(unittest.TestCase):
     def test_copilot_smoke_rejects_boolean_schema_version(self) -> None:
         with (
             tempfile.TemporaryDirectory() as temporary,
-            patch("nvx_tools.adversarial.shutil.which", return_value="copilot"),
+            patch("nvx_tools.common.shutil.which", return_value="copilot"),
             patch.object(
                 CopilotController,
                 "_version",
@@ -1851,7 +1851,7 @@ class CopilotContainmentTests(unittest.TestCase):
         ) as temporary:
             relative_run_dir = Path(temporary).relative_to(Path.cwd())
             with (
-                patch("nvx_tools.adversarial.shutil.which", return_value="copilot"),
+                patch("nvx_tools.common.shutil.which", return_value="copilot"),
                 patch.object(
                     CopilotController,
                     "_version",
@@ -1958,7 +1958,7 @@ class CopilotContainmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with (
-                patch("nvx_tools.adversarial.shutil.which", return_value="copilot"),
+                patch("nvx_tools.common.shutil.which", return_value="copilot"),
                 patch.object(
                     CopilotController,
                     "_version",
