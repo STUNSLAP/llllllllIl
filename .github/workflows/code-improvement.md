@@ -21,7 +21,7 @@ engine:
   id: copilot
   version: "1.0.86"
 model: gpt-5.6-sol-fast
-max-turns: 50
+max-turns: 100
 timeout-minutes: 60
 concurrency: code-improvement
 sandbox:
