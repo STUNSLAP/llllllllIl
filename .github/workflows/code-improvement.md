@@ -520,6 +520,11 @@ Choose exactly one of these mutually exclusive scopes:
 2. **One named improvement category.** Use exactly one of:
    `code-quality`, `documentation`, `deduplication`, or `reusability`.
 
+Only consider candidates whose complete implementation and focused tests are
+covered by `create-pull-request.allowed-files`. Explicitly exclude
+`.github/specula/**`: do not inspect it for candidates, select a failing check
+rooted there, or propose changes to it.
+
 For category selection, examine the cache's recent selections. Give each viable
 category weight `1 + min(4, runs since it was last selected)`; an unseen
 category has weight 5. Set the weight to zero when there is no specific viable
@@ -604,6 +609,8 @@ and concise reason. Never create activity merely to avoid a no-op.
 - **DO NOT** modify `openvmm/`, initialize or inspect its private contents,
   update the `openvmm` gitlink, edit `.gitmodules`, or make a nested-repository
   change.
+- **DO NOT** modify `.github/specula/**`; Specula is outside this workflow's
+  candidate scope.
 - **DO NOT** modify dependency or source manifests, lock files, CI workflows or
   actions, agent instructions, prompts, skills, security policy, licenses,
   release/version files, kernel inputs, performance baselines, generated files,
