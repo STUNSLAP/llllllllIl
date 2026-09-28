@@ -38,6 +38,46 @@ def _posix_shell() -> str | None:
     return shell
 
 
+def _vp_binding_profile(vp_indices: list[int]) -> bytes:
+    fields = "duration_ns=1 process_elapsed_ns=2 pid=3"
+    phases = [
+        "vp_bind_bsp" if index == 0 else f"vp_bind_ap_{index}" for index in vp_indices
+    ]
+    lines = [
+        f"OPENVMM_SNAPSHOT_PROFILE_V1 operation=startup phase={phase} "
+        f"exclusive=0 {fields}"
+        for phase in phases
+    ]
+    lines.append(
+        "OPENVMM_SNAPSHOT_PROFILE_V1 operation=startup phase=vp_thread_bind "
+        f"exclusive=1 {fields}"
+    )
+    return "".join(f"{line}\r\n" for line in lines).encode()
+
+
+def _restore_target(command: list[str]) -> int | None:
+    if "--restore-processors" not in command:
+        return None
+    return int(command[command.index("--restore-processors") + 1])
+
+
+def _restore_processors_measure(
+    backend: str,
+    *,
+    mshv_prefix: bool = True,
+) -> MagicMock:
+    def measure(command: list[str], **kwargs: object) -> None:
+        target = _restore_target(command)
+        vp_count = 8
+        if mshv_prefix and backend == "mshv" and target is not None:
+            vp_count = target
+        log_path = cast(Path, kwargs["log_path"])
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_bytes(_vp_binding_profile(list(range(vp_count))))
+
+    return MagicMock(side_effect=measure)
+
+
 class MicrovmTestParserTests(unittest.TestCase):
     def test_parser_defaults_to_all_correctness_scenarios(self):
         args = nvx.parse_args(["test-microvm", "--backend", "mshv"])
@@ -1660,6 +1700,7 @@ class MicrovmTests(unittest.TestCase):
     def test_restore_processors_uses_capacity_eight_and_each_target(self):
         with tempfile.TemporaryDirectory() as temporary:
             output_dir = Path(temporary) / "logs"
+            measure_once = _restore_processors_measure("mshv")
             with (
                 patch.object(
                     microvm_tests,
@@ -1667,7 +1708,7 @@ class MicrovmTests(unittest.TestCase):
                     return_value=["openvmm", "boot"],
                 ) as workload_boot_command,
                 patch.object(microvm_tests, "capture_snapshot") as capture_snapshot,
-                patch.object(microvm_tests, "measure_once") as measure_once,
+                patch.object(microvm_tests, "measure_once", measure_once),
                 patch.object(
                     microvm_tests,
                     "_snapshot_fingerprint",
@@ -1684,18 +1725,29 @@ class MicrovmTests(unittest.TestCase):
                     timeout=60,
                     output_dir=output_dir,
                 )
+            logs = sorted(path.name for path in output_dir.iterdir())
 
         self.assertEqual(workload_boot_command.call_args.kwargs["processors"], 8)
         self.assertEqual(
             workload_boot_command.call_args.args[5], "quiet loglevel=0 maxcpus=1"
         )
         self.assertEqual(capture_snapshot.call_args.kwargs["processors"], 1)
-        self.assertEqual(measure_once.call_count, 4)
+        self.assertEqual(measure_once.call_count, 5)
         self.assertTrue(
             all(
                 entry.kwargs["guest_exit_prequeued"]
                 for entry in measure_once.call_args_list
             )
+        )
+        self.assertTrue(
+            all(
+                entry.kwargs["environment"][benchmark.SNAPSHOT_PROFILE_ENV] == "1"
+                for entry in measure_once.call_args_list
+            )
+        )
+        self.assertEqual(
+            [_restore_target(entry.args[0]) for entry in measure_once.call_args_list],
+            [1, 2, 4, 8, None],
         )
         self.assertEqual(
             [entry.kwargs["marker"] for entry in measure_once.call_args_list],
@@ -1704,16 +1756,139 @@ class MicrovmTests(unittest.TestCase):
                 b"NVX-RESTORE-PROCESSORS-OK count=2",
                 b"NVX-RESTORE-PROCESSORS-OK count=4",
                 b"NVX-RESTORE-PROCESSORS-OK count=8",
+                b"NVX-RESTORE-PROCESSORS-OK count=1",
             ],
         )
+        self.assertEqual(
+            logs,
+            [
+                "restore-processors-1.log",
+                "restore-processors-2.log",
+                "restore-processors-4.log",
+                "restore-processors-8.log",
+                "restore-processors-untargeted.log",
+            ],
+        )
+
+    def test_restore_processors_rejects_full_capacity_mshv_prefix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(microvm_tests, "capture_snapshot"),
+                patch.object(
+                    microvm_tests,
+                    "measure_once",
+                    _restore_processors_measure("mshv", mshv_prefix=False),
+                ),
+                patch.object(
+                    microvm_tests,
+                    "_snapshot_fingerprint",
+                    return_value=("manifest", "state", "memory"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"restore target 2 bound VPs \[0, 1, 2, 3, 4, 5, 6, 7\] on mshv; "
+                    r"expected exactly VPs 0\.\.1 of capacity 8",
+                ):
+                    microvm_tests.run_restore_processors(
+                        Path("openvmm"),
+                        Path("vmlinux"),
+                        Path("initrd"),
+                        "mshv",
+                        [2],
+                        memory_mib=128,
+                        timeout=60,
+                        output_dir=Path(temporary),
+                    )
+
+    def test_restore_processors_requires_full_capacity_off_mshv(self):
+        for backend in ("kvm", "whp"):
+            with self.subTest(backend=backend):
+                with tempfile.TemporaryDirectory() as temporary:
+
+                    def measure(command: list[str], **kwargs: object) -> None:
+                        log_path = cast(Path, kwargs["log_path"])
+                        log_path.write_bytes(_vp_binding_profile([0, 1]))
+
+                    with (
+                        patch.object(microvm_tests, "capture_snapshot"),
+                        patch.object(
+                            microvm_tests, "measure_once", side_effect=measure
+                        ),
+                        patch.object(
+                            microvm_tests,
+                            "_snapshot_fingerprint",
+                            return_value=("manifest", "state", "memory"),
+                        ),
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            rf"restore target 2 bound VPs \[0, 1\] on {backend}; "
+                            r"expected exactly VPs 0\.\.7 of capacity 8",
+                        ):
+                            microvm_tests.run_restore_processors(
+                                Path("openvmm"),
+                                Path("vmlinux"),
+                                Path("initrd"),
+                                backend,
+                                [2],
+                                memory_mib=128,
+                                timeout=60,
+                                output_dir=Path(temporary),
+                            )
+
+    def test_restore_vp_bindings_require_one_complete_record_set(self):
+        profile = _vp_binding_profile([0, 1])
+        self.assertEqual(microvm_tests._restore_vp_bindings(profile), [0, 1])
+        self.assertEqual(
+            microvm_tests._restore_vp_bindings(b"guest output\n" + profile),
+            [0, 1],
+        )
+        self.assertEqual(
+            microvm_tests._restore_vp_bindings(
+                profile.replace(
+                    b"operation=startup phase=vp_thread_bind",
+                    b"phase=vp_thread_bind operation=startup",
+                )
+            ),
+            [0, 1],
+        )
+        self.assertEqual(
+            microvm_tests._restore_vp_bindings(
+                profile + profile.replace(b"operation=startup", b"operation=restore")
+            ),
+            [0, 1],
+        )
+        microvm_tests._check_restore_vp_bindings(profile, "mshv", target=2, capacity=8)
+        with self.assertRaisesRegex(RuntimeError, r"bound VPs \[0, 1, 1\]"):
+            microvm_tests._check_restore_vp_bindings(
+                _vp_binding_profile([0, 1, 1]), "mshv", target=2, capacity=8
+            )
+        with self.assertRaisesRegex(RuntimeError, r"untargeted restore bound VPs"):
+            microvm_tests._check_restore_vp_bindings(
+                profile, "mshv", target=None, capacity=8
+            )
+        with self.assertRaisesRegex(RuntimeError, r"found 0"):
+            microvm_tests._restore_vp_bindings(b"")
+        with self.assertRaisesRegex(RuntimeError, r"found 2"):
+            microvm_tests._restore_vp_bindings(profile + profile)
+        with self.assertRaisesRegex(RuntimeError, r"malformed VP binding"):
+            microvm_tests._restore_vp_bindings(
+                profile.replace(b"vp_bind_ap_1", b"vp_bind_ap_x")
+            )
+        with self.assertRaises(ValueError):
+            microvm_tests._restore_vp_bindings(
+                profile.replace(b"exclusive=0", b"exclusive=2")
+            )
 
     def test_restore_tsc_sync_forces_linux_warp_check_and_keeps_failure_guard(self):
         for backend in ("kvm", "mshv", "whp"):
             with self.subTest(backend=backend):
+                measure = _restore_processors_measure(backend)
                 with tempfile.TemporaryDirectory() as temporary:
                     with (
                         patch.object(microvm_tests, "capture_snapshot") as capture,
-                        patch.object(microvm_tests, "measure_once") as measure,
+                        patch.object(microvm_tests, "measure_once", measure),
                         patch.object(
                             microvm_tests,
                             "_snapshot_fingerprint",
@@ -1744,13 +1919,10 @@ class MicrovmTests(unittest.TestCase):
                     script.endswith(microvm_tests._read_script("restore-processors.sh"))
                 )
                 self.assertEqual(capture.call_args.kwargs["processors"], 1)
-                self.assertEqual(measure.call_count, 4)
+                self.assertEqual(measure.call_count, 5)
                 self.assertEqual(
-                    [
-                        call.args[0][call.args[0].index("--restore-processors") + 1]
-                        for call in measure.call_args_list
-                    ],
-                    ["1", "2", "4", "8"],
+                    [_restore_target(call.args[0]) for call in measure.call_args_list],
+                    [1, 2, 4, 8, None],
                 )
 
     def test_restore_tsc_sync_rejects_an_ineffective_cpu_feature_mask(self):

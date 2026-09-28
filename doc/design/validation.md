@@ -50,8 +50,13 @@ Coverage also includes
 pinned per-vCPU execution, timer/interrupt progress, reset, cancellation,
 count and topology mismatch rejection, and repeated immutable restore.
 Restore-time processor coverage captures one capacity-8 template with a
-boot-online count of one, restores it at 1/2/4/8 online VPs, schedules work on
-every requested CPU, and verifies that the artifact is unchanged.
+boot-online count of one, restores it at 1/2/4/8 online VPs and without a
+target, schedules work on every requested CPU, and verifies that the artifact
+is unchanged. Its VP-binding lifecycle records verify that MSHV binds exactly
+the requested prefix, while untargeted MSHV restores and all KVM and WHP
+restores bind the full capacity. The profiled `snapshot-restore-vcpu`
+benchmark reports the same VP-binding and worker-construction phases for
+comparison with fixed-capacity restores.
 Restore-time memory coverage captures 512 MiB with a 2-GiB capacity, restores
 the same artifact at 512 MiB, 1 GiB, and 2 GiB, validates the added-byte count
 and expanded allocation, and verifies artifact immutability. Unit coverage
@@ -59,9 +64,6 @@ verifies that only an explicit MSHV processor target selects a runtime prefix,
 that the complete saved VP inventory is validated before filtering, that
 reduced-prefix saves are rejected, that dormant VP access fails cleanly, and
 that MSHV restored-TSC alignment targets only created VPs.
-Lifecycle profiling verifies that MSHV binds exactly the requested prefix while
-fixed-capacity comparisons retain equivalent per-prefix binding and
-worker-construction costs.
 Additional unit coverage exercises the control-console slot and attachment
 inventory, command-line spoofing rejection, the control-session record
 protocol against language-neutral golden vectors and boundary cases, the
