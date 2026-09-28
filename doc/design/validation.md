@@ -57,7 +57,8 @@ the same artifact at 512 MiB, 1 GiB, and 2 GiB, validates the added-byte count
 and expanded allocation, and verifies artifact immutability. Unit coverage
 verifies that only an explicit MSHV processor target selects a runtime prefix,
 that the complete saved VP inventory is validated before filtering, that
-reduced-prefix saves are rejected, and that dormant VP access fails cleanly.
+reduced-prefix saves are rejected, that dormant VP access fails cleanly, and
+that MSHV restored-TSC alignment targets only created VPs.
 Lifecycle profiling verifies that MSHV binds exactly the requested prefix while
 fixed-capacity comparisons retain equivalent per-prefix binding and
 worker-construction costs.
