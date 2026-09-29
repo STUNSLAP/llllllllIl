@@ -16,8 +16,6 @@ The current ABI family intentionally does not provide:
 - snapshot block media other than cached regular raw files;
 - sandbox-block, network, or control-console construction through the
    management RPC, or its restore of snapshots that contain them;
-- per-restore relocation of saved console or control-console listener
-   endpoints;
 - host networking other than the in-process portable endpoint, unrestricted
    ingress, generic bidirectional host-loopback connectivity, or live
    host-loopback port forwards in snapshots;
