@@ -2313,11 +2313,9 @@ class MicrovmTests(unittest.TestCase):
         shell = _posix_shell()
         if shell is None:
             self.skipTest("POSIX shell is unavailable")
-        script = (
-            microvm_tests._render_script(
-                "tsc-sync-control.sh.in", PROCESSORS="4", ROUNDS="2"
-            ).replace("nvx-exit", "nvx_exit")
-        )
+        script = microvm_tests._render_script(
+            "tsc-sync-control.sh.in", PROCESSORS="4", ROUNDS="2"
+        ).replace("nvx-exit", "nvx_exit")
 
         result = subprocess.run(
             [shell, "-s"],
