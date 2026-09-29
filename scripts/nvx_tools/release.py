@@ -899,6 +899,23 @@ def _validate_initramfs_provenance(
     return provenance
 
 
+def _require_runtime_provenance_paths() -> tuple[Path, Path, Path]:
+    return (
+        require_file(
+            artifact_path(OpenVMMBuildConstants.PROVENANCE_NAME),
+            "OpenVMM build provenance",
+        ),
+        require_file(
+            artifact_path(KernelBuildConstants.PROVENANCE_NAME),
+            "kernel build provenance",
+        ),
+        require_file(
+            artifact_path(InitramfsBuildConstants.PROVENANCE_NAME),
+            "initramfs build provenance",
+        ),
+    )
+
+
 def validate_runtime_artifact_provenance() -> None:
     binary = require_file(openvmm_binary_path(), "OpenVMM release binary")
     kernel = require_file(
@@ -917,18 +934,11 @@ def validate_runtime_artifact_provenance() -> None:
         artifact_path(KernelBuildConstants.CONFIG_NAME),
         "required guest artifact vmlinux.config",
     )
-    openvmm_provenance_path = require_file(
-        artifact_path(OpenVMMBuildConstants.PROVENANCE_NAME),
-        "OpenVMM build provenance",
-    )
-    kernel_provenance_path = require_file(
-        artifact_path(KernelBuildConstants.PROVENANCE_NAME),
-        "kernel build provenance",
-    )
-    initramfs_provenance_path = require_file(
-        artifact_path(InitramfsBuildConstants.PROVENANCE_NAME),
-        "initramfs build provenance",
-    )
+    (
+        openvmm_provenance_path,
+        kernel_provenance_path,
+        initramfs_provenance_path,
+    ) = _require_runtime_provenance_paths()
     _validate_openvmm_provenance(binary, openvmm_provenance_path)
     _validate_kernel_provenance(kernel, kernel_config, kernel_provenance_path)
     _validate_initramfs_provenance(
@@ -1280,18 +1290,11 @@ def package_release(
         artifact_path(AlpineBuildConstants.PACKAGE_MANIFEST_NAME),
         "initramfs package manifest",
     )
-    openvmm_provenance_path = require_file(
-        artifact_path(OpenVMMBuildConstants.PROVENANCE_NAME),
-        "OpenVMM build provenance",
-    )
-    kernel_provenance_path = require_file(
-        artifact_path(KernelBuildConstants.PROVENANCE_NAME),
-        "kernel build provenance",
-    )
-    initramfs_provenance_path = require_file(
-        artifact_path(InitramfsBuildConstants.PROVENANCE_NAME),
-        "initramfs build provenance",
-    )
+    (
+        openvmm_provenance_path,
+        kernel_provenance_path,
+        initramfs_provenance_path,
+    ) = _require_runtime_provenance_paths()
     openvmm_provenance = _validate_openvmm_provenance(
         binary,
         openvmm_provenance_path,

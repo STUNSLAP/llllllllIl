@@ -7707,6 +7707,51 @@ class ReleaseTests(unittest.TestCase):
             common.verify_sha256_sums(destination)
             self.assertIn("binary-only package", stderr.getvalue())
 
+    def test_runtime_provenance_validation_uses_required_paths(self):
+        build_dir = Path("build")
+        binary = Path("openvmm")
+
+        def artifact_path(name: str) -> Path:
+            return build_dir / name
+
+        def require_file(path: Path, _description: str) -> Path:
+            return path
+
+        with (
+            patch.object(release, "artifact_path", side_effect=artifact_path),
+            patch.object(release, "openvmm_binary_path", return_value=binary),
+            patch.object(
+                release,
+                "require_file",
+                side_effect=require_file,
+            ) as require,
+            patch.object(release, "_validate_openvmm_provenance") as openvmm,
+            patch.object(release, "_validate_kernel_provenance"),
+            patch.object(release, "_validate_initramfs_provenance"),
+        ):
+            release.validate_runtime_artifact_provenance()
+
+        self.assertEqual(
+            require.call_args_list[-3:],
+            [
+                call(
+                    build_dir / OpenVMMBuildConstants.PROVENANCE_NAME,
+                    "OpenVMM build provenance",
+                ),
+                call(
+                    build_dir / KernelBuildConstants.PROVENANCE_NAME,
+                    "kernel build provenance",
+                ),
+                call(
+                    build_dir / InitramfsBuildConstants.PROVENANCE_NAME,
+                    "initramfs build provenance",
+                ),
+            ],
+        )
+        openvmm.assert_called_once_with(
+            binary, build_dir / OpenVMMBuildConstants.PROVENANCE_NAME
+        )
+
     def test_package_rejects_dirty_openvmm_provenance(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
