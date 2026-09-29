@@ -3382,13 +3382,14 @@ def run_scratch_snapshot(
         )
 
 
-def _snapshot_tier_script(tier: str) -> str:
-    platform = tier == "platform"
-    workload_start = tier == "workload-start"
-    instance_checkpoint = tier == "instance-checkpoint"
-    if not (platform or workload_start or instance_checkpoint):
+def _snapshot_tier_kinds(tier: str) -> tuple[bool, bool, bool]:
+    if tier not in ("platform", "workload-start", "instance-checkpoint"):
         raise ValueError(f"unsupported snapshot tier {tier!r}")
+    return tier == "platform", tier == "workload-start", tier == "instance-checkpoint"
 
+
+def _snapshot_tier_script(tier: str) -> str:
+    platform, workload_start, instance_checkpoint = _snapshot_tier_kinds(tier)
     prefix = f"NVX-TIER-{tier.upper()}"
     workload_marker = f"{prefix}-WORKLOAD-RAN"
     paired_setup = ""
@@ -3515,11 +3516,7 @@ def _run_snapshot_tier(
     timeout: float,
     output_dir: Path,
 ) -> None:
-    platform = tier == "platform"
-    workload_start = tier == "workload-start"
-    instance_checkpoint = tier == "instance-checkpoint"
-    if not (platform or workload_start or instance_checkpoint):
-        raise ValueError(f"unsupported snapshot tier {tier!r}")
+    platform, workload_start, instance_checkpoint = _snapshot_tier_kinds(tier)
 
     prefix = f"NVX-TIER-{tier.upper()}"
     capture_marker = f"{prefix}-CAPTURE".encode()
