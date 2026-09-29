@@ -197,7 +197,7 @@ def _artifact_metadata() -> dict[str, object]:
             "initramfs package manifest",
         ),
         "initramfs_provenance": require_file(
-            BuildConstants.BUILD_DIR / InitramfsBuildConstants.PROVENANCE_NAME,
+            artifact_path(InitramfsBuildConstants.PROVENANCE_NAME),
             "initramfs provenance",
         ),
         "openvmm": require_file(
@@ -205,11 +205,11 @@ def _artifact_metadata() -> dict[str, object]:
             "OpenVMM release binary",
         ),
         "kernel_provenance": require_file(
-            BuildConstants.BUILD_DIR / KernelBuildConstants.PROVENANCE_NAME,
+            artifact_path(KernelBuildConstants.PROVENANCE_NAME),
             "kernel provenance",
         ),
         "openvmm_provenance": require_file(
-            BuildConstants.BUILD_DIR / OpenVMMBuildConstants.PROVENANCE_NAME,
+            artifact_path(OpenVMMBuildConstants.PROVENANCE_NAME),
             "OpenVMM provenance",
         ),
     }
