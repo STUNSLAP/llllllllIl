@@ -366,8 +366,18 @@ safe-outputs:
 
         index_file=/tmp/gh-aw/line-limit.index
         stats_file=/tmp/gh-aw/line-limit.numstat
-        rm -f "$index_file" "$stats_file"
-        trap 'rm -f /tmp/gh-aw/line-limit.index /tmp/gh-aw/line-limit.numstat' EXIT
+        size_file=/tmp/gh-aw/line-limit.size
+        rm -f "$index_file" "$stats_file" "$size_file"
+        trap 'rm -f /tmp/gh-aw/line-limit.index /tmp/gh-aw/line-limit.numstat /tmp/gh-aw/line-limit.size' EXIT
+
+        wc -c < "$1" > "$size_file"
+        read -r patch_bytes < "$size_file"
+        echo "Agent patch is ${patch_bytes} bytes (limit: 524288)."
+        if (( patch_bytes > 524288 )); then
+          echo "Rejecting agent patch larger than 512 KB." >&2
+          exit 1
+        fi
+
         GIT_INDEX_FILE="$index_file" git read-tree HEAD
         GIT_INDEX_FILE="$index_file" git apply --cached "$1"
         GIT_INDEX_FILE="$index_file" git diff --cached --numstat HEAD -- > "$stats_file"
@@ -430,7 +440,7 @@ safe-outputs:
     if-no-changes: ignore
     # gh-aw also applies max-patch-size to the signed-commit payload, which
     # carries the full contents of every changed file. The line-limit step
-    # above bounds the diff itself.
+    # above bounds the patch itself to 512 KB and 99 changed lines.
     max-patch-size: 4096
     max-patch-files: 4
 ---
