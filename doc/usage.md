@@ -37,7 +37,7 @@ python3 scripts/nvx.py performance gate --help
 | `build` | Build the guest artifacts and OpenVMM. |
 | `download` | Download and install the latest matching GitHub release. |
 | `run` | Run an OpenVMM microVM. |
-| `sandbox` | Run one workload from EROFS layers over private ext4 scratch. |
+| `sandbox` | Run or manage workloads over EROFS layers and private ext4 scratch. |
 | `benchmark` | Run the OpenVMM-native benchmark coordinator. |
 | `performance` | Collect, gate, and persist CI performance results. |
 | `collect-sources` | Materialize verified Linux, Alpine, and Ubuntu release sources. |
@@ -351,8 +351,10 @@ virtio-fs examples.
 
 ```text
 python3 scripts/nvx.py sandbox
-    --layer ROLE,PATH,EROFS_UUID [--layer ...]
-    --scratch PATH
+    [{run,provision,start,exec,stop,deprovision}]
+    [--layer ROLE,PATH,EROFS_UUID]...
+    [--scratch PATH]
+    [--state-dir PATH]
     [--entrypoint PATH]
     [--arg VALUE]...
     [--hostname NAME]
@@ -369,8 +371,10 @@ python3 scripts/nvx.py sandbox
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--layer ROLE,PATH,EROFS_UUID` | required | Attach a `distro`, `runtime`, or `custom` EROFS layer. Repeat once per distinct role. |
-| `--scratch PATH` | required | Attach a preformatted ext4 scratch image as the writable overlay. |
+| `{run,provision,start,exec,stop,deprovision}` | `run` | Select a one-shot run or a managed lifecycle operation. |
+| `--layer ROLE,PATH,EROFS_UUID` | required for `run` and `provision` | Attach a `distro`, `runtime`, or `custom` EROFS layer. Repeat once per distinct role. |
+| `--scratch PATH` | required for `run` and `provision` | Attach a preformatted ext4 scratch image as the writable overlay. |
+| `--state-dir PATH` | required for managed operations | Select persistent sandbox state. One-shot `run` rejects this option. |
 | `--entrypoint PATH` | `/bin/sh` | Select an absolute workload entrypoint without whitespace. |
 | `--arg VALUE` | none | Append one whitespace-free entrypoint argument. Repeat to pass multiple arguments. |
 | `--hostname NAME` | `nvx-sandbox` | Set the workload UTS hostname. |
