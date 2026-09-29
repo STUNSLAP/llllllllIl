@@ -650,6 +650,15 @@ class _InitializedSession:
         }
 
 
+def _close_oracles_after_failure(oracles: OracleSession, error: Exception) -> None:
+    try:
+        oracles.close()
+    except ScriptError as cleanup_error:
+        raise ScriptError(
+            f"{error}; oracle cleanup also failed: {cleanup_error}"
+        ) from error
+
+
 class AdversarialExecutor:
     """Stateful stdio protocol endpoint intended for a forced launcher."""
 
@@ -836,12 +845,7 @@ class AdversarialExecutor:
             ValueError,
         ) as error:
             self._session = None
-            try:
-                session.oracles.close()
-            except ScriptError as cleanup_error:
-                raise ScriptError(
-                    f"{error}; oracle cleanup also failed: {cleanup_error}"
-                ) from error
+            _close_oracles_after_failure(session.oracles, error)
             raise
         passed = (
             verification.returncode == 0
@@ -966,12 +970,7 @@ class AdversarialExecutor:
             ValueError,
         ) as error:
             self._session = None
-            try:
-                session.oracles.close()
-            except ScriptError as cleanup_error:
-                raise ScriptError(
-                    f"{error}; oracle cleanup also failed: {cleanup_error}"
-                ) from error
+            _close_oracles_after_failure(session.oracles, error)
             raise
         oracle_result = session.oracles.close()
         canary_violation = (

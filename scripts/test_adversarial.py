@@ -45,6 +45,7 @@ from nvx_tools.adversarial_broker import (
 )
 from nvx_tools.adversarial_executor import (
     AdversarialExecutor,
+    _close_oracles_after_failure,
     _InitializedSession,
     _inventory_outcomes,
     _live_openvmm_pids,
@@ -1610,6 +1611,23 @@ class CopilotContainmentTests(unittest.TestCase):
             executor = AdversarialExecutor(Path(temporary))
             with self.assertRaisesRegex(ScriptError, "must be an integer"):
                 executor.handle({"schema_version": True, "operation": "shutdown"})
+
+    def test_executor_failure_closes_oracles(self) -> None:
+        oracles = MagicMock()
+
+        _close_oracles_after_failure(oracles, ScriptError("operation failed"))
+
+        oracles.close.assert_called_once_with()
+
+    def test_executor_failure_reports_oracle_cleanup_failure(self) -> None:
+        oracles = MagicMock()
+        oracles.close.side_effect = ScriptError("cleanup failed")
+
+        with self.assertRaisesRegex(
+            ScriptError,
+            "operation failed; oracle cleanup also failed: cleanup failed",
+        ):
+            _close_oracles_after_failure(oracles, ScriptError("operation failed"))
 
     def test_external_executor_rejects_dirty_source_tree(self) -> None:
         campaign = "workload-isolation"
