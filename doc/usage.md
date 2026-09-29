@@ -358,6 +358,7 @@ python3 scripts/nvx.py sandbox
     [--entrypoint PATH]
     [--arg VALUE]...
     [--hostname NAME]
+    [--workload-user UID:GID]
     [--memory-max BYTES]
     [--pids-max COUNT]
     [--memory-mib MIB]
@@ -378,6 +379,7 @@ python3 scripts/nvx.py sandbox
 | `--entrypoint PATH` | `/bin/sh` | Select an absolute workload entrypoint without whitespace. |
 | `--arg VALUE` | none | Append one whitespace-free entrypoint argument. Repeat to pass multiple arguments. |
 | `--hostname NAME` | `nvx-sandbox` | Set the workload UTS hostname. |
+| `--workload-user UID:GID` | `65534:65534` | Select the fixed non-root workload identity for `run` or `provision`. |
 | `--memory-max BYTES` | none | Set the workload cgroup memory limit. |
 | `--pids-max COUNT` | none | Set the workload cgroup process limit. |
 | `--memory-mib MIB` | `256` | Set guest memory in MiB. |
