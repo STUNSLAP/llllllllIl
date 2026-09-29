@@ -431,6 +431,7 @@ python3 scripts/nvx.py benchmark [OPTIONS]
 | `--cache-state {warm,cold,both}` | `both` | Select artifact cache states for the `snapshot-profile` suite. |
 | `--output PATH` | none | Write the benchmark result as JSON. |
 | `--output-dir PATH` | none | Write canonical workload logs to a directory. |
+| `--scratch-dir PATH` | system temporary directory | Select an existing directory for temporary snapshots, guest RAM backing, and workload files. |
 | `--keep-kvm-stage` | off | Keep temporary staged KVM benchmark binaries. |
 
 Measured counts must be at least 1; warmups may be zero, and timeouts must be greater than zero.
