@@ -362,6 +362,8 @@ python3 scripts/nvx.py sandbox
     [--memory-max BYTES]
     [--pids-max COUNT]
     [--memory-mib MIB]
+    [--timeout SECONDS]
+    [--exec-timeout-ms MILLISECONDS]
     [--hypervisor {auto,whp,kvm,mshv}]
     [--net IPV4/PREFIX]
     [--network-profile {portable}]
@@ -383,6 +385,8 @@ python3 scripts/nvx.py sandbox
 | `--memory-max BYTES` | none | Set the workload cgroup memory limit. |
 | `--pids-max COUNT` | none | Set the workload cgroup process limit. |
 | `--memory-mib MIB` | `256` | Set guest memory in MiB. |
+| `--timeout SECONDS` | `60` | Set the control response timeout for managed `start`, `exec`, and `stop`. |
+| `--exec-timeout-ms MILLISECONDS` | `0` | Set the managed `exec` guest workload timeout; zero disables it. |
 | `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the host hypervisor. |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with a static guest address. |
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
