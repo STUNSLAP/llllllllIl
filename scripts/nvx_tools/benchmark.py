@@ -1238,6 +1238,28 @@ def contains_output_line(output: bytes | bytearray, marker: bytes) -> bool:
     return any(line.removesuffix(b"\r") == marker for line in output.split(b"\n"))
 
 
+def completed_output_line_with_prefix(
+    output: bytes | bytearray, prefix: bytes
+) -> bytes | None:
+    """Return the first newline-terminated output line that starts with prefix."""
+    for line in output.split(b"\n")[:-1]:
+        line = line.removesuffix(b"\r")
+        if line.startswith(prefix):
+            return bytes(line)
+    return None
+
+
+class GuestFailureReported(RuntimeError):
+    """Raised when a guest prints a failure marker before its success marker."""
+
+    def __init__(self, line: str, output_tail: str) -> None:
+        super().__init__(
+            f"guest reported {line}\n--- OpenVMM output ---\n{output_tail}"
+        )
+        self.line = line
+        self.output_tail = output_tail
+
+
 def parse_device_restore_marker(line: str) -> dict[str, str] | None:
     line = ANSI_ESCAPE_PATTERN.sub("", line).removesuffix("\r")
     if not line.startswith(DEVICE_RESTORE_MARKER_PREFIX):
@@ -1411,11 +1433,13 @@ def measure_once(
     snapshot_profile: bool = False,
     profile_sink: list[dict[str, object]] | None = None,
     log_path: Path | None = None,
+    failure_marker: bytes | None = None,
 ) -> tuple[float, int | None, float | None, float]:
     """Measure one OpenVMM launch through ``marker`` and its teardown.
 
     Peak RSS is None when OpenVMM exited before it could be sampled at the
-    marker, which a prequeued guest exit makes possible.
+    marker, which a prequeued guest exit makes possible. A completed output
+    line starting with ``failure_marker`` stops the launch immediately.
     """
     started = time.perf_counter_ns()
     interaction = InteractiveProcess(command, environment)
@@ -1450,6 +1474,13 @@ def measure_once(
             if profile is not None:
                 profile.feed(chunk)
             output.extend(chunk)
+            if failure_marker is not None:
+                failure = completed_output_line_with_prefix(output, failure_marker)
+                if failure is not None:
+                    raise GuestFailureReported(
+                        failure.decode("utf-8", "replace"),
+                        output[-4096:].decode("utf-8", "replace"),
+                    )
             marker_seen = (
                 contains_output_line(output, marker)
                 if marker_must_be_line
@@ -1494,6 +1525,9 @@ def measure_once(
                 return elapsed_ms, peak_bytes, teardown_ms, wall_ms
             if len(output) > 1024 * 1024:
                 del output[: len(output) - 1024 * 1024]
+    except GuestFailureReported:
+        terminate(process)
+        raise
     except Exception as error:
         terminate(process)
         tail = output[-4096:].decode("utf-8", "replace")

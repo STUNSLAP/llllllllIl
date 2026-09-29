@@ -2004,6 +2004,311 @@ class MicrovmTests(unittest.TestCase):
                         "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc", result.stdout
                     )
 
+    def test_restore_processors_fail_fast_and_record_restored_tsc_logs(self):
+        for check_tsc_sync in (False, True):
+            with self.subTest(check_tsc_sync=check_tsc_sync):
+                measure = _restore_processors_measure("mshv")
+                with tempfile.TemporaryDirectory() as temporary:
+                    with (
+                        patch.object(microvm_tests, "capture_snapshot"),
+                        patch.object(microvm_tests, "measure_once", measure),
+                        patch.object(
+                            microvm_tests,
+                            "_snapshot_fingerprint",
+                            return_value=("manifest", "state", "memory"),
+                        ),
+                    ):
+                        microvm_tests.run_restore_processors(
+                            Path("openvmm"),
+                            Path("vmlinux"),
+                            Path("initrd"),
+                            "mshv",
+                            [2, 8],
+                            memory_mib=128,
+                            timeout=60,
+                            output_dir=Path(temporary),
+                            check_tsc_sync=check_tsc_sync,
+                        )
+
+                self.assertEqual(measure.call_count, 3)
+                for entry in measure.call_args_list:
+                    self.assertEqual(
+                        entry.kwargs["failure_marker"],
+                        b"NVX-RESTORE-PROCESSORS-FAIL",
+                    )
+                    environment = entry.kwargs["environment"]
+                    self.assertEqual(
+                        environment["OPENVMM_LOG"], "off,virt_mshv::x86_64::tsc=info"
+                    )
+                    self.assertEqual(environment[benchmark.SNAPSHOT_PROFILE_ENV], "1")
+
+    def test_restore_processors_classifies_unstable_tsc_with_fresh_boot_control(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            passing = _restore_processors_measure("mshv")
+
+            def measure(command: list[str], **kwargs: object) -> None:
+                if _restore_target(command) == 4:
+                    raise benchmark.GuestFailureReported(
+                        "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc",
+                        "Measured 45 cycles TSC warp between CPUs\r\n",
+                    )
+                passing(command, **kwargs)
+
+            with (
+                patch.object(microvm_tests, "capture_snapshot"),
+                patch.object(
+                    microvm_tests, "measure_once", side_effect=measure
+                ) as measure_once,
+                patch.object(
+                    microvm_tests,
+                    "_snapshot_fingerprint",
+                    return_value=("manifest", "state", "memory"),
+                ),
+                patch.object(
+                    microvm_tests,
+                    "run_fresh_boot_tsc_control",
+                    return_value="fresh-boot TSC control: verdict",
+                ) as control,
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    microvm_tests.run_restore_processors(
+                        Path("openvmm"),
+                        Path("vmlinux"),
+                        Path("initrd"),
+                        "mshv",
+                        [1, 2, 4, 8],
+                        memory_mib=192,
+                        timeout=30,
+                        output_dir=output_dir,
+                        check_tsc_sync=True,
+                    )
+
+        self.assertEqual(
+            str(raised.exception),
+            "restore target 4: guest reported "
+            "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc\n"
+            "fresh-boot TSC control: verdict\n"
+            "--- OpenVMM output ---\n"
+            "Measured 45 cycles TSC warp between CPUs\r\n",
+        )
+        self.assertIsInstance(
+            raised.exception.__cause__, benchmark.GuestFailureReported
+        )
+        self.assertEqual(measure_once.call_count, 3)
+        control.assert_called_once_with(
+            Path("openvmm"),
+            Path("vmlinux"),
+            Path("initrd"),
+            "mshv",
+            memory_mib=192,
+            timeout=30,
+            log_path=output_dir / "restore-processors-tsc-control.log",
+        )
+
+    def test_restore_processors_reports_other_guest_failures_without_control(self):
+        failure = benchmark.GuestFailureReported(
+            "NVX-RESTORE-PROCESSORS-FAIL expected=0-3 actual=0-2", "tail"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(microvm_tests, "capture_snapshot"),
+                patch.object(microvm_tests, "measure_once", side_effect=failure),
+                patch.object(
+                    microvm_tests,
+                    "_snapshot_fingerprint",
+                    return_value=("manifest", "state", "memory"),
+                ),
+                patch.object(microvm_tests, "run_fresh_boot_tsc_control") as control,
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    microvm_tests.run_restore_processors(
+                        Path("openvmm"),
+                        Path("vmlinux"),
+                        Path("initrd"),
+                        "kvm",
+                        [4],
+                        memory_mib=128,
+                        timeout=60,
+                        output_dir=Path(temporary),
+                    )
+
+        self.assertEqual(
+            str(raised.exception),
+            "restore target 4: guest reported "
+            "NVX-RESTORE-PROCESSORS-FAIL expected=0-3 actual=0-2\n"
+            "--- OpenVMM output ---\ntail",
+        )
+        self.assertIs(raised.exception.__cause__, failure)
+        control.assert_not_called()
+
+    def test_fresh_boot_tsc_control_forces_the_warp_check_on_every_processor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "control.log"
+            result: benchmark.GuestCommandResult = {
+                "text": (
+                    '> echo "NVX-TSC-CONTROL-RESULT unstable activations=0"\r\n'
+                    "NVX-TSC-CONTROL-RESULT stable activations=147\r\n"
+                ),
+                "wall_ms": 1.0,
+                "peak_rss_bytes": 1,
+            }
+            with (
+                patch.object(
+                    microvm_tests,
+                    "workload_boot_command",
+                    return_value=["openvmm", "boot"],
+                ) as workload_boot_command,
+                patch.object(
+                    microvm_tests, "run_guest_script", return_value=result
+                ) as run_guest_script,
+            ):
+                verdict = microvm_tests.run_fresh_boot_tsc_control(
+                    Path("openvmm"),
+                    Path("vmlinux"),
+                    Path("initrd"),
+                    "kvm",
+                    memory_mib=128,
+                    timeout=45,
+                    log_path=log_path,
+                )
+
+        self.assertEqual(
+            verdict,
+            "fresh-boot TSC control: no TSC instability across 147 CPU "
+            "activations without snapshot restore",
+        )
+        self.assertEqual(
+            workload_boot_command.call_args.args,
+            (
+                Path("openvmm"),
+                "kvm",
+                Path("vmlinux"),
+                Path("initrd"),
+                128,
+                "quiet loglevel=0 clearcpuid=tsc_adjust",
+            ),
+        )
+        self.assertEqual(workload_boot_command.call_args.kwargs, {"processors": 8})
+        command, script, marker = run_guest_script.call_args.args
+        self.assertEqual(command, ["openvmm", "boot"])
+        self.assertEqual(
+            script,
+            microvm_tests._render_script(
+                "tsc-sync-control.sh.in", PROCESSORS="8", ROUNDS="20"
+            ),
+        )
+        self.assertNotIn("@", script)
+        self.assertEqual(marker, b"NVX-TSC-CONTROL-DONE")
+        self.assertEqual(
+            run_guest_script.call_args.kwargs, {"timeout": 45, "log_path": log_path}
+        )
+
+    def test_fresh_boot_tsc_control_reports_its_own_failure(self):
+        with patch.object(
+            microvm_tests,
+            "run_guest_script",
+            side_effect=TimeoutError("guest workload did not finish within 45s\ntail"),
+        ):
+            verdict = microvm_tests.run_fresh_boot_tsc_control(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "mshv",
+                memory_mib=128,
+                timeout=45,
+                log_path=Path("control.log"),
+            )
+
+        self.assertEqual(
+            verdict,
+            "fresh-boot TSC control did not complete: "
+            "guest workload did not finish within 45s",
+        )
+
+    def test_tsc_control_verdict_accepts_only_guest_result_lines(self):
+        for text, expected in (
+            (
+                "NVX-TSC-CONTROL-RESULT unstable activations=12\r\n",
+                "fresh-boot TSC control: Linux also found TSC instability without "
+                "snapshot restore after 12 CPU activations",
+            ),
+            (
+                '> echo "NVX-TSC-CONTROL-RESULT stable activations=$activations"\n',
+                "fresh-boot TSC control did not report a result",
+            ),
+            (
+                "NVX-TSC-CONTROL-RESULT stable activations=many\n",
+                "fresh-boot TSC control did not report a result",
+            ),
+            ("", "fresh-boot TSC control did not report a result"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(microvm_tests._tsc_control_verdict(text), expected)
+
+    def test_tsc_sync_control_script_reactivates_aps_until_tsc_instability(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        for flags, online, unstable, expected_status, expected_output in (
+            ("tsc rdtscp", 4, False, 0, "NVX-TSC-CONTROL-RESULT stable activations=9"),
+            (
+                "tsc rdtscp",
+                4,
+                True,
+                0,
+                "NVX-TSC-CONTROL-RESULT unstable activations=3",
+            ),
+            ("tsc tsc_adjust", 4, False, 61, "NVX-TSC-CONTROL-FAIL code=61"),
+            ("tsc rdtscp", 2, False, 60, "NVX-TSC-CONTROL-FAIL code=60"),
+        ):
+            with self.subTest(flags=flags, online=online, unstable=unstable):
+                with tempfile.TemporaryDirectory() as temporary:
+                    cpu_root = Path(temporary)
+                    for cpu in range(1, 4):
+                        (cpu_root / f"cpu{cpu}").mkdir()
+                    kernel_log = (
+                        "Measured 45 cycles TSC warp between CPUs"
+                        if unstable
+                        else "clocksource: Switched to clocksource tsc"
+                    )
+                    script = (
+                        microvm_tests._render_script(
+                            "tsc-sync-control.sh.in", PROCESSORS="4", ROUNDS="2"
+                        )
+                        .replace("/sys/devices/system/cpu", cpu_root.as_posix())
+                        .replace("nvx-exit", "nvx_exit")
+                    )
+                    result = subprocess.run(
+                        [shell, "-s"],
+                        input=(
+                            f"getconf() {{ printf '{online}\\n'; }}\n"
+                            f"cat() {{ printf 'flags : {flags}\\n'; }}\n"
+                            f"dmesg() {{ printf '%s\\n' '{kernel_log}'; }}\n"
+                            'nvx_exit() { exit "$1"; }\n' + script
+                        ),
+                        text=True,
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    reactivated = all(
+                        (cpu_root / f"cpu{cpu}" / "online").is_file()
+                        and (cpu_root / f"cpu{cpu}" / "online").read_text() == "1\n"
+                        for cpu in range(1, 4)
+                    )
+
+                self.assertEqual(
+                    result.returncode, expected_status, result.stdout + result.stderr
+                )
+                self.assertIn(expected_output, result.stdout)
+                self.assertEqual(
+                    "NVX-TSC-CONTROL-DONE" in result.stdout, expected_status == 0
+                )
+                self.assertEqual(reactivated, expected_output.endswith("=9"))
+                if unstable:
+                    self.assertIn(kernel_log, result.stdout)
+
     def test_restore_memory_reuses_one_base_snapshot_for_all_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
