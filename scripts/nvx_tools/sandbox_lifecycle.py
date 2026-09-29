@@ -392,7 +392,10 @@ def start(state_path: Path, timeout: float) -> None:
         "network_egress_deny",
         "host_loopback_forward",
     ):
-        for value in config.get(name, []):
+        values = config.get(name, [])
+        if not isinstance(values, list):
+            raise ScriptError("sandbox configuration is malformed")
+        for value in cast(list[object], values):
             command.extend([f"--{name.replace('_', '-')}", str(value)])
     network_proxy = config.get("network_proxy")
     if network_proxy is not None:
