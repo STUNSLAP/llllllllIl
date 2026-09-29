@@ -808,6 +808,10 @@ def read_workload_dimensions(
         document = _json_object(
             json.loads(metadata_path.read_text(encoding="utf-8")), str(metadata_path)
         )
+    except OSError as error:
+        raise PerformanceError(
+            f"cannot read benchmark metadata {metadata_path}: {error}"
+        ) from error
     except (UnicodeError, json.JSONDecodeError) as error:
         raise PerformanceError(
             f"invalid benchmark metadata JSON {metadata_path}: {error}"
