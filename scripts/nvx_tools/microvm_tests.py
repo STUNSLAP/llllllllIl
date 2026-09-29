@@ -31,7 +31,7 @@ from .benchmark import (
     record_adversarial_openvmm_pid,
     smp_probe_script,
     snapshot_restore_command,
-    whp_stable_clocksource_wait_script,
+    stable_clocksource_wait_script,
     workload_boot_command,
 )
 from .benchmark import (
@@ -320,7 +320,7 @@ def _snapshot_core_script(backend: str) -> str:
             'current_clocksource)" = kvm-clock ] || fail 46'
         )
     elif backend == "whp":
-        select_clocksource = whp_stable_clocksource_wait_script()
+        select_clocksource = stable_clocksource_wait_script()
         validate_clocksource = (
             '[ "$(cat /sys/devices/system/clocksource/clocksource0/'
             'current_clocksource)" != tsc-early ] || fail 46'

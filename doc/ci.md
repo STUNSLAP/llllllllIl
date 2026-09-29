@@ -30,6 +30,11 @@ runs with OpenVMM lifecycle profiling and must report exactly one
 `startup.vp_thread_bind` record. Its `startup.vp_bind_*` records must show that
 an explicit MSHV target binds exactly VPs `0..N-1`, while untargeted MSHV
 restores and all KVM and WHP restores bind the full capacity.
+On MSHV and WHP, the capture waits until Linux replaces its transitional
+`tsc-early` clocksource. A snapshot taken earlier can fail after restore
+without any cross-CPU skew, because the clocksource watchdog compares
+`tsc-early` with jiffies across the restore downtime, as described in
+[the benchmark guide](benchmarks.md).
 A restore fails as soon as its guest prints `NVX-RESTORE-PROCESSORS-FAIL`,
 rather than waiting for the phase timeout. Restore logs also record OpenVMM's
 `aligning restored AP TSCs to the BSP` event, which reports how many created

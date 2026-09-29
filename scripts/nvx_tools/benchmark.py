@@ -1709,7 +1709,8 @@ def clocksource_parameter(backend: str) -> str:
     return "clocksource=kvm-clock" if backend == "kvm" else "clocksource=tsc"
 
 
-def whp_stable_clocksource_wait_script() -> str:
+def stable_clocksource_wait_script() -> str:
+    """Wait up to five seconds for Linux to replace its tsc-early clocksource."""
     return "\n".join(
         (
             f"clock_path={CLOCKSOURCE_CURRENT_PATH}",
@@ -3109,9 +3110,13 @@ def prepare_snapshot_capture_script(
     post_restore_script: str | None = None,
 ) -> str:
     clocksource_ready = ""
-    if backend == "whp":
+    # Until Linux replaces tsc-early, its periodic tick doesn't recover the
+    # jiffies that a restore's downtime skips. The clocksource watchdog can then
+    # compare tsc-early with jiffies across the restore and mark the TSC
+    # unstable. KVM guests leave tsc-early almost immediately after boot.
+    if backend in ("mshv", "whp"):
         clocksource_ready = (
-            whp_stable_clocksource_wait_script()
+            stable_clocksource_wait_script()
             + "\n"
             + 'current_clocksource="$(cat "$clock_path")"\n'
             + '[ "$current_clocksource" != tsc-early ] || { '

@@ -5888,6 +5888,25 @@ class BenchmarkTests(unittest.TestCase):
             )
         )
 
+    def test_mshv_and_whp_capture_after_linux_leaves_tsc_early(self):
+        wait = benchmark.stable_clocksource_wait_script()
+        for backend, waits in (("mshv", True), ("whp", True), ("kvm", False)):
+            with self.subTest(backend=backend):
+                script = benchmark.prepare_snapshot_capture_script(
+                    1, backend=backend, teardown_mode="guest-exit"
+                )
+                probe = script.split("<<'NVX_SMP_PROBE_SCRIPT'\n", 1)[1]
+                probe = probe.split("NVX_SMP_PROBE_SCRIPT\n", 1)[0]
+                self.assertEqual(probe.startswith(wait), waits)
+                self.assertEqual("SMP-CLOCKSOURCE-FAIL expected=stable" in probe, waits)
+                if waits:
+                    # The wait and its check run before the probe completes, so
+                    # the host requests the snapshot only after tsc-early is gone.
+                    self.assertLess(
+                        probe.index("SMP-CLOCKSOURCE-FAIL"),
+                        probe.index("NVX-SMP-PROBE-OK"),
+                    )
+
     def test_output_marker_must_be_a_complete_line(self):
         marker = benchmark.RESTORE_MARKER
         self.assertFalse(
