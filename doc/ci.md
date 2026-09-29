@@ -24,9 +24,14 @@ CLI. Alpine-control-only scenarios remain explicit and are rejected for the
 Ubuntu initramfs. Failure logs from the NVX layer are uploaded per backend.
 The restore-processor scenario also rejects Linux TSC instability diagnostics,
 even if the requested CPUs came online, so clock skew cannot silently pass by
-falling back to a different clocksource.
+falling back to a different clocksource. After the 1/2/4/8-CPU restores, it
+restores the same snapshot once without `--restore-processors`. Every restore
+runs with OpenVMM lifecycle profiling and must report exactly one
+`startup.vp_thread_bind` record. Its `startup.vp_bind_*` records must show that
+an explicit MSHV target binds exactly VPs `0..N-1`, while untargeted MSHV
+restores and all KVM and WHP restores bind the full capacity.
 
-The `restore-tsc-sync` scenario repeats the 1/2/4/8-CPU restore sequence with
+The `restore-tsc-sync` scenario repeats the restore-processor sequence with
 the test-only kernel option `clearcpuid=tsc_adjust`. Linux normally skips its
 cross-CPU TSC warp test when `IA32_TSC_ADJUST` is available and consistent
 within a package. This scenario verifies that the feature is masked, forcing

@@ -21,8 +21,10 @@ from typing import Any, cast
 from .benchmark import (
     RESTORE_MARKER,
     SMP_PROBE_COMPLETION_MARKER,
+    SNAPSHOT_PROFILE_ENV,
     GuestCommandResult,
     measure_once,
+    parse_snapshot_profile_line,
     positive_float,
     positive_int,
     record_adversarial_openvmm_pid,
@@ -2005,6 +2007,54 @@ def run_smp_snapshot(
                 )
 
 
+def _restore_vp_bindings(output: bytes) -> list[int]:
+    """Return the VP indices bound by one profiled OpenVMM process."""
+    bound: list[int] = []
+    thread_bind_records = 0
+    for line in _output_lines(output):
+        record = parse_snapshot_profile_line(line)
+        if record is None or record["operation"] != "startup":
+            continue
+        phase = cast(str, record["phase"])
+        if phase == "vp_thread_bind":
+            thread_bind_records += 1
+        elif phase == "vp_bind_bsp":
+            bound.append(0)
+        elif phase.startswith("vp_bind_ap_"):
+            index = phase.removeprefix("vp_bind_ap_")
+            if not index.isdecimal() or int(index) == 0:
+                raise RuntimeError(f"malformed VP binding profile phase {phase!r}")
+            bound.append(int(index))
+    if thread_bind_records != 1:
+        raise RuntimeError(
+            "expected exactly one startup.vp_thread_bind profile record, "
+            f"found {thread_bind_records}"
+        )
+    return sorted(bound)
+
+
+def _restore_label(target: int | None) -> str:
+    return "untargeted restore" if target is None else f"restore target {target}"
+
+
+def _check_restore_vp_bindings(
+    output: bytes,
+    backend: str,
+    *,
+    target: int | None,
+    capacity: int,
+) -> None:
+    # Only MSHV instantiates the VP prefix of an explicit restore target.
+    # Untargeted MSHV restores and every KVM or WHP restore bind the capacity.
+    expected = target if backend == "mshv" and target is not None else capacity
+    bound = _restore_vp_bindings(output)
+    if bound != list(range(expected)):
+        raise RuntimeError(
+            f"{_restore_label(target)} bound VPs {bound} on {backend}; "
+            f"expected exactly VPs 0..{expected - 1} of capacity {capacity}"
+        )
+
+
 def run_restore_processors(
     executable: Path,
     kernel: Path,
@@ -2018,11 +2068,16 @@ def run_restore_processors(
     check_tsc_sync: bool = False,
 ) -> None:
     capacity = 8
-    cmdline = "quiet loglevel=0 maxcpus=1"
+    boot_online = 1
+    cmdline = f"quiet loglevel=0 maxcpus={boot_online}"
     script = _read_script("restore-processors.sh")
     if check_tsc_sync:
         cmdline += " clearcpuid=tsc_adjust"
         script = _read_script("restore-tsc-sync.sh") + script
+    # The VP-binding lifecycle records identify the VPs that each restore
+    # instantiates without changing restore behavior.
+    environment = _restore_environment()
+    environment[SNAPSHOT_PROFILE_ENV] = "1"
     with tempfile.TemporaryDirectory(prefix="nvx-restore-processors-") as temporary:
         snapshot_path = Path(temporary) / "snapshot"
         boot_command = workload_boot_command(
@@ -2039,13 +2094,18 @@ def run_restore_processors(
             snapshot_path,
             backend=backend,
             timeout=timeout,
-            processors=1,
+            processors=boot_online,
             post_restore_script=script,
             log_path=output_dir / "restore-processors-capture.log",
         )
         fingerprint = _snapshot_fingerprint(snapshot_path)
-        for target in dict.fromkeys(processor_counts):
-            marker = f"NVX-RESTORE-PROCESSORS-OK count={target}".encode()
+        # An untargeted restore keeps the captured boot-online prefix.
+        targets: list[int | None] = [*dict.fromkeys(processor_counts), None]
+        for target in targets:
+            name = "untargeted" if target is None else str(target)
+            online = boot_online if target is None else target
+            marker = f"NVX-RESTORE-PROCESSORS-OK count={online}".encode()
+            log_path = output_dir / f"restore-processors-{name}.log"
             measure_once(
                 snapshot_restore_command(
                     executable,
@@ -2054,16 +2114,22 @@ def run_restore_processors(
                     processors=capacity,
                     restore_processors=target,
                 ),
-                environment=_restore_environment(),
+                environment=environment,
                 timeout=timeout,
                 marker=marker,
                 marker_must_be_line=True,
                 guest_exit_prequeued=True,
-                log_path=output_dir / f"restore-processors-{target}.log",
+                log_path=log_path,
+            )
+            _check_restore_vp_bindings(
+                log_path.read_bytes(),
+                backend,
+                target=target,
+                capacity=capacity,
             )
             if _snapshot_fingerprint(snapshot_path) != fingerprint:
                 raise RuntimeError(
-                    f"restore target {target} modified snapshot artifacts"
+                    f"{_restore_label(target)} modified snapshot artifacts"
                 )
 
 
