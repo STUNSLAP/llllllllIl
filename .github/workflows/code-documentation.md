@@ -55,13 +55,14 @@ evals:
 Correct one specific inaccurate, ambiguous, or missing statement that can be
 verified against current NVX code or commands.
 
-Target Markdown documentation in `README.md` and `doc/`, or a comment or
+Target Markdown documentation in `doc/`, or a comment or
 docstring in allowlisted tooling that misstates the code it describes. A
 qualifying candidate is one statement, table row, or short passage that
 contradicts, is ambiguous about, or omits a fact established by current NVX
 sources, such as a CLI option, subcommand, default, path, or prerequisite
 defined in `scripts/nvx.py` or `scripts/nvx_tools/`, or a CI step defined under
-`.github/`.
+`.github/`. Leave `README.md` alone: gh-aw protects it, so it is excluded from
+the pull request allowlist.
 
 Verify the current behavior before editing: cite the defining source line, or
 run a read-only command such as `python scripts/nvx.py <command> --help` and

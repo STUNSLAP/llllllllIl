@@ -397,7 +397,6 @@ safe-outputs:
     expires: 14d
     base-branch: dev
     allowed-files:
-      - "README.md"
       - "doc/*.md"
       - "doc/**/*.md"
       - "scripts/*.py"
