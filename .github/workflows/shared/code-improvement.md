@@ -428,7 +428,10 @@ safe-outputs:
     protected-files: fallback-to-issue
     fallback-as-issue: false
     if-no-changes: ignore
-    max-patch-size: 512
+    # gh-aw also applies max-patch-size to the signed-commit payload, which
+    # carries the full contents of every changed file. The line-limit step
+    # above bounds the diff itself.
+    max-patch-size: 4096
     max-patch-files: 4
 ---
 
