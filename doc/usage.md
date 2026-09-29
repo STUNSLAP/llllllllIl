@@ -306,6 +306,7 @@ python3 scripts/nvx.py run
     [--host-loopback {allow,deny}]
     [--network-proxy IPV4:TCP-PORT]
     [--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT]...
+    [--outcome-report PATH]
     [--cmdline TEXT]
     [--restore-snapshot PATH]
     [--restore-processors {1,2,4,8}]
@@ -333,6 +334,7 @@ python3 scripts/nvx.py run
 | `--host-loopback {allow,deny}` | existing mapping | Control guest access to host loopback services. |
 | `--network-proxy IPV4:TCP-PORT` | none | Allow one explicit host TCP proxy endpoint. |
 | `--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT` | none | Publish one TCP or UDP localhost port to the guest; repeat to add forwards. |
+| `--outcome-report PATH` | none | Write a bounded local JSON outcome report. |
 | `--cmdline TEXT` | empty | Append kernel parameters; `nvx_*` and `tsc=` tokens are reserved. |
 | `--restore-snapshot PATH` | none | Restore the immutable machine contract and saved state from a snapshot directory. |
 | `--restore-processors {1,2,4,8}` | none | Bring this contiguous processor prefix online before restore readiness. Requires an opt-in microVM snapshot and cannot exceed `--processors` capacity. |
@@ -360,6 +362,7 @@ python3 scripts/nvx.py sandbox
     [--hypervisor {auto,whp,kvm,mshv}]
     [--net IPV4/PREFIX]
     [--network-profile {portable}]
+    [--outcome-report PATH]
     [--cmdline TEXT]
     [--dry-run]
 ```
@@ -377,6 +380,7 @@ python3 scripts/nvx.py sandbox
 | `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the host hypervisor. |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with a static guest address. |
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
+| `--outcome-report PATH` | none | Write a bounded local JSON outcome report for one-shot `run` or managed `exec`. |
 | `--cmdline TEXT` | empty | Append non-sandbox kernel parameters; `nvx_*` and `tsc=` tokens are reserved. |
 | `--dry-run` | off | Print the generated OpenVMM microVM command without running it. |
 
