@@ -263,6 +263,25 @@ def _format_command(command: list[str]) -> str:
     return subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
 
 
+def _extend_network_arguments(command: list[str], args: argparse.Namespace) -> None:
+    if args.net is not None:
+        command.extend(["--net", args.net, "--network-profile", args.network_profile])
+    if args.network_egress is not None:
+        command.extend(["--network-egress", args.network_egress])
+    if args.network_ingress is not None:
+        command.extend(["--network-ingress", args.network_ingress])
+    for rule in args.network_egress_allow:
+        command.extend(["--network-egress-allow", rule])
+    for rule in args.network_egress_deny:
+        command.extend(["--network-egress-deny", rule])
+    if args.host_loopback is not None:
+        command.extend(["--host-loopback", args.host_loopback])
+    if args.network_proxy is not None:
+        command.extend(["--network-proxy", args.network_proxy])
+    for forward in args.host_loopback_forward:
+        command.extend(["--host-loopback-forward", forward])
+
+
 def command_run(args: argparse.Namespace) -> None:
     if (args.net is None) != (args.network_profile is None):
         raise ScriptError("--net and --network-profile must be specified together")
@@ -336,22 +355,7 @@ def command_run(args: argparse.Namespace) -> None:
         command.extend(["--mount", args.mount])
     for denied_path in args.mount_deny:
         command.extend(["--mount-deny", str(denied_path)])
-    if args.net is not None:
-        command.extend(["--net", args.net, "--network-profile", args.network_profile])
-    if args.network_egress is not None:
-        command.extend(["--network-egress", args.network_egress])
-    if args.network_ingress is not None:
-        command.extend(["--network-ingress", args.network_ingress])
-    for rule in args.network_egress_allow:
-        command.extend(["--network-egress-allow", rule])
-    for rule in args.network_egress_deny:
-        command.extend(["--network-egress-deny", rule])
-    if args.host_loopback is not None:
-        command.extend(["--host-loopback", args.host_loopback])
-    if args.network_proxy is not None:
-        command.extend(["--network-proxy", args.network_proxy])
-    for forward in args.host_loopback_forward:
-        command.extend(["--host-loopback-forward", forward])
+    _extend_network_arguments(command, args)
     if args.outcome_report is not None:
         command.extend(["--microvm-report", str(args.outcome_report)])
     if args.cmdline:
@@ -477,22 +481,7 @@ def command_sandbox(args: argparse.Namespace) -> None:
         "--cmdline",
         launch.kernel_command_line(args.cmdline),
     ]
-    if args.net is not None:
-        command.extend(["--net", args.net, "--network-profile", args.network_profile])
-    if args.network_egress is not None:
-        command.extend(["--network-egress", args.network_egress])
-    if args.network_ingress is not None:
-        command.extend(["--network-ingress", args.network_ingress])
-    for rule in args.network_egress_allow:
-        command.extend(["--network-egress-allow", rule])
-    for rule in args.network_egress_deny:
-        command.extend(["--network-egress-deny", rule])
-    if args.host_loopback is not None:
-        command.extend(["--host-loopback", args.host_loopback])
-    if args.network_proxy is not None:
-        command.extend(["--network-proxy", args.network_proxy])
-    for forward in args.host_loopback_forward:
-        command.extend(["--host-loopback-forward", forward])
+    _extend_network_arguments(command, args)
     if args.outcome_report is not None:
         command.extend(["--microvm-report", str(args.outcome_report)])
     print(f">> {_format_command(command)}")
