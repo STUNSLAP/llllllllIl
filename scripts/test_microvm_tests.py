@@ -2038,7 +2038,9 @@ class MicrovmTests(unittest.TestCase):
                     )
                     environment = entry.kwargs["environment"]
                     self.assertEqual(
-                        environment["OPENVMM_LOG"], "off,virt_mshv::x86_64::tsc=info"
+                        environment["OPENVMM_LOG"],
+                        "off,vmm_core::partition_unit::vp_set::tsc=debug,"
+                        "virt_mshv::x86_64::tsc=info",
                     )
                     self.assertEqual(environment[benchmark.SNAPSHOT_PROFILE_ENV], "1")
 

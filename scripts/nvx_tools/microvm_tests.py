@@ -141,8 +141,11 @@ GUEST_BOOT_COMPLETION_MARKER = b"NVX-GUEST-BOOT-CHECK-OK"
 GUEST_IDENTITY_COMPLETION_MARKER = b"NVX-GUEST-IDENTITY-OK"
 RESTORE_PROCESSORS_FAILURE_MARKER = b"NVX-RESTORE-PROCESSORS-FAIL"
 RESTORE_UNSTABLE_TSC_FAILURE = "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc"
-# Records which restored MSHV APs were aligned to the BSP counter.
-RESTORE_TSC_LOG_FILTER = "off,virt_mshv::x86_64::tsc=info"
+# Records each VP's applied restore downtime and which restored MSHV APs were
+# aligned to the BSP counter.
+RESTORE_TSC_LOG_FILTER = (
+    "off,vmm_core::partition_unit::vp_set::tsc=debug,virt_mshv::x86_64::tsc=info"
+)
 TSC_CONTROL_PROCESSORS = 8
 TSC_CONTROL_ROUNDS = 20
 TSC_CONTROL_COMPLETION_MARKER = b"NVX-TSC-CONTROL-DONE"
