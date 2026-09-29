@@ -51,7 +51,7 @@ from nvx_tools.build_constants import (
     BuildConstants,
     OpenVMMBuildConstants,
 )
-from nvx_tools.common import ScriptError, require_tool
+from nvx_tools.common import ScriptError, remaining_timeout, require_tool
 from nvx_tools.release import verify_source_tree
 
 COPILOT_CREDIT_RESERVATION = 30
@@ -654,10 +654,6 @@ class ExecutorClient:
         self.close()
 
 
-def _remaining(deadline: float) -> float:
-    return max(0.0, deadline - time.monotonic())
-
-
 def _finalization_reserve(config: CampaignConfig) -> float:
     return (
         min(config.action_timeout, config.phase_timeout * 2)
@@ -1056,7 +1052,7 @@ def _quarantine_after_protocol_failure(
     action_timeout: float,
     label: str,
 ) -> dict[str, object] | None:
-    remaining = _remaining(deadline)
+    remaining = remaining_timeout(deadline)
     artifact_path = run_dir / f"{label}-quarantine.json"
     if remaining <= EXECUTOR_PROTOCOL_GRACE_SECONDS + 1.0:
         write_json(
@@ -1149,7 +1145,7 @@ def _prefix_reproduces(
     expected_case: str | None,
     expected_suspected_escape: bool,
 ) -> bool:
-    remaining = _remaining(deadline)
+    remaining = remaining_timeout(deadline)
     if remaining <= EXECUTOR_INITIALIZE_OVERHEAD_SECONDS + 1.0:
         raise ScriptError("campaign time budget exhausted during minimization")
     with ExecutorClient(
@@ -1175,7 +1171,7 @@ def _prefix_reproduces(
         observed_failure: tuple[str, str | None, bool] | None = None
         quarantine = False
         for sequence, action in enumerate(actions, start=1):
-            remaining = _remaining(deadline)
+            remaining = remaining_timeout(deadline)
             if remaining <= EXECUTOR_PROTOCOL_GRACE_SECONDS + 1.0:
                 raise ScriptError("campaign time budget exhausted during minimization")
             client_timeout = min(
@@ -1205,7 +1201,7 @@ def _prefix_reproduces(
                 observed_failure = _action_failure_fingerprint(result)
                 quarantine = result.suspected_escape
                 break
-        remaining = _remaining(deadline)
+        remaining = remaining_timeout(deadline)
         if remaining > EXECUTOR_PROTOCOL_GRACE_SECONDS + 1.0:
             finalized = _finalize_executor(
                 client,
@@ -1261,7 +1257,7 @@ def _minimize_failure(
         candidate_length = len(minimized) - 1
         if (
             candidate_length <= 0
-            or _remaining(deadline) <= EXECUTOR_INITIALIZE_OVERHEAD_SECONDS + 1.0
+            or remaining_timeout(deadline) <= EXECUTOR_INITIALIZE_OVERHEAD_SECONDS + 1.0
         ):
             break
         candidate = (
@@ -1535,7 +1531,7 @@ def run_campaign(config: CampaignConfig) -> CampaignOutcome:
             command=config.executor_command,
             label="primary",
         ) as executor:
-            remaining = _remaining(deadline)
+            remaining = remaining_timeout(deadline)
             if remaining <= EXECUTOR_INITIALIZE_OVERHEAD_SECONDS + 1.0:
                 raise ScriptError("campaign time budget exhausted before preflight")
             initialized = _initialize_executor(
@@ -1560,7 +1556,7 @@ def run_campaign(config: CampaignConfig) -> CampaignOutcome:
                     model=config.model,
                     credit_budget=config.budget_ai_credits,
                 )
-                remaining = _remaining(deadline)
+                remaining = remaining_timeout(deadline)
                 controller.smoke_test(
                     timeout=min(
                         120.0,
@@ -1595,7 +1591,7 @@ def run_campaign(config: CampaignConfig) -> CampaignOutcome:
                 ),
             )
             while len(actions) < config.budget_actions:
-                remaining = _remaining(deadline)
+                remaining = remaining_timeout(deadline)
                 finalization_reserve = _finalization_reserve(config)
                 if remaining <= finalization_reserve:
                     if replay_actions is None:
@@ -1635,7 +1631,7 @@ def run_campaign(config: CampaignConfig) -> CampaignOutcome:
                         remaining_actions=config.budget_actions - len(actions),
                         seed=config.seed,
                     )
-                remaining = _remaining(deadline)
+                remaining = remaining_timeout(deadline)
                 available = remaining - finalization_reserve
                 if available <= EXECUTOR_PROTOCOL_GRACE_SECONDS + 1.0:
                     if replay_actions is None:
@@ -1693,7 +1689,7 @@ def run_campaign(config: CampaignConfig) -> CampaignOutcome:
                     category = "action-budget-exhausted"
                 status = "passed"
             results = broker.results
-            remaining = _remaining(deadline)
+            remaining = remaining_timeout(deadline)
             if remaining <= EXECUTOR_PROTOCOL_GRACE_SECONDS + 1.0:
                 raise ScriptError(
                     "campaign time budget exhausted before post-campaign canary boot"
@@ -1779,7 +1775,7 @@ def run_campaign(config: CampaignConfig) -> CampaignOutcome:
         and actions
         and target_failure
         and failure is None
-        and _remaining(deadline) > 1.0
+        and remaining_timeout(deadline) > 1.0
     )
     if (
         should_minimize

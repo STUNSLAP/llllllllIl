@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,6 +26,10 @@ from .build_constants import (
 
 class ScriptError(RuntimeError):
     """Raised for an actionable command-line workflow failure."""
+
+
+def remaining_timeout(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
 
 
 def artifact_path(name: str) -> Path:
