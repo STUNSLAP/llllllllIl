@@ -45,6 +45,7 @@ from nvx_tools.adversarial_broker import (
 )
 from nvx_tools.adversarial_executor import (
     AdversarialExecutor,
+    _artifact_metadata,
     _close_oracles_after_failure,
     _InitializedSession,
     _inventory_outcomes,
@@ -59,7 +60,13 @@ from nvx_tools.adversarial_oracles import (
     run_bounded_process,
 )
 from nvx_tools.benchmark import InteractiveProcess
-from nvx_tools.build_constants import ReleaseBuildConstants
+from nvx_tools.build_constants import (
+    AlpineBuildConstants,
+    InitramfsBuildConstants,
+    KernelBuildConstants,
+    OpenVMMBuildConstants,
+    ReleaseBuildConstants,
+)
 from nvx_tools.common import ScriptError
 
 
@@ -1577,6 +1584,44 @@ class CopilotContainmentTests(unittest.TestCase):
         self.assertNotIn("COPILOT_GITHUB_TOKEN", environment)
         self.assertNotIn("SSH_AUTH_SOCK", environment)
         self.assertNotIn("UNRELATED_SECRET", environment)
+
+    def test_executor_resolves_build_artifacts_with_shared_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            openvmm = root / OpenVMMBuildConstants.BINARY_NAME
+            openvmm.write_bytes(b"openvmm")
+
+            def artifact_path(name: str) -> Path:
+                path = root / name
+                path.write_bytes(name.encode())
+                return path
+
+            with (
+                patch(
+                    "nvx_tools.adversarial_executor.artifact_path",
+                    side_effect=artifact_path,
+                ) as resolve,
+                patch(
+                    "nvx_tools.adversarial_executor.openvmm_binary_path",
+                    return_value=openvmm,
+                ),
+                patch(
+                    "nvx_tools.adversarial_executor.validate_runtime_artifact_provenance"
+                ),
+            ):
+                _artifact_metadata()
+
+        self.assertEqual(
+            [entry.args[0] for entry in resolve.call_args_list],
+            [
+                KernelBuildConstants.BINARY_NAME,
+                AlpineBuildConstants.INITRAMFS_NAME,
+                AlpineBuildConstants.PACKAGE_MANIFEST_NAME,
+                InitramfsBuildConstants.PROVENANCE_NAME,
+                KernelBuildConstants.PROVENANCE_NAME,
+                OpenVMMBuildConstants.PROVENANCE_NAME,
+            ],
+        )
 
     def test_external_executor_also_drops_controller_credentials(self) -> None:
         process = MagicMock()
