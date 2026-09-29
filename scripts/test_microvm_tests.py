@@ -2309,6 +2309,35 @@ class MicrovmTests(unittest.TestCase):
                 if unstable:
                     self.assertIn(kernel_log, result.stdout)
 
+    def test_tsc_sync_control_script_fails_when_dmesg_fails(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        script = (
+            microvm_tests._render_script(
+                "tsc-sync-control.sh.in", PROCESSORS="4", ROUNDS="2"
+            ).replace("nvx-exit", "nvx_exit")
+        )
+
+        result = subprocess.run(
+            [shell, "-s"],
+            input=(
+                "getconf() { printf '4\\n'; }\n"
+                "cat() { printf 'flags : tsc rdtscp\\n'; }\n"
+                "dmesg() { return 71; }\n"
+                'nvx_exit() { exit "$1"; }\n' + script
+            ),
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 71, result.stdout + result.stderr)
+        self.assertIn("NVX-TSC-CONTROL-FAIL code=71", result.stdout)
+        self.assertNotIn("NVX-TSC-CONTROL-RESULT", result.stdout)
+        self.assertNotIn("NVX-TSC-CONTROL-DONE", result.stdout)
+
     def test_restore_memory_reuses_one_base_snapshot_for_all_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

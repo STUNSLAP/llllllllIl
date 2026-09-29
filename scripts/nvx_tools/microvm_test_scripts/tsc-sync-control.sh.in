@@ -9,7 +9,8 @@ fail() {
 trap 'status=$?; if [ "$status" -ne 0 ]; then fail "$status"; fi' EXIT
 
 tsc_unstable() {
-    case "$(dmesg)" in
+    kernel_log="$(dmesg)" || fail "$?"
+    case "$kernel_log" in
         *"TSC warp"* | *"Marking TSC unstable"* | *"TSC found unstable"*) return 0 ;;
     esac
     return 1
