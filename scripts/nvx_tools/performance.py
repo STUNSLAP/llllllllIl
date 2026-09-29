@@ -802,12 +802,16 @@ def read_workload_dimensions(
     input_dir: Path, expected_platform: str
 ) -> tuple[BenchmarkDimensions, dict[str, object] | None]:
     metadata_path = input_dir / BENCHMARK_METADATA_FILENAME
-    if not metadata_path.exists():
-        return BenchmarkDimensions(expected_platform, 1, 1), None
     try:
         document = _json_object(
             json.loads(metadata_path.read_text(encoding="utf-8")), str(metadata_path)
         )
+    except FileNotFoundError:
+        return BenchmarkDimensions(expected_platform, 1, 1), None
+    except OSError as error:
+        raise PerformanceError(
+            f"cannot read benchmark metadata {metadata_path}: {error}"
+        ) from error
     except (UnicodeError, json.JSONDecodeError) as error:
         raise PerformanceError(
             f"invalid benchmark metadata JSON {metadata_path}: {error}"
