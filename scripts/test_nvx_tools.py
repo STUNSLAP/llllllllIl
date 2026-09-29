@@ -710,6 +710,48 @@ class CliTests(unittest.TestCase):
         with self.assertRaisesRegex(common.ScriptError, "--net and --network-profile"):
             nvx.command_run(missing_network)
 
+    def test_run_and_sandbox_forward_network_arguments(self):
+        network_arguments = (
+            "--net 10.0.0.2/24 --network-profile portable "
+            "--network-egress deny --network-ingress deny "
+            "--network-egress-allow 140.82.112.0/20:tcp:443 "
+            "--network-egress-deny 10.0.0.0/8 --host-loopback allow "
+            "--network-proxy 10.0.0.1:3128 --host-loopback-forward tcp:8080:80"
+        ).split()
+        commands = [
+            ["run", "--dry-run", *network_arguments],
+            [
+                "sandbox",
+                "--dry-run",
+                "--layer",
+                "distro,distro.erofs,11111111-1111-1111-1111-111111111111",
+                "--scratch",
+                "scratch.ext4",
+                *network_arguments,
+            ],
+        ]
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        for arguments in commands:
+            with self.subTest(command=arguments[0]):
+                args = nvx.parse_args(arguments)
+                with (
+                    patch.object(nvx, "require_file", side_effect=require),
+                    patch.object(sandbox, "require_file", side_effect=require),
+                    patch.object(
+                        nvx, "_format_command", return_value="formatted"
+                    ) as format_command,
+                ):
+                    args.handler(args)
+
+                command = format_command.call_args.args[0]
+                self.assertEqual(
+                    command[command.index("--net") :],
+                    network_arguments,
+                )
+
     def test_run_parses_denied_filesystem_paths(self):
         args = nvx.parse_args(
             [
