@@ -941,6 +941,30 @@ class MicrovmTests(unittest.TestCase):
                 self.assertEqual(log_path.read_bytes(), result.output)
                 self.assertEqual(queues.return_value.get.call_count, 4)
 
+    def test_process_wait_clamps_elapsed_process_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(openvmm_process, "InteractiveProcess") as interaction,
+                patch.object(openvmm_process.threading, "Thread"),
+                patch.object(openvmm_process.queue, "Queue") as queues,
+                patch.object(
+                    openvmm_process.time,
+                    "monotonic",
+                    side_effect=[0.0, 0.25, 2.0],
+                ),
+            ):
+                interaction.return_value.process.poll.return_value = 0
+                interaction.return_value.process.wait.return_value = 0
+                queues.return_value.get.return_value = None
+                queues.return_value.get_nowait.side_effect = queue.Empty
+                with openvmm_process.OpenvmmProcess(
+                    ["openvmm"], Path(temporary) / "output.log"
+                ) as process:
+                    process.wait(1.0)
+                interaction.return_value.process.wait.assert_called_once_with(
+                    timeout=0.0
+                )
+
     def test_process_wait_for_accepts_marker_after_process_exit(self):
         with tempfile.TemporaryDirectory() as temporary:
             log_path = Path(temporary) / "output.log"
