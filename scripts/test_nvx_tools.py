@@ -4719,6 +4719,27 @@ class SandboxTests(unittest.TestCase):
             self.assertEqual(config["workload_uid"], 65534)
             self.assertEqual(config["hypervisor"], "whp")
             self.assertFalse((state / sandbox_lifecycle.RUNTIME_NAME).exists())
+
+            config["network_egress_allow"] = None
+            (state / sandbox_lifecycle.CONFIG_NAME).write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(
+                    sandbox_lifecycle,
+                    "require_file",
+                    side_effect=require,
+                ),
+                self.assertRaisesRegex(
+                    common.ScriptError, "sandbox configuration is malformed"
+                ),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
             with self.assertRaisesRegex(common.ScriptError, "already provisioned"):
                 sandbox_lifecycle.provision(
                     state,
