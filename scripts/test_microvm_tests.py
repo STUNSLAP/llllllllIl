@@ -2096,6 +2096,11 @@ class MicrovmTests(unittest.TestCase):
                     "run_fresh_boot_tsc_control",
                     return_value="fresh-boot TSC control: verdict",
                 ) as control,
+                patch.object(
+                    microvm_tests,
+                    "_host_invariant_tsc_note",
+                    return_value="host clock: note\n",
+                ),
             ):
                 with self.assertRaises(RuntimeError) as raised:
                     microvm_tests.run_restore_processors(
@@ -2115,6 +2120,7 @@ class MicrovmTests(unittest.TestCase):
             "restore target 4: guest reported "
             "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc\n"
             "fresh-boot TSC control: verdict\n"
+            "host clock: note\n"
             "--- OpenVMM output ---\n"
             "Measured 45 cycles TSC warp between CPUs\r\n",
         )
@@ -2131,6 +2137,32 @@ class MicrovmTests(unittest.TestCase):
             timeout=30,
             log_path=output_dir / "restore-processors-tsc-control.log",
         )
+
+    def test_host_invariant_tsc_note_reads_the_cpu_flags(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cpuinfo = Path(temporary) / "cpuinfo"
+            cases = (
+                (
+                    "processor\t: 0\nflags\t\t: fpu tsc constant_tsc nonstop_tsc\n",
+                    "host CPU exposes an invariant TSC (nonstop_tsc)\n",
+                ),
+                (
+                    "processor\t: 0\nflags\t\t: fpu tsc constant_tsc tsc_known_freq\n",
+                    "host CPU does not expose an invariant TSC (nonstop_tsc); "
+                    "guests on this host intermittently see cross-vCPU TSC warps\n",
+                ),
+                ("processor\t: 0\n", ""),
+            )
+            for text, expected in cases:
+                with self.subTest(text=text):
+                    cpuinfo.write_text(text, encoding="utf-8")
+                    self.assertEqual(
+                        microvm_tests._host_invariant_tsc_note(cpuinfo), expected
+                    )
+            self.assertEqual(
+                microvm_tests._host_invariant_tsc_note(Path(temporary) / "missing"),
+                "",
+            )
 
     def test_restore_processors_reports_other_guest_failures_without_control(self):
         failure = benchmark.GuestFailureReported(
