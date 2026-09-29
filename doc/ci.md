@@ -30,6 +30,22 @@ runs with OpenVMM lifecycle profiling and must report exactly one
 `startup.vp_thread_bind` record. Its `startup.vp_bind_*` records must show that
 an explicit MSHV target binds exactly VPs `0..N-1`, while untargeted MSHV
 restores and all KVM and WHP restores bind the full capacity.
+On MSHV and WHP, the capture waits until Linux replaces its transitional
+`tsc-early` clocksource. A snapshot taken earlier can fail after restore
+without any cross-CPU skew, because the clocksource watchdog compares
+`tsc-early` with jiffies across the restore downtime, as described in
+[the benchmark guide](benchmarks.md).
+A restore fails as soon as its guest prints `NVX-RESTORE-PROCESSORS-FAIL`,
+rather than waiting for the phase timeout. Restore logs also record OpenVMM's
+`adjusted restored vCPU TSC` event for each VP, which includes the applied
+snapshot downtime, and its `aligning restored AP TSCs to the BSP` event, which
+reports how many created MSHV APs were aligned. When the guest reports
+`unstable-tsc`, the harness boots a never-restored eight-vCPU guest with the
+same forced warp check and reactivates each AP 20 times. The error then states
+whether this control also found TSC instability, which points to host or
+hypervisor clock skew rather than restore alignment, and the control log is
+kept as `restore-processors-tsc-control.log`. The control only classifies the
+failure; the restore still fails.
 
 The `restore-tsc-sync` scenario repeats the restore-processor sequence with
 the test-only kernel option `clearcpuid=tsc_adjust`. Linux normally skips its

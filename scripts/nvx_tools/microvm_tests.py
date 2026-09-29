@@ -23,6 +23,7 @@ from .benchmark import (
     SMP_PROBE_COMPLETION_MARKER,
     SNAPSHOT_PROFILE_ENV,
     GuestCommandResult,
+    GuestFailureReported,
     measure_once,
     parse_snapshot_profile_line,
     positive_float,
@@ -30,7 +31,7 @@ from .benchmark import (
     record_adversarial_openvmm_pid,
     smp_probe_script,
     snapshot_restore_command,
-    whp_stable_clocksource_wait_script,
+    stable_clocksource_wait_script,
     workload_boot_command,
 )
 from .benchmark import (
@@ -138,6 +139,17 @@ WORKLOAD_IDENTITY_MARKER = b"NVX-WORKLOAD-IDENTITY-OK uid=65534 gid=65534"
 BOOT_MARKER = b"NVX-GUEST-BOOT-OK:"
 GUEST_BOOT_COMPLETION_MARKER = b"NVX-GUEST-BOOT-CHECK-OK"
 GUEST_IDENTITY_COMPLETION_MARKER = b"NVX-GUEST-IDENTITY-OK"
+RESTORE_PROCESSORS_FAILURE_MARKER = b"NVX-RESTORE-PROCESSORS-FAIL"
+RESTORE_UNSTABLE_TSC_FAILURE = "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc"
+# Records each VP's applied restore downtime and which restored MSHV APs were
+# aligned to the BSP counter.
+RESTORE_TSC_LOG_FILTER = (
+    "off,vmm_core::partition_unit::vp_set::tsc=debug,virt_mshv::x86_64::tsc=info"
+)
+TSC_CONTROL_PROCESSORS = 8
+TSC_CONTROL_ROUNDS = 20
+TSC_CONTROL_COMPLETION_MARKER = b"NVX-TSC-CONTROL-DONE"
+TSC_CONTROL_RESULT_PREFIX = "NVX-TSC-CONTROL-RESULT "
 OUTCOME_TOP_LEVEL_FIELDS = frozenset(
     {
         "schema_version",
@@ -311,7 +323,7 @@ def _snapshot_core_script(backend: str) -> str:
             'current_clocksource)" = kvm-clock ] || fail 46'
         )
     elif backend == "whp":
-        select_clocksource = whp_stable_clocksource_wait_script()
+        select_clocksource = stable_clocksource_wait_script()
         validate_clocksource = (
             '[ "$(cat /sys/devices/system/clocksource/clocksource0/'
             'current_clocksource)" != tsc-early ] || fail 46'
@@ -2055,6 +2067,72 @@ def _check_restore_vp_bindings(
         )
 
 
+def _tsc_control_verdict(text: str) -> str:
+    """Summarize the fresh-boot TSC control result printed by the guest."""
+    for line in text.splitlines():
+        line = line.removesuffix("\r")
+        if line.startswith(TSC_CONTROL_RESULT_PREFIX):
+            fields = line.removeprefix(TSC_CONTROL_RESULT_PREFIX)
+            state, _, activations = fields.partition(" activations=")
+            if state == "stable" and activations.isdecimal():
+                return (
+                    "fresh-boot TSC control: no TSC instability across "
+                    f"{activations} CPU activations without snapshot restore"
+                )
+            if state == "unstable" and activations.isdecimal():
+                return (
+                    "fresh-boot TSC control: Linux also found TSC instability "
+                    f"without snapshot restore after {activations} CPU activations"
+                )
+            break
+    return "fresh-boot TSC control did not report a result"
+
+
+def run_fresh_boot_tsc_control(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    log_path: Path,
+) -> str:
+    """Check whether a never-restored guest reproduces a restore TSC failure.
+
+    The guest boots every processor with Linux's cross-CPU TSC warp check
+    forced, then repeatedly reactivates each AP against CPU 0. The result only
+    classifies the failure that triggered it.
+    """
+    command = workload_boot_command(
+        executable,
+        backend,
+        kernel,
+        initrd,
+        memory_mib,
+        "quiet loglevel=0 clearcpuid=tsc_adjust",
+        processors=TSC_CONTROL_PROCESSORS,
+    )
+    script = _render_script(
+        "tsc-sync-control.sh.in",
+        PROCESSORS=str(TSC_CONTROL_PROCESSORS),
+        ROUNDS=str(TSC_CONTROL_ROUNDS),
+    )
+    try:
+        result = run_guest_script(
+            command,
+            script,
+            TSC_CONTROL_COMPLETION_MARKER,
+            timeout=timeout,
+            log_path=log_path,
+        )
+    except Exception as error:
+        # The control only annotates the restore failure that triggered it.
+        summary = str(error).splitlines()[0] if str(error) else type(error).__name__
+        return f"fresh-boot TSC control did not complete: {summary}"
+    return _tsc_control_verdict(result["text"])
+
+
 def run_restore_processors(
     executable: Path,
     kernel: Path,
@@ -2077,6 +2155,7 @@ def run_restore_processors(
     # The VP-binding lifecycle records identify the VPs that each restore
     # instantiates without changing restore behavior.
     environment = _restore_environment()
+    environment["OPENVMM_LOG"] = RESTORE_TSC_LOG_FILTER
     environment[SNAPSHOT_PROFILE_ENV] = "1"
     with tempfile.TemporaryDirectory(prefix="nvx-restore-processors-") as temporary:
         snapshot_path = Path(temporary) / "snapshot"
@@ -2106,21 +2185,40 @@ def run_restore_processors(
             online = boot_online if target is None else target
             marker = f"NVX-RESTORE-PROCESSORS-OK count={online}".encode()
             log_path = output_dir / f"restore-processors-{name}.log"
-            measure_once(
-                snapshot_restore_command(
-                    executable,
-                    backend,
-                    snapshot_path,
-                    processors=capacity,
-                    restore_processors=target,
-                ),
-                environment=environment,
-                timeout=timeout,
-                marker=marker,
-                marker_must_be_line=True,
-                guest_exit_prequeued=True,
-                log_path=log_path,
-            )
+            try:
+                measure_once(
+                    snapshot_restore_command(
+                        executable,
+                        backend,
+                        snapshot_path,
+                        processors=capacity,
+                        restore_processors=target,
+                    ),
+                    environment=environment,
+                    timeout=timeout,
+                    marker=marker,
+                    marker_must_be_line=True,
+                    guest_exit_prequeued=True,
+                    log_path=log_path,
+                    failure_marker=RESTORE_PROCESSORS_FAILURE_MARKER,
+                )
+            except GuestFailureReported as error:
+                verdict = ""
+                if error.line == RESTORE_UNSTABLE_TSC_FAILURE:
+                    verdict = run_fresh_boot_tsc_control(
+                        executable,
+                        kernel,
+                        initrd,
+                        backend,
+                        memory_mib=memory_mib,
+                        timeout=timeout,
+                        log_path=output_dir / "restore-processors-tsc-control.log",
+                    )
+                    verdict += "\n"
+                raise RuntimeError(
+                    f"{_restore_label(target)}: guest reported {error.line}\n"
+                    f"{verdict}--- OpenVMM output ---\n{error.output_tail}"
+                ) from error
             _check_restore_vp_bindings(
                 log_path.read_bytes(),
                 backend,

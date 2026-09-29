@@ -5438,6 +5438,73 @@ class BenchmarkTests(unittest.TestCase):
                     interaction.process, benchmark.TEARDOWN_TIMEOUT_SECONDS
                 )
 
+    def test_completed_output_line_with_prefix_requires_a_whole_line(self):
+        prefix = b"NVX-RESTORE-PROCESSORS-FAIL"
+        self.assertIsNone(
+            benchmark.completed_output_line_with_prefix(
+                b"NVX-RESTORE-PROCESSORS-FAIL unst", prefix
+            )
+        )
+        self.assertIsNone(
+            benchmark.completed_output_line_with_prefix(
+                b'> echo "NVX-RESTORE-PROCESSORS-FAIL count=$n"\r\n', prefix
+            )
+        )
+        self.assertEqual(
+            benchmark.completed_output_line_with_prefix(
+                b"guest\r\nNVX-RESTORE-PROCESSORS-FAIL unstable-tsc\r\nmore", prefix
+            ),
+            b"NVX-RESTORE-PROCESSORS-FAIL unstable-tsc",
+        )
+
+    def test_measure_once_stops_at_a_completed_guest_failure_marker(self):
+        class FakeInteraction:
+            def __init__(self):
+                self.process = MagicMock(pid=123)
+                self.process.poll.return_value = None
+
+            def read_output(self, chunks: queue.Queue[bytes | None]):
+                chunks.put(b'> echo "NVX-RESTORE-PROCESSORS-FAIL count=$n"\r\n')
+                chunks.put(b"Measured 6 cycles TSC warp between CPUs\r\n")
+                chunks.put(b"NVX-RESTORE-PROCESSORS-FAIL unst")
+                chunks.put(b"able-tsc\r\n")
+
+            def write_input(self, data: bytes):
+                raise AssertionError(f"unexpected input: {data!r}")
+
+            def close(self):
+                pass
+
+        interaction = FakeInteraction()
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "restore.log"
+            with (
+                patch.object(benchmark, "InteractiveProcess", return_value=interaction),
+                patch.object(benchmark, "terminate") as terminate,
+                patch.object(benchmark, "wait_for_process_exit") as wait,
+            ):
+                with self.assertRaises(benchmark.GuestFailureReported) as raised:
+                    benchmark.measure_once(
+                        ["openvmm"],
+                        environment={},
+                        timeout=60,
+                        marker=b"NVX-RESTORE-PROCESSORS-OK count=8",
+                        marker_must_be_line=True,
+                        guest_exit_prequeued=True,
+                        log_path=log_path,
+                        failure_marker=b"NVX-RESTORE-PROCESSORS-FAIL",
+                    )
+            log = log_path.read_bytes()
+
+        self.assertEqual(
+            raised.exception.line, "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc"
+        )
+        self.assertIn("TSC warp", raised.exception.output_tail)
+        self.assertIn("--- OpenVMM output ---", str(raised.exception))
+        terminate.assert_called_once_with(interaction.process)
+        wait.assert_not_called()
+        self.assertTrue(log.endswith(b"NVX-RESTORE-PROCESSORS-FAIL unstable-tsc\r\n"))
+
     def test_live_peak_rss_samples_linux_process_without_reaping(self):
         process = MagicMock(pid=123)
         with (
@@ -5820,6 +5887,25 @@ class BenchmarkTests(unittest.TestCase):
                 f"{benchmark.SNAPSHOT_CAPTURE_PATH}\n"
             )
         )
+
+    def test_mshv_and_whp_capture_after_linux_leaves_tsc_early(self):
+        wait = benchmark.stable_clocksource_wait_script()
+        for backend, waits in (("mshv", True), ("whp", True), ("kvm", False)):
+            with self.subTest(backend=backend):
+                script = benchmark.prepare_snapshot_capture_script(
+                    1, backend=backend, teardown_mode="guest-exit"
+                )
+                probe = script.split("<<'NVX_SMP_PROBE_SCRIPT'\n", 1)[1]
+                probe = probe.split("NVX_SMP_PROBE_SCRIPT\n", 1)[0]
+                self.assertEqual(probe.startswith(wait), waits)
+                self.assertEqual("SMP-CLOCKSOURCE-FAIL expected=stable" in probe, waits)
+                if waits:
+                    # The wait and its check run before the probe completes, so
+                    # the host requests the snapshot only after tsc-early is gone.
+                    self.assertLess(
+                        probe.index("SMP-CLOCKSOURCE-FAIL"),
+                        probe.index("NVX-SMP-PROBE-OK"),
+                    )
 
     def test_output_marker_must_be_a_complete_line(self):
         marker = benchmark.RESTORE_MARKER
