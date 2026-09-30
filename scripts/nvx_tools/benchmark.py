@@ -39,7 +39,7 @@ from .build_constants import (
     KernelBuildConstants,
     OpenVMMBuildConstants,
 )
-from .common import sha256_file
+from .common import bytes_to_mib, sha256_file
 
 BOOT_MARKER = b"ALPINE-MICROVM-BOOT-OK"
 RESTORE_MARKER = b"OPENVMM-SNAPSHOT-RESTORE-OK"
@@ -1199,10 +1199,6 @@ def summarize_lifecycle_profiles(
         "raw_samples": raw_samples,
         "phases": phases,
     }
-
-
-def bytes_to_mib(value: int | float) -> float:
-    return value / (1024 * 1024)
 
 
 def terminate(process: subprocess.Popen[bytes]) -> None:
