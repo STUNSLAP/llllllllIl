@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
 import re
@@ -35,6 +36,13 @@ def strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise ScriptError(f"duplicate JSON property: {key}")
         result[key] = value
     return result
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 def remaining_timeout(deadline: float) -> float:
