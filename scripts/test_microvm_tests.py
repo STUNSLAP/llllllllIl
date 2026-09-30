@@ -1415,6 +1415,21 @@ class MicrovmTests(unittest.TestCase):
         self.assertIn("captured-workload-id", checkpoint)
         self.assertNotIn("@CAPTURE_ACTION@", checkpoint)
 
+    def test_snapshot_tier_entry_points_reject_unsupported_tiers(self):
+        with self.assertRaisesRegex(ValueError, "unsupported snapshot tier 'invalid'"):
+            microvm_tests._snapshot_tier_script("invalid")
+        with self.assertRaisesRegex(ValueError, "unsupported snapshot tier 'invalid'"):
+            microvm_tests._run_snapshot_tier(
+                "invalid",
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=60,
+                output_dir=Path("logs"),
+            )
+
     def test_snapshot_tier_runner_dispatches_all_tiers(self):
         with patch.object(microvm_tests, "_run_snapshot_tier") as run_tier:
             microvm_tests.run_snapshot_tiers(
