@@ -3930,6 +3930,16 @@ class BuildTests(unittest.TestCase):
             ],
         )
 
+    def test_ubuntu_package_lock_read_errors_are_actionable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "packages.json"
+            path.write_text("{", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                common.ScriptError, "failed to read Ubuntu package lock"
+            ):
+                ubuntu.load_package_lock(path)
+
     def test_ubuntu_safe_extractor_rejects_archive_symlink_escape(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
