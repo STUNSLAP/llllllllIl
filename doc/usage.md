@@ -306,6 +306,7 @@ python3 scripts/nvx.py run
     [--network-ingress {allow,deny}]
     [--network-egress-allow CIDR[:PROTOCOL:PORT]]...
     [--network-egress-deny CIDR[:PROTOCOL:PORT]]...
+    [--network-egress-policy-file PATH]
     [--host-loopback {allow,deny}]
     [--network-proxy IPV4:TCP-PORT]
     [--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT]...
@@ -334,6 +335,7 @@ python3 scripts/nvx.py run
 | `--network-ingress {allow,deny}` | `deny` | Set the default host ingress policy. The portable profile currently supports only `deny`; `allow` is rejected before launch. |
 | `--network-egress-allow CIDR[:PROTOCOL:PORT]` | none | Allow matching guest egress; repeat to add rules. |
 | `--network-egress-deny CIDR[:PROTOCOL:PORT]` | none | Deny matching guest egress; repeat to add rules. Deny rules take precedence. |
+| `--network-egress-policy-file PATH` | none | Load bounded IPv4 ranges and rule-local CIDR exclusions from JSON. Requires explicit `--network-egress`; cannot be mixed with explicit allow/deny rule flags. |
 | `--host-loopback {allow,deny}` | existing mapping | Control guest access to host loopback services. |
 | `--network-proxy IPV4:TCP-PORT` | none | Allow one explicit host TCP proxy endpoint. |
 | `--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT` | none | Publish one TCP or UDP localhost port to the guest; repeat to add forwards. |
@@ -374,6 +376,7 @@ python3 scripts/nvx.py sandbox
     [--network-ingress {allow,deny}]
     [--network-egress-allow CIDR[:PROTOCOL:PORT]]...
     [--network-egress-deny CIDR[:PROTOCOL:PORT]]...
+    [--network-egress-policy-file PATH]
     [--host-loopback {allow,deny}]
     [--network-proxy IPV4:TCP-PORT]
     [--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT]...
@@ -406,6 +409,7 @@ Network policy options configure only the `run` and `provision` launches.
 | `--network-ingress {allow,deny}` | `deny` | Set the host ingress policy for `run` or `provision`. The portable profile supports only `deny`. |
 | `--network-egress-allow CIDR[:PROTOCOL:PORT]` | none | Allow matching guest egress; repeat to add rules. Requires explicit `--network-egress`. |
 | `--network-egress-deny CIDR[:PROTOCOL:PORT]` | none | Deny matching guest egress; repeat to add rules. Requires explicit `--network-egress`; deny rules take precedence. |
+| `--network-egress-policy-file PATH` | none | Load bounded IPv4 ranges and rule-local CIDR exclusions for `run` or `provision`. Managed provision persists lowered rules, not this path. Requires explicit `--network-egress`; cannot be mixed with explicit allow/deny rule flags. |
 | `--host-loopback {allow,deny}` | existing mapping | Control guest access to host loopback services for `run` or `provision`. |
 | `--network-proxy IPV4:TCP-PORT` | none | Allow one explicit host TCP proxy endpoint; the IPv4 address must match the guest gateway. |
 | `--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT` | none | Publish one TCP or UDP localhost port to the guest; repeat to add forwards and set `--host-loopback allow`. |

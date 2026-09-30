@@ -1663,6 +1663,22 @@ class MicrovmTests(unittest.TestCase):
                 ingress="deny",
             )
 
+    def test_bounded_egress_acceptance_policy_lowers_ranges_and_exclusions(self):
+        policy = microvm_tests._bounded_egress_policy(
+            "192.0.2.1",
+            (21001, 21002, 21003),
+            (22001, 22002, 22003),
+        )
+
+        self.assertIn("192.0.2.0/24:tcp:21001", policy.allow)
+        self.assertIn("192.0.2.0/24:tcp:21003", policy.allow)
+        self.assertIn("192.0.2.0/24:udp:22001", policy.allow)
+        self.assertIn("192.0.2.0/24:udp:22003", policy.allow)
+        self.assertIn("192.0.2.0/24:tcp:21002", policy.deny)
+        self.assertIn("192.0.2.0/24:udp:22002", policy.deny)
+        self.assertNotIn("192.0.2.0/24:tcp:21000", policy.allow)
+        self.assertNotIn("192.0.2.0/24:tcp:21004", policy.allow)
+
     def test_sandbox_blocks_use_fixed_roles_and_access(self):
         with (
             patch.object(

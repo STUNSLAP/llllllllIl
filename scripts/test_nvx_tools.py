@@ -752,6 +752,192 @@ class CliTests(unittest.TestCase):
                     network_arguments,
                 )
 
+    def test_run_lowers_structured_egress_policy_before_launch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            policy = Path(temporary) / "policy.json"
+            policy.write_text(
+                json.dumps(
+                    {
+                        "allow": [
+                            {
+                                "cidr": "192.0.2.0/24",
+                                "except": ["192.0.2.128/25"],
+                                "protocol": "tcp",
+                                "port": 8000,
+                                "endPort": 8001,
+                            },
+                            {"cidr": "192.0.2.200/32"},
+                        ],
+                        "deny": [
+                            {
+                                "cidr": "192.0.2.0/24",
+                                "protocol": "tcp",
+                                "port": 8001,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = nvx.parse_args(
+                [
+                    "run",
+                    "--dry-run",
+                    "--network-egress",
+                    "deny",
+                    "--network-egress-policy-file",
+                    str(policy),
+                ]
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(nvx, "require_file", side_effect=require),
+                patch.object(
+                    nvx, "_format_command", return_value="formatted"
+                ) as format_command,
+            ):
+                nvx.command_run(args)
+
+        command = format_command.call_args.args[0]
+        self.assertNotIn("--network-egress-policy-file", command)
+        self.assertEqual(command.count("--network-egress-allow"), 3)
+        self.assertIn("192.0.2.0/25:tcp:8000", command)
+        self.assertIn("192.0.2.0/25:tcp:8001", command)
+        self.assertIn("192.0.2.200/32", command)
+        self.assertEqual(command.count("--network-egress-deny"), 1)
+        self.assertIn("192.0.2.0/24:tcp:8001", command)
+
+    def test_policy_file_rejects_ambiguous_flags_before_artifact_access(self):
+        cases = (
+            [
+                "--network-egress",
+                "deny",
+                "--network-egress-policy-file",
+                "policy.json",
+                "--network-egress-allow",
+                "192.0.2.1",
+            ],
+            ["--network-egress-policy-file", "policy.json"],
+        )
+        for extra in cases:
+            with self.subTest(extra=extra):
+                args = nvx.parse_args(["run", "--dry-run", *extra])
+                with (
+                    patch.object(nvx, "require_file") as require,
+                    self.assertRaises(common.ScriptError),
+                ):
+                    nvx.command_run(args)
+                require.assert_not_called()
+
+    def test_managed_provision_persists_lowered_policy_not_source_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            policy = root / "policy.json"
+            state = root / "state"
+            layer.write_bytes(b"layer")
+            scratch.write_bytes(b"scratch")
+            policy.write_text(
+                json.dumps(
+                    {
+                        "allow": [
+                            {
+                                "cidr": "192.0.2.0/24",
+                                "except": ["192.0.2.128/25"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = nvx.parse_args(
+                [
+                    "sandbox",
+                    "provision",
+                    "--state-dir",
+                    str(state),
+                    "--layer",
+                    f"distro,{layer},11111111-1111-1111-1111-111111111111",
+                    "--scratch",
+                    str(scratch),
+                    "--network-egress",
+                    "deny",
+                    "--network-egress-policy-file",
+                    str(policy),
+                ]
+            )
+
+            nvx.command_sandbox(args)
+            config = json.loads(
+                (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
+            )
+            policy.unlink()
+
+            self.assertEqual(config["network_egress"], "deny")
+            self.assertEqual(config["network_egress_allow"], ["192.0.2.0/25"])
+            self.assertEqual(config["network_egress_deny"], [])
+            self.assertNotIn("network_egress_policy_file", config)
+
+    def test_invalid_policy_has_no_managed_state_side_effect(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            policy = root / "policy.json"
+            state = root / "state"
+            layer.write_bytes(b"layer")
+            scratch.write_bytes(b"scratch")
+            policy.write_text(
+                '{"allow":[{"cidr":"192.0.2.0/24","protocol":"tcp"}]}',
+                encoding="utf-8",
+            )
+            args = nvx.parse_args(
+                [
+                    "sandbox",
+                    "provision",
+                    "--state-dir",
+                    str(state),
+                    "--layer",
+                    f"distro,{layer},11111111-1111-1111-1111-111111111111",
+                    "--scratch",
+                    str(scratch),
+                    "--network-egress",
+                    "deny",
+                    "--network-egress-policy-file",
+                    str(policy),
+                ]
+            )
+
+            with self.assertRaises(common.ScriptError):
+                nvx.command_sandbox(args)
+            self.assertFalse(state.exists())
+
+    def test_managed_non_launch_operations_reject_network_policy_options(self):
+        args = nvx.parse_args(
+            [
+                "sandbox",
+                "start",
+                "--state-dir",
+                "state",
+                "--network-egress",
+                "deny",
+                "--network-egress-policy-file",
+                "policy.json",
+            ]
+        )
+        with (
+            patch.object(sandbox_lifecycle, "start") as start,
+            self.assertRaisesRegex(
+                common.ScriptError, "only valid for sandbox run or provision"
+            ),
+        ):
+            nvx.command_sandbox(args)
+        start.assert_not_called()
+
     def test_run_parses_denied_filesystem_paths(self):
         args = nvx.parse_args(
             [

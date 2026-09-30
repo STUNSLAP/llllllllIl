@@ -139,6 +139,58 @@ allow/deny options:
 Rules match IPv4 addresses or CIDRs and may add one TCP or UDP destination
 port. Deny matches take precedence over allow matches.
 
+NVX can lower inclusive TCP/UDP port ranges and rule-local IPv4 exclusions to
+those native rules:
+
+```json
+{
+  "allow": [
+    {
+      "cidr": "192.0.2.0/24",
+      "except": ["192.0.2.128/25"],
+      "protocol": "tcp",
+      "port": 8000,
+      "endPort": 8010
+    },
+    {
+      "cidr": "192.0.2.200/32"
+    }
+  ],
+  "deny": [
+    {
+      "cidr": "192.0.2.0/24",
+      "protocol": "tcp",
+      "port": 8005
+    }
+  ]
+}
+```
+
+Pass the file with `--network-egress-policy-file PATH` on `run`, one-shot
+`sandbox run`, or `sandbox provision`. An explicit `--network-egress allow` or
+`deny` is required. The file option cannot be mixed with
+`--network-egress-allow` or `--network-egress-deny`.
+
+The root accepts only `allow` and `deny` arrays. Each rule requires one IPv4
+`cidr`; optional `except` entries must be IPv4 CIDRs contained by that parent.
+`protocol` is `tcp` or `udp` and requires `port` in `1..65535`. Optional
+`endPort` is inclusive, must be in `1..65535`, and cannot be below `port`.
+Omitting the protocol and ports matches every IPv4 transport supported by the
+native rule. Protocol-wide TCP/UDP rules without a port and IPv6 are not
+supported.
+
+Exclusions affect only their containing rule: they never become global deny
+rules. A later allow rule may therefore match an address excluded from an
+earlier allow rule, while an address excluded from a deny rule falls through to
+other rules and the explicit default. Explicit deny matches still take
+precedence over allow matches.
+
+NVX canonicalizes safely equivalent prefixes and rejects policies that lower to
+more than 256 allow rules or 256 deny rules. It rejects oversized expansions
+before launch rather than truncating or widening them. Managed provision stores
+the validated lowered rules in sandbox state, so later starts do not reread a
+mutable source policy file.
+
 Host-loopback denial and deliberate localhost port publishing are separately
 controlled from ordinary egress:
 

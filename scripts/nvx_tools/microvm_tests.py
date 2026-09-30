@@ -53,6 +53,7 @@ from .common import (
     sha256_file,
 )
 from .control_session import ControlSession
+from .egress_policy import CompiledEgressPolicy, compile_policy
 from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
 from .openvmm_process import OpenvmmProcess, TcpConsole
 
@@ -1316,6 +1317,72 @@ def run_directional_network_policy(
         server.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
 
 
+def _bind_consecutive_ports(
+    socket_type: socket.SocketKind, count: int
+) -> list[socket.socket]:
+    for base in range(20000, 60000 - count):
+        endpoints: list[socket.socket] = []
+        try:
+            for offset in range(count):
+                endpoint = socket.socket(socket.AF_INET, socket_type)
+                endpoints.append(endpoint)
+                endpoint.bind(("0.0.0.0", base + offset))
+                if socket_type == socket.SOCK_STREAM:
+                    endpoint.listen(1)
+            return endpoints
+        except OSError:
+            for endpoint in endpoints:
+                endpoint.close()
+    raise RuntimeError(f"could not reserve {count} consecutive host ports")
+
+
+def _bounded_egress_policy(
+    gateway: str,
+    tcp_ports: tuple[int, int, int],
+    udp_ports: tuple[int, int, int],
+) -> CompiledEgressPolicy:
+    allow: list[dict[str, object]] = []
+    deny: list[dict[str, object]] = []
+    for protocol, (start, denied, end) in (
+        ("tcp", tcp_ports),
+        ("udp", udp_ports),
+    ):
+        allow.extend(
+            (
+                {
+                    "cidr": "192.0.2.0/24",
+                    "except": [f"{gateway}/32"],
+                    "protocol": protocol,
+                    "port": start,
+                    "endPort": end,
+                },
+                {
+                    "cidr": f"{gateway}/32",
+                    "protocol": protocol,
+                    "port": start,
+                    "endPort": end,
+                },
+            )
+        )
+        deny.extend(
+            (
+                {
+                    "cidr": "192.0.2.0/24",
+                    "except": [f"{gateway}/32"],
+                    "protocol": protocol,
+                    "port": start,
+                    "endPort": end,
+                },
+                {
+                    "cidr": f"{gateway}/32",
+                    "protocol": protocol,
+                    "port": denied,
+                },
+            )
+        )
+    return compile_policy({"allow": allow, "deny": deny})
+
+
 def run_l3_l4_egress_policy(
     executable: Path,
     kernel: Path,
@@ -1326,41 +1393,36 @@ def run_l3_l4_egress_policy(
     timeout: float,
     output_dir: Path,
 ) -> None:
-    allowed_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    denied_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    allowed_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    denied_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    for listener in (allowed_tcp, denied_tcp):
-        listener.bind(("0.0.0.0", 0))
-        listener.listen(1)
-        listener.settimeout(timeout)
-    for endpoint in (allowed_udp, denied_udp):
-        endpoint.bind(("127.0.0.1", 0))
+    tcp = _bind_consecutive_ports(socket.SOCK_STREAM, 5)
+    udp = _bind_consecutive_ports(socket.SOCK_DGRAM, 5)
+    for endpoint in (*tcp, *udp):
         endpoint.settimeout(timeout)
-    allowed_tcp_port = int(allowed_tcp.getsockname()[1])
-    denied_tcp_port = int(denied_tcp.getsockname()[1])
-    allowed_udp_port = int(allowed_udp.getsockname()[1])
-    denied_udp_port = int(denied_udp.getsockname()[1])
+    tcp_ports = tuple(int(endpoint.getsockname()[1]) for endpoint in tcp)
+    udp_ports = tuple(int(endpoint.getsockname()[1]) for endpoint in udp)
     server_errors: list[Exception] = []
 
     def serve_allowed() -> None:
         try:
-            connection, _ = allowed_tcp.accept()
-            with connection:
-                connection.settimeout(timeout)
-                request = connection.recv(4096)
-                if not request.startswith(b"GET /allowed HTTP/1."):
-                    raise RuntimeError(f"unexpected L3/L4 HTTP request: {request!r}")
-                body = b"NVX-L3-L4-TCP-ALLOW"
-                connection.sendall(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: "
-                    + str(len(body)).encode("ascii")
-                    + b"\r\nConnection: close\r\n\r\n"
-                    + body
-                )
-            payload, _ = allowed_udp.recvfrom(128)
-            if payload != b"NVX-L3-L4-UDP-ALLOW":
-                raise RuntimeError(f"unexpected allowed UDP payload: {payload!r}")
+            for listener, suffix in ((tcp[1], b"START"), (tcp[3], b"END")):
+                connection, _ = listener.accept()
+                with connection:
+                    connection.settimeout(timeout)
+                    request = connection.recv(4096)
+                    if not request.startswith(b"GET /allowed HTTP/1."):
+                        raise RuntimeError(
+                            f"unexpected L3/L4 HTTP request: {request!r}"
+                        )
+                    body = b"NVX-L3-L4-TCP-ALLOW-" + suffix
+                    connection.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: "
+                        + str(len(body)).encode("ascii")
+                        + b"\r\nConnection: close\r\n\r\n"
+                        + body
+                    )
+            for endpoint, suffix in ((udp[1], b"START"), (udp[3], b"END")):
+                payload, _ = endpoint.recvfrom(128)
+                if payload != b"NVX-L3-L4-UDP-ALLOW-" + suffix:
+                    raise RuntimeError(f"unexpected allowed UDP payload: {payload!r}")
         except Exception as error:
             server_errors.append(error)
 
@@ -1381,17 +1443,14 @@ def run_l3_l4_egress_policy(
             network=DIRECTIONAL_NETWORK_CIDR,
         )
         command.extend(("--network-egress", "deny"))
-        for rule in (
-            f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}:tcp:{allowed_tcp_port}",
-            f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}:udp:{allowed_udp_port}",
-            f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}:tcp:{denied_tcp_port}",
-            f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}:udp:{denied_udp_port}",
-        ):
+        policy = _bounded_egress_policy(
+            DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+            (tcp_ports[1], tcp_ports[2], tcp_ports[3]),
+            (udp_ports[1], udp_ports[2], udp_ports[3]),
+        )
+        for rule in policy.allow:
             command.extend(("--network-egress-allow", rule))
-        for rule in (
-            f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}:tcp:{denied_tcp_port}",
-            f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}:udp:{denied_udp_port}",
-        ):
+        for rule in policy.deny:
             command.extend(("--network-egress-deny", rule))
 
         run_guest_script(
@@ -1399,10 +1458,16 @@ def run_l3_l4_egress_policy(
             _render_script(
                 "l3-l4-egress-policy.sh.in",
                 GATEWAY_IPV4=DIRECTIONAL_NETWORK_GATEWAY_IPV4,
-                ALLOWED_TCP_PORT=str(allowed_tcp_port),
-                DENIED_TCP_PORT=str(denied_tcp_port),
-                ALLOWED_UDP_PORT=str(allowed_udp_port),
-                DENIED_UDP_PORT=str(denied_udp_port),
+                TCP_ADJACENT_LOW=str(tcp_ports[0]),
+                TCP_START=str(tcp_ports[1]),
+                TCP_DENIED=str(tcp_ports[2]),
+                TCP_END=str(tcp_ports[3]),
+                TCP_ADJACENT_HIGH=str(tcp_ports[4]),
+                UDP_ADJACENT_LOW=str(udp_ports[0]),
+                UDP_START=str(udp_ports[1]),
+                UDP_DENIED=str(udp_ports[2]),
+                UDP_END=str(udp_ports[3]),
+                UDP_ADJACENT_HIGH=str(udp_ports[4]),
             ),
             L3_L4_EGRESS_COMPLETION_MARKER,
             timeout=timeout,
@@ -1416,23 +1481,25 @@ def run_l3_l4_egress_policy(
                 "L3/L4 allowed endpoint server failed"
             ) from server_errors[0]
 
-        denied_tcp.settimeout(NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS)
-        try:
-            unexpected, _ = denied_tcp.accept()
-        except TimeoutError:
-            pass
-        else:
-            unexpected.close()
-            raise RuntimeError("deny rule did not override the TCP allow rule")
-        denied_udp.settimeout(NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS)
-        try:
-            unexpected, _ = denied_udp.recvfrom(128)
-        except TimeoutError:
-            pass
-        else:
-            raise RuntimeError(
-                f"deny rule did not override the UDP allow rule: {unexpected!r}"
-            )
+        for endpoint in (tcp[0], tcp[2], tcp[4]):
+            endpoint.settimeout(NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS)
+            try:
+                unexpected, _ = endpoint.accept()
+            except TimeoutError:
+                pass
+            else:
+                unexpected.close()
+                raise RuntimeError("blocked TCP range port reached the host")
+        for endpoint in (udp[0], udp[2], udp[4]):
+            endpoint.settimeout(NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS)
+            try:
+                unexpected, _ = endpoint.recvfrom(128)
+            except TimeoutError:
+                pass
+            else:
+                raise RuntimeError(
+                    f"blocked UDP range port reached the host: {unexpected!r}"
+                )
 
         for name, extra, expected in (
             (
@@ -1475,7 +1542,7 @@ def run_l3_l4_egress_policy(
                     f"invalid L3/L4 policy {name} was not rejected before boot"
                 )
     finally:
-        for endpoint in (allowed_tcp, denied_tcp, allowed_udp, denied_udp):
+        for endpoint in (*tcp, *udp):
             endpoint.close()
         server.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
 
