@@ -2234,6 +2234,77 @@ class CiConfigurationTests(unittest.TestCase):
             ):
                 self.assertIn(firmware, configuration)
 
+    def test_linux_runners_require_an_invariant_tsc(self):
+        validate_runner = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "validate-runner"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        linux_setup = (
+            BuildConstants.REPO_ROOT / "scripts" / "setup" / "setup-linux-runner.sh"
+        ).read_text(encoding="utf-8")
+
+        step = validate_runner.split("    - name: Validate host TSC\n", 1)[1]
+        step = step.split("\n\n    - name: ", 1)[0]
+        self.assertIn("      if: runner.os != 'Windows'\n", step)
+        check = "\n".join(
+            line.removeprefix("        ")
+            for line in step.split("      run: |\n", 1)[1].splitlines()
+        )
+        function = linux_setup.split("require_invariant_tsc() {\n", 1)[1]
+        function = "require_invariant_tsc() {\n" + function.split("\n}\n", 1)[0]
+        function += "\n}\n"
+        self.assertLess(
+            linux_setup.index("require_invariant_tsc /proc/cpuinfo\n"),
+            linux_setup.index('sudo -n true || die "passwordless sudo is required"'),
+        )
+        if os.name != "posix":
+            return
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cpuinfo = Path(temporary) / "cpuinfo"
+            for flags, invariant in (
+                ("fpu tsc constant_tsc nonstop_tsc tsc_known_freq", True),
+                ("fpu tsc constant_tsc tsc_known_freq", False),
+                ("fpu tsc constant_tsc nonstop_tsc_x", False),
+            ):
+                cpuinfo.write_text(
+                    f"model name\t: Test CPU\nflags\t\t: {flags}\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(flags=flags, check="validate-runner"):
+                    result = subprocess.run(
+                        ["bash", "-c", check.replace("/proc/cpuinfo", str(cpuinfo))],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode == 0, invariant, result.stderr)
+                    self.assertIn("CPU: Test CPU", result.stdout)
+                    self.assertEqual(
+                        "::error::Runner host does not expose an invariant TSC"
+                        in result.stderr,
+                        not invariant,
+                    )
+                with self.subTest(flags=flags, check="setup-linux-runner"):
+                    result = subprocess.run(
+                        [
+                            "sh",
+                            "-c",
+                            'die() { echo "$*" >&2; exit 1; }\n'
+                            f"{function}"
+                            f"require_invariant_tsc '{cpuinfo}'\n",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode == 0, invariant, result.stderr)
+
     def test_runner_setups_install_backend_native_openvmm_targets(self):
         linux_setup = (
             BuildConstants.REPO_ROOT / "scripts" / "setup" / "setup-linux-runner.sh"

@@ -150,6 +150,7 @@ TSC_CONTROL_PROCESSORS = 8
 TSC_CONTROL_ROUNDS = 20
 TSC_CONTROL_COMPLETION_MARKER = b"NVX-TSC-CONTROL-DONE"
 TSC_CONTROL_RESULT_PREFIX = "NVX-TSC-CONTROL-RESULT "
+HOST_CPUINFO = Path("/proc/cpuinfo")
 OUTCOME_TOP_LEVEL_FIELDS = frozenset(
     {
         "schema_version",
@@ -2088,6 +2089,28 @@ def _tsc_control_verdict(text: str) -> str:
     return "fresh-boot TSC control did not report a result"
 
 
+def _host_invariant_tsc_note(cpuinfo: Path = HOST_CPUINFO) -> str:
+    """Report whether a Linux host CPU exposes an invariant TSC.
+
+    Guests on a host without one intermittently see cross-vCPU TSC warps
+    whether or not they were restored (#211).
+    """
+    try:
+        text = cpuinfo.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        name, _, flags = line.partition(":")
+        if name.strip() == "flags":
+            if "nonstop_tsc" in flags.split():
+                return "host CPU exposes an invariant TSC (nonstop_tsc)\n"
+            return (
+                "host CPU does not expose an invariant TSC (nonstop_tsc); guests "
+                "on this host intermittently see cross-vCPU TSC warps\n"
+            )
+    return ""
+
+
 def run_fresh_boot_tsc_control(
     executable: Path,
     kernel: Path,
@@ -2214,7 +2237,7 @@ def run_restore_processors(
                         timeout=timeout,
                         log_path=output_dir / "restore-processors-tsc-control.log",
                     )
-                    verdict += "\n"
+                    verdict += "\n" + _host_invariant_tsc_note()
                 raise RuntimeError(
                     f"{_restore_label(target)}: guest reported {error.line}\n"
                     f"{verdict}--- OpenVMM output ---\n{error.output_tail}"

@@ -43,9 +43,18 @@ reports how many created MSHV APs were aligned. When the guest reports
 `unstable-tsc`, the harness boots a never-restored eight-vCPU guest with the
 same forced warp check and reactivates each AP 20 times. The error then states
 whether this control also found TSC instability, which points to host or
-hypervisor clock skew rather than restore alignment, and the control log is
-kept as `restore-processors-tsc-control.log`. The control only classifies the
+hypervisor clock skew rather than restore alignment, and whether the host CPU
+exposes an invariant TSC. The control log is kept as
+`restore-processors-tsc-control.log`. The control only classifies the
 failure; the restore still fails.
+
+Linux runners must expose an invariant TSC, reported as `nonstop_tsc` in
+`/proc/cpuinfo`. The `validate-runner` action prints each runner's kernel, CPU
+model, clocksource, and TSC flags, and fails the job when `nonstop_tsc` is
+missing. On an MSHV runner VM whose Azure host hid the invariant TSC,
+never-restored guests also hit cross-vCPU TSC warps during CPU activation, and
+keeping every host CPU out of idle removed them (#211). Redeploy such a VM on a
+host that exposes an invariant TSC instead of retrying its jobs.
 
 The `restore-tsc-sync` scenario repeats the restore-processor sequence with
 the test-only kernel option `clearcpuid=tsc_adjust`. Linux normally skips its
