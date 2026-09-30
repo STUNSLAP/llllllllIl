@@ -119,6 +119,19 @@ def run_capture(
     return CommandResult(command, result.returncode, result.stdout, result.stderr)
 
 
+def git_output(*arguments: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(BuildConstants.REPO_ROOT), *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        timeout=30.0,
+    )
+    return completed.stdout.strip()
+
+
 def openvmm_git_state(directory: Path) -> tuple[str, bool]:
     head = run_capture(["git", "-C", directory, "rev-parse", "HEAD"])
     require_success(head, "OpenVMM revision query")

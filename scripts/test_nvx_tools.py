@@ -8466,6 +8466,22 @@ class PositiveIntTests(unittest.TestCase):
             common.positive_int("not-an-int")
 
 
+class GitOutputTests(unittest.TestCase):
+    def test_runs_git_from_repository_root_and_strips_output(self):
+        completed = MagicMock(stdout=" output \n")
+        with patch.object(common.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(common.git_output("status", "--short"), "output")
+        run.assert_called_once_with(
+            ["git", "-C", str(BuildConstants.REPO_ROOT), "status", "--short"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=30.0,
+        )
+
+
 class SharedFileTests(unittest.TestCase):
     def test_checksum_manifest_detects_modified_file(self):
         with tempfile.TemporaryDirectory() as temporary:
