@@ -1663,6 +1663,28 @@ class MicrovmTests(unittest.TestCase):
                 ingress="deny",
             )
 
+    def test_egress_port_reservation_closes_tcp_when_udp_fails(self):
+        endpoints = [MagicMock(spec=socket.socket) for _ in range(5)]
+        with (
+            patch.object(
+                microvm_tests,
+                "_bind_consecutive_ports",
+                side_effect=[endpoints, RuntimeError("UDP unavailable")],
+            ),
+            self.assertRaisesRegex(RuntimeError, "UDP unavailable"),
+        ):
+            microvm_tests.run_l3_l4_egress_policy(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initramfs"),
+                "whp",
+                memory_mib=128,
+                timeout=1,
+                output_dir=Path("."),
+            )
+        for endpoint in endpoints:
+            endpoint.close.assert_called_once_with()
+
     def test_bounded_egress_acceptance_policy_lowers_ranges_and_exclusions(self):
         policy = microvm_tests._bounded_egress_policy(
             "192.0.2.1",

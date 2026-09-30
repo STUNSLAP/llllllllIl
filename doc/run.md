@@ -173,6 +173,8 @@ Pass the file with `--network-egress-policy-file PATH` on `run`, one-shot
 
 The root accepts only `allow` and `deny` arrays. Each rule requires one IPv4
 `cidr`; optional `except` entries must be IPv4 CIDRs contained by that parent.
+Host bits are normalized like the native CIDR syntax: `10.0.0.5/24` means
+`10.0.0.0/24`, not one host. Use `/32` to select one IPv4 address.
 Duplicate JSON properties, unknown fields, and explicit `null` protocol values
 are rejected. Policy files are limited to 1 MiB of UTF-8 input.
 `protocol` is `tcp` or `udp` and requires `port` in `1..65535`. Optional

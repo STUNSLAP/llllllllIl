@@ -76,6 +76,10 @@ class EgressPolicyTests(unittest.TestCase):
             with self.subTest(rule=rule), self.assertRaises(ScriptError):
                 self.compile({"allow": [rule]})
 
+    def test_normalizes_host_bits_like_the_native_cidr_parser(self):
+        compiled = self.compile({"allow": [{"cidr": "10.0.0.5/24"}]})
+        self.assertEqual(compiled.allow, ("10.0.0.0/24",))
+
     def test_subtracts_rule_local_cidr_exclusions(self):
         compiled = self.compile(
             {

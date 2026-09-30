@@ -1336,6 +1336,18 @@ def _bind_consecutive_ports(
     raise RuntimeError(f"could not reserve {count} consecutive host ports")
 
 
+def _bind_egress_ports() -> tuple[list[socket.socket], list[socket.socket]]:
+    with ExitStack() as cleanup:
+        tcp = _bind_consecutive_ports(socket.SOCK_STREAM, 5)
+        for endpoint in tcp:
+            cleanup.callback(endpoint.close)
+        udp = _bind_consecutive_ports(socket.SOCK_DGRAM, 5)
+        for endpoint in udp:
+            cleanup.callback(endpoint.close)
+        cleanup.pop_all()
+        return tcp, udp
+
+
 def _bounded_egress_policy(
     gateway: str,
     tcp_ports: tuple[int, int, int],
@@ -1403,8 +1415,7 @@ def run_l3_l4_egress_policy(
     timeout: float,
     output_dir: Path,
 ) -> None:
-    tcp = _bind_consecutive_ports(socket.SOCK_STREAM, 5)
-    udp = _bind_consecutive_ports(socket.SOCK_DGRAM, 5)
+    tcp, udp = _bind_egress_ports()
     for endpoint in (*tcp, *udp):
         endpoint.settimeout(timeout)
     tcp_ports = tuple(int(endpoint.getsockname()[1]) for endpoint in tcp)
