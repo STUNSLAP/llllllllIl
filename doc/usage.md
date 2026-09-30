@@ -367,10 +367,19 @@ python3 scripts/nvx.py sandbox
     [--hypervisor {auto,whp,kvm,mshv}]
     [--net IPV4/PREFIX]
     [--network-profile {portable}]
+    [--network-egress {allow,deny}]
+    [--network-ingress {allow,deny}]
+    [--network-egress-allow CIDR[:PROTOCOL:PORT]]...
+    [--network-egress-deny CIDR[:PROTOCOL:PORT]]...
+    [--host-loopback {allow,deny}]
+    [--network-proxy IPV4:TCP-PORT]
+    [--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT]...
     [--outcome-report PATH]
     [--cmdline TEXT]
     [--dry-run]
 ```
+
+Network policy options configure only the `run` and `provision` launches.
 
 | Option | Default | Description |
 | --- | --- | --- |
@@ -390,6 +399,13 @@ python3 scripts/nvx.py sandbox
 | `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the host hypervisor. |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with a static guest address. |
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
+| `--network-egress {allow,deny}` | `allow` | Set the default guest egress policy for `run` or `provision`. |
+| `--network-ingress {allow,deny}` | `deny` | Set the host ingress policy for `run` or `provision`. The portable profile supports only `deny`. |
+| `--network-egress-allow CIDR[:PROTOCOL:PORT]` | none | Allow matching guest egress; repeat to add rules. Requires explicit `--network-egress`. |
+| `--network-egress-deny CIDR[:PROTOCOL:PORT]` | none | Deny matching guest egress; repeat to add rules. Requires explicit `--network-egress`; deny rules take precedence. |
+| `--host-loopback {allow,deny}` | existing mapping | Control guest access to host loopback services for `run` or `provision`. |
+| `--network-proxy IPV4:TCP-PORT` | none | Allow one explicit host TCP proxy endpoint; the IPv4 address must match the guest gateway. |
+| `--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT` | none | Publish one TCP or UDP localhost port to the guest; repeat to add forwards and set `--host-loopback allow`. |
 | `--outcome-report PATH` | none | Write a bounded local JSON outcome report for one-shot `run` or managed `exec`. |
 | `--cmdline TEXT` | empty | Append non-sandbox kernel parameters; `nvx_*` and `tsc=` tokens are reserved. |
 | `--dry-run` | off | Print the generated OpenVMM microVM command without running it. |
