@@ -6,9 +6,9 @@ import ipaddress
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
-from .common import ScriptError
+from .common import ScriptError, strict_json_object
 
 MAX_RULES_PER_ACTION = 256
 MAX_POLICY_FILE_SIZE = 1024 * 1024
@@ -30,10 +30,13 @@ class _Rule:
     end_port: int | None
 
 
-def _object(value: object, description: str) -> dict[str, Any]:
+def _object(value: object, description: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ScriptError(f"{description} must be an object")
-    return cast(dict[str, Any], value)
+    mapping = cast(dict[object, object], value)
+    if not all(isinstance(key, str) for key in mapping):
+        raise ScriptError(f"{description} fields must be strings")
+    return cast(dict[str, object], value)
 
 
 def _array(value: object, description: str) -> list[object]:
@@ -107,7 +110,7 @@ def _parse_rule(value: object, description: str) -> _Rule:
     networks = _subtract_exclusions(parent, exclusions, description)
 
     protocol_value = rule.get("protocol")
-    if protocol_value is None:
+    if "protocol" not in rule:
         if "port" in rule or "endPort" in rule:
             raise ScriptError(f"{description}.port requires protocol")
         return _Rule(networks, None, None, None)
@@ -132,6 +135,8 @@ def _compile_category(value: object, category: str) -> tuple[str, ...]:
     grouped: dict[tuple[str | None, int | None], list[ipaddress.IPv4Network]] = {}
     for index, value in enumerate(rules):
         rule = _parse_rule(value, f"{category}[{index}]")
+        if not rule.networks:
+            continue
         if rule.protocol is None:
             grouped.setdefault((None, None), []).extend(rule.networks)
             continue
@@ -179,15 +184,16 @@ def compile_policy(value: object) -> CompiledEgressPolicy:
 
 def compile_policy_file(path: Path) -> CompiledEgressPolicy:
     try:
-        size = path.stat().st_size
+        with path.open("rb") as stream:
+            data = stream.read(MAX_POLICY_FILE_SIZE + 1)
     except OSError as error:
         raise ScriptError(f"failed to read egress policy file: {path}") from error
-    if size > MAX_POLICY_FILE_SIZE:
+    if len(data) > MAX_POLICY_FILE_SIZE:
         raise ScriptError(
             f"egress policy file exceeds {MAX_POLICY_FILE_SIZE}-byte limit: {path}"
         )
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        value = json.loads(data.decode("utf-8"), object_pairs_hook=strict_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ScriptError(f"failed to read egress policy file: {path}") from error
     return compile_policy(value)

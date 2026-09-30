@@ -5,10 +5,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 from nvx_tools.common import ScriptError  # noqa: E402
-from nvx_tools.egress_policy import compile_policy_file  # noqa: E402
+from nvx_tools.egress_policy import (
+    MAX_POLICY_FILE_SIZE,  # noqa: E402
+    compile_policy_file,  # noqa: E402
+)
 
 
 class EgressPolicyTests(unittest.TestCase):
@@ -158,11 +162,50 @@ class EgressPolicyTests(unittest.TestCase):
             {"allow": [{"cidr": "192.0.2.0/24", "unknown": 1}]},
             {"allow": [{"cidr": 7}]},
             {"allow": [{"cidr": "192.0.2.0/24", "except": "192.0.2.1"}]},
+            {"allow": [{"cidr": "192.0.2.0/24", "protocol": None}]},
         )
 
         for value in invalid:
             with self.subTest(value=value), self.assertRaises(ScriptError):
                 self.compile(value)
+
+    def test_rejects_duplicate_json_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "policy.json"
+            for text in (
+                '{"deny":[{"cidr":"0.0.0.0/0"}],"deny":[]}',
+                '{"allow":[{"cidr":"192.0.2.0/24","port":80,"port":443,"protocol":"tcp"}]}',
+            ):
+                with self.subTest(text=text):
+                    path.write_text(text, encoding="utf-8")
+                    with self.assertRaisesRegex(ScriptError, "duplicate JSON property"):
+                        compile_policy_file(path)
+
+    def test_empty_destination_does_not_expand_port_range(self):
+        compiled = self.compile(
+            {
+                "allow": [
+                    {
+                        "cidr": "192.0.2.0/24",
+                        "except": ["192.0.2.0/24"],
+                        "protocol": "tcp",
+                        "port": 1,
+                        "endPort": 65535,
+                    }
+                ]
+            }
+        )
+        self.assertEqual(compiled.allow, ())
+        self.assertEqual(compiled.deny, ())
+
+    def test_limits_the_actual_policy_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "policy.json"
+            path.write_bytes(b" " * (MAX_POLICY_FILE_SIZE + 1))
+            with mock.patch.object(Path, "stat") as stat:
+                stat.return_value.st_size = 0
+                with self.assertRaisesRegex(ScriptError, "byte limit"):
+                    compile_policy_file(path)
 
     def test_accepts_exact_256_rule_boundaries(self):
         compiled = self.compile(
