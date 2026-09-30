@@ -433,6 +433,7 @@ def command_sandbox(args: argparse.Namespace) -> None:
             raise ScriptError("--net and --network-profile must be specified together")
         if not args.layer or args.scratch is None:
             raise ScriptError(f"sandbox {operation} requires --layer and --scratch")
+        network_egress_allow, network_egress_deny = _resolve_network_egress_rules(args)
         launch = SandboxLaunch(
             layers=tuple(args.layer),
             scratch=args.scratch,
@@ -444,7 +445,6 @@ def command_sandbox(args: argparse.Namespace) -> None:
             pids_max=args.pids_max,
         ).validated()
         _validate_sandbox_systemd_policy(launch)
-        network_egress_allow, network_egress_deny = _resolve_network_egress_rules(args)
     else:
         launch = None
         network_egress_allow = ()

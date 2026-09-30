@@ -832,6 +832,32 @@ class CliTests(unittest.TestCase):
                     nvx.command_run(args)
                 require.assert_not_called()
 
+    def test_sandbox_rejects_policy_mixing_before_validating_layer_files(self):
+        for operation in ("run", "provision"):
+            with self.subTest(operation=operation):
+                args = nvx.parse_args(
+                    [
+                        "sandbox",
+                        operation,
+                        "--layer",
+                        "distro,absent.erofs,00000000-0000-4000-8000-000000000001",
+                        "--scratch",
+                        "absent.ext4",
+                        "--network-egress",
+                        "deny",
+                        "--network-egress-policy-file",
+                        "absent.json",
+                        "--network-egress-allow",
+                        "192.0.2.1",
+                    ]
+                )
+                with (
+                    patch.object(nvx.SandboxLaunch, "validated") as validated,
+                    self.assertRaisesRegex(common.ScriptError, "cannot be combined"),
+                ):
+                    nvx.command_sandbox(args)
+                validated.assert_not_called()
+
     def test_managed_provision_persists_lowered_policy_not_source_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
