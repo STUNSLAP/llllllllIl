@@ -465,7 +465,8 @@ python3 scripts/nvx.py sandbox start \
   --state-dir /run/user/1000/nvx-example
 python3 scripts/nvx.py sandbox exec \
   --state-dir /run/user/1000/nvx-example \
-  --entrypoint /usr/bin/python3 --arg=/work/agent.py \
+  --entrypoint /usr/bin/python3 --arg=/work/agent.py --cwd /work \
+  --environment-file /run/user/1000/nvx-example-environment.json \
   --outcome-report /run/user/1000/nvx-example-exec.json
 python3 scripts/nvx.py sandbox exec \
   --state-dir /run/user/1000/nvx-example \
@@ -480,10 +481,16 @@ Lifecycle transitions fail closed: `start` rejects an already-running or stale
 runtime record, `exec` and `stop` require a live OpenVMM process, and
 `deprovision` refuses to remove a running sandbox or unknown files. Managed
 workload arguments use the bounded control protocol rather than the kernel
-command line and may contain whitespace. The workload sees one machine ID for
-the life of the VM. On `stop`, the guest agent unmounts the live share, overlay,
-layers, and scratch in dependency order before the VM powers off, as it does
-when a one-shot workload exits. The legacy operation-less `sandbox`
+command line and may contain whitespace. Managed execution can select an
+absolute working directory and either repeated inline `KEY=VALUE` entries or a
+UTF-8 JSON-array environment file. The two environment forms are mutually
+exclusive. Omission preserves guest defaults, while an empty file array requests
+an empty environment. Inline values are visible in the host process arguments
+and should not be used for secrets. These options apply only to managed
+`sandbox exec`; one-shot execution rejects them. The workload sees one machine
+ID for the life of the VM. On `stop`, the guest agent unmounts the live share,
+overlay, layers, and scratch in dependency order before the VM powers off, as it
+does when a one-shot workload exits. The legacy operation-less `sandbox`
 form is `sandbox run`; it remains one-shot and rejects `--state-dir` or any
 request to retain VM state.
 
