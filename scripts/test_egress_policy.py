@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import ipaddress
 import json
 import sys
 import tempfile
@@ -206,6 +207,22 @@ class EgressPolicyTests(unittest.TestCase):
                 stat.return_value.st_size = 0
                 with self.assertRaisesRegex(ScriptError, "byte limit"):
                     compile_policy_file(path)
+
+    def test_many_source_networks_can_collapse_within_native_budget(self):
+        start = int(ipaddress.IPv4Address("192.0.2.0"))
+        compiled = self.compile(
+            {
+                "allow": [
+                    {
+                        "cidr": str(ipaddress.IPv4Address(start + offset)),
+                        "protocol": "tcp",
+                        "port": 80,
+                    }
+                    for offset in range(512)
+                ]
+            }
+        )
+        self.assertEqual(compiled.allow, ("192.0.2.0/23:tcp:80",))
 
     def test_accepts_exact_256_rule_boundaries(self):
         compiled = self.compile(

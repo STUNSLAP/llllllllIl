@@ -53,7 +53,7 @@ from .common import (
     sha256_file,
 )
 from .control_session import ControlSession
-from .egress_policy import CompiledEgressPolicy, compile_policy
+from .egress_policy import CompiledEgressPolicy, compile_policy_file
 from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
 from .openvmm_process import OpenvmmProcess, TcpConsole
 
@@ -1340,6 +1340,8 @@ def _bounded_egress_policy(
     gateway: str,
     tcp_ports: tuple[int, int, int],
     udp_ports: tuple[int, int, int],
+    *,
+    policy_file: Path | None = None,
 ) -> CompiledEgressPolicy:
     allow: list[dict[str, object]] = []
     deny: list[dict[str, object]] = []
@@ -1380,7 +1382,15 @@ def _bounded_egress_policy(
                 },
             )
         )
-    return compile_policy({"allow": allow, "deny": deny})
+
+    def compile_file(path: Path) -> CompiledEgressPolicy:
+        path.write_text(json.dumps({"allow": allow, "deny": deny}), encoding="utf-8")
+        return compile_policy_file(path)
+
+    if policy_file is not None:
+        return compile_file(policy_file)
+    with tempfile.TemporaryDirectory(prefix="nvx-egress-policy-") as temporary:
+        return compile_file(Path(temporary) / "policy.json")
 
 
 def run_l3_l4_egress_policy(
@@ -1447,6 +1457,7 @@ def run_l3_l4_egress_policy(
             DIRECTIONAL_NETWORK_GATEWAY_IPV4,
             (tcp_ports[1], tcp_ports[2], tcp_ports[3]),
             (udp_ports[1], udp_ports[2], udp_ports[3]),
+            policy_file=output_dir / "l3-l4-requested-policy.json",
         )
         for rule in policy.allow:
             command.extend(("--network-egress-allow", rule))
