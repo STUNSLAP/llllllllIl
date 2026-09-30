@@ -438,7 +438,7 @@ python3 scripts/nvx.py benchmark [OPTIONS]
 | `--virtfs-runs N` | `3` | Set the number of virtio-fs workload samples. |
 | `--virtfs-memory-mib MIB` | `512` | Set guest memory for the virtio-fs workload. |
 | `--payload-mib MIB` | `64` | Set the virtio-fs sequential I/O payload size. |
-| `--shell-memories MIB [MIB ...]` | `128 256 512` | Set the guest memory sizes for shell snapshot measurements. |
+| `--shell-memories MIB [MIB ...]` | `128 256 512` (`128 256 512 1024` for `snapshot-profile`) | Set the guest memory sizes for shell snapshot measurements. |
 | `--network-memory-mib MIB` | `256` | Set guest memory for the network snapshot workload. |
 | `--restore-devices {console,net,virtiofs} [...]` | all three devices | Select devices for the `device-restore-profile` suite. |
 | `--restore-modes {active,deferred} [...]` | both modes | Select activation modes for the `device-restore-profile` suite. |
