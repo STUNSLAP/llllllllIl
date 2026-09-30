@@ -537,6 +537,30 @@ class MicrovmTests(unittest.TestCase):
             "printf 'sensitive-output-value\\n'; /sbin/nvx-exit 37"
         )
 
+    def test_structured_outcome_rejects_boolean_schema_version(self):
+        report = self._outcome_report(
+            "whp",
+            outcome={
+                "operation": "run",
+                "category": "guest-exit",
+                "status_code": 0,
+            },
+            policy={
+                "status": "applied",
+                "status_code": 0,
+                "mode": "rules",
+                "allow_rule_count": 0,
+                "deny_rule_count": 0,
+                "host_loopback": "deny",
+            },
+        )
+        report["schema_version"] = True
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "outcome.json"
+            path.write_text(json.dumps(report), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "unsupported version"):
+                microvm_tests._read_outcome_report(path)
+
     def test_structured_outcome_preserves_invalid_primary_report(self):
         report = self._outcome_report(
             "whp",

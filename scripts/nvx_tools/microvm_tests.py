@@ -357,7 +357,12 @@ def _read_outcome_report(path: Path) -> dict[str, Any]:
     raw = cast(dict[str, object], value)
     if set(raw) != set(OUTCOME_TOP_LEVEL_FIELDS):
         raise RuntimeError("structured outcome report has unexpected top-level fields")
-    if raw["schema_version"] != 1:
+    schema_version = raw["schema_version"]
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != 1
+    ):
         raise RuntimeError("structured outcome report has an unsupported version")
     instance_id = raw["instance_id"]
     if (
