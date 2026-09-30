@@ -29,7 +29,10 @@ python3 scripts/nvx.py performance gate --help
 | `build-distro-layer` | Build a deterministic Ubuntu EROFS distro layer. |
 | `verify-guest-determinism` | Rebuild Ubuntu guest artifacts twice and compare SHA-256 values. |
 | `build-openvmm` | Build the OpenVMM release binary. |
+| `record-openvmm-provenance` | Bind an existing OpenVMM binary to the pinned source revision. |
+| `materialize-kernel-provenance-inputs` | Write kernel provenance inputs from raw run-head blobs. |
 | `setup-cross-os-cache` | Install GNU tar and zstd for GitHub Actions cross-OS caches. |
+| `check-required-ci` | Validate required GitHub Actions job results. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
 | `test-openvmm` | Run self-contained OpenVMM microVM control-plane tests. |
 | `test-microvm` | Run NVX Linux and device correctness tests through OpenVMM. |

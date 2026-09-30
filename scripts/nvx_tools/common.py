@@ -40,6 +40,10 @@ def remaining_timeout(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
 
 
+def bytes_to_mib(value: int | float) -> float:
+    return value / (1024 * 1024)
+
+
 def artifact_path(name: str) -> Path:
     return BuildConstants.BUILD_DIR / name
 

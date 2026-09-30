@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from .common import positive_int
+from .common import bytes_to_mib, positive_int
 
 LEGACY_CSV_FIELDS = ["commit", "metric", "unit", "direction", "p50"]
 CSV_FIELDS = [
@@ -68,7 +68,6 @@ LIFECYCLE_METRICS = frozenset(
         "openvmm_snapshot_restore_peak_rss",
     }
 )
-BYTES_PER_MIB = 1024 * 1024
 LIFECYCLE_MEMORY_MIB = 128
 LIFECYCLE_BOOT_MARKER = "ALPINE-MICROVM-BOOT-OK"
 LIFECYCLE_RESTORE_MARKER = "OPENVMM-SNAPSHOT-RESTORE-OK"
@@ -1162,7 +1161,7 @@ def read_lifecycle_data(platform: str, input_path: Path) -> LifecycleData:
         metric: (
             unit,
             "lower",
-            value / BYTES_PER_MIB if unit == "MiB" else value,
+            bytes_to_mib(value) if unit == "MiB" else value,
         )
         for metric, section, field, unit in metric_fields
         for value in [_openvmm_value(document, section, backend, field, input_path)]
@@ -1279,8 +1278,8 @@ def append_openvmm_diagnostics(
             document, section, backend, "peak_rss_max_bytes", source
         )
         lines.append(
-            f"| {label} | {p50 / BYTES_PER_MIB:.2f} MiB | "
-            f"{maximum / BYTES_PER_MIB:.2f} MiB |"
+            f"| {label} | {bytes_to_mib(p50):.2f} MiB | "
+            f"{bytes_to_mib(maximum):.2f} MiB |"
         )
     lines.extend(
         [
