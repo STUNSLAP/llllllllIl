@@ -9,8 +9,8 @@ import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -1703,6 +1703,21 @@ class MicrovmTests(unittest.TestCase):
         self.assertNotIn("192.0.2.0/24:tcp:21004", policy.allow)
 
     def test_l3_l4_egress_acceptance_invokes_public_nvx_policy_file(self):
+        class ImmediateThread:
+            def __init__(
+                self, *, target: Callable[[], None], **_kwargs: object
+            ) -> None:
+                self.target = target
+
+            def start(self) -> None:
+                self.target()
+
+            def join(self, _timeout: float | None = None, **_kwargs: object) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return False
+
         for guest, memory_mib in (("alpine", 128), ("ubuntu", 256)):
             with self.subTest(guest=guest):
                 tcp = [MagicMock(spec=socket.socket) for _ in range(5)]
@@ -1715,6 +1730,18 @@ class MicrovmTests(unittest.TestCase):
                     endpoint.accept.side_effect = TimeoutError
                 for endpoint in (udp[0], udp[2], udp[4]):
                     endpoint.recvfrom.side_effect = TimeoutError
+                for endpoint in (tcp[1], tcp[3]):
+                    connection = MagicMock(spec=socket.socket)
+                    connection.recv.return_value = b"GET /allowed HTTP/1.1\r\n\r\n"
+                    endpoint.accept.return_value = (connection, ("127.0.0.1", 1))
+                udp[1].recvfrom.return_value = (
+                    b"NVX-L3-L4-UDP-ALLOW-START",
+                    ("127.0.0.1", 1),
+                )
+                udp[3].recvfrom.return_value = (
+                    b"NVX-L3-L4-UDP-ALLOW-END",
+                    ("127.0.0.1", 1),
+                )
 
                 with (
                     tempfile.TemporaryDirectory() as temporary,
@@ -1725,9 +1752,11 @@ class MicrovmTests(unittest.TestCase):
                     ),
                     patch.object(microvm_tests, "run_guest_script") as run_guest_script,
                     patch.object(microvm_tests, "OpenvmmProcess") as openvmm_process,
-                    patch.object(threading.Thread, "start"),
-                    patch.object(threading.Thread, "join"),
-                    patch.object(threading.Thread, "is_alive", return_value=False),
+                    patch.object(
+                        microvm_tests.threading,
+                        "Thread",
+                        side_effect=ImmediateThread,
+                    ),
                 ):
                     wait = openvmm_process.return_value.__enter__.return_value.wait
                     wait.side_effect = (
@@ -1795,6 +1824,10 @@ class MicrovmTests(unittest.TestCase):
                     )
                     self.assertEqual(results["interface"], "nvx.py run")
                     self.assertEqual(
+                        results["observed"]["allowed"],
+                        ["tcp:start", "tcp:end", "udp:start", "udp:end"],
+                    )
+                    self.assertEqual(
                         results["observed"]["blocked"],
                         [
                             "tcp:adjacent-low",
@@ -1804,6 +1837,90 @@ class MicrovmTests(unittest.TestCase):
                             "udp:interior",
                             "udp:adjacent-high",
                         ],
+                    )
+
+    def test_l3_l4_egress_does_not_report_unobserved_success(self):
+        class ControlledThread:
+            run_target = False
+
+            def __init__(
+                self, *, target: Callable[[], None], **_kwargs: object
+            ) -> None:
+                self.target = target
+
+            def start(self) -> None:
+                if self.run_target:
+                    self.target()
+
+            def join(self, _timeout: float | None = None, **_kwargs: object) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return False
+
+        for failure in ("absent-positive", "unexpected-connection"):
+            with self.subTest(failure=failure):
+                tcp = [MagicMock(spec=socket.socket) for _ in range(5)]
+                udp = [MagicMock(spec=socket.socket) for _ in range(5)]
+                for index, endpoint in enumerate(tcp):
+                    endpoint.getsockname.return_value = ("0.0.0.0", 21000 + index)
+                for index, endpoint in enumerate(udp):
+                    endpoint.getsockname.return_value = ("0.0.0.0", 22000 + index)
+                for endpoint in (tcp[0], tcp[2], tcp[4]):
+                    endpoint.accept.side_effect = TimeoutError
+                for endpoint in (udp[0], udp[2], udp[4]):
+                    endpoint.recvfrom.side_effect = TimeoutError
+
+                ControlledThread.run_target = failure == "unexpected-connection"
+                if ControlledThread.run_target:
+                    for endpoint in (tcp[1], tcp[3]):
+                        connection = MagicMock(spec=socket.socket)
+                        connection.recv.return_value = b"GET /allowed HTTP/1.1\r\n\r\n"
+                        endpoint.accept.return_value = (
+                            connection,
+                            ("127.0.0.1", 1),
+                        )
+                    udp[1].recvfrom.return_value = (
+                        b"NVX-L3-L4-UDP-ALLOW-START",
+                        ("127.0.0.1", 1),
+                    )
+                    udp[3].recvfrom.return_value = (
+                        b"NVX-L3-L4-UDP-ALLOW-END",
+                        ("127.0.0.1", 1),
+                    )
+                    tcp[0].accept.side_effect = None
+                    tcp[0].accept.return_value = (
+                        MagicMock(spec=socket.socket),
+                        ("127.0.0.1", 1),
+                    )
+
+                with tempfile.TemporaryDirectory() as temporary:
+                    output_dir = Path(temporary)
+                    with (
+                        patch.object(
+                            microvm_tests,
+                            "_bind_egress_ports",
+                            return_value=(tcp, udp),
+                        ),
+                        patch.object(microvm_tests, "run_guest_script"),
+                        patch.object(
+                            microvm_tests.threading,
+                            "Thread",
+                            side_effect=ControlledThread,
+                        ),
+                        self.assertRaises(RuntimeError),
+                    ):
+                        microvm_tests.run_l3_l4_egress_policy(
+                            Path("openvmm"),
+                            Path("vmlinux"),
+                            Path("initramfs"),
+                            "whp",
+                            memory_mib=128,
+                            timeout=1,
+                            output_dir=output_dir,
+                        )
+                    self.assertFalse(
+                        (output_dir / "l3-l4-egress-policy-results.json").exists()
                     )
 
     def test_runner_dispatches_public_l3_l4_egress_acceptance(self):

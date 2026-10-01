@@ -2066,6 +2066,34 @@ def _try_peak_rss(process: subprocess.Popen[bytes], current: int) -> int:
         return current
 
 
+def _raise_guest_script_failure(
+    primary_error: BaseException | None,
+    cleanup_errors: list[BaseException],
+) -> None:
+    if primary_error is not None:
+        if cleanup_errors:
+            cleanup_summary = "\n".join(
+                f"- {type(error).__name__}: {error}" for error in cleanup_errors
+            )
+            primary_error.args = (
+                f"{primary_error}\n--- cleanup failures ---\n{cleanup_summary}",
+                *primary_error.args[1:],
+            )
+            primary_error.cleanup_errors = tuple(cleanup_errors)  # type: ignore[attr-defined]
+        raise primary_error.with_traceback(primary_error.__traceback__)
+
+    if len(cleanup_errors) == 1:
+        error = cleanup_errors[0]
+        raise error.with_traceback(error.__traceback__)
+    if cleanup_errors:
+        cleanup_summary = "\n".join(
+            f"- {type(error).__name__}: {error}" for error in cleanup_errors
+        )
+        error = RuntimeError(f"guest cleanup failed:\n{cleanup_summary}")
+        error.cleanup_errors = tuple(cleanup_errors)  # type: ignore[attr-defined]
+        raise error
+
+
 def run_guest_script(
     command: Sequence[str],
     script: str,
@@ -2099,6 +2127,9 @@ def run_guest_script(
     input_sent = False
     completed = False
     peak_bytes = 0
+    result: GuestCommandResult | None = None
+    primary_error: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -2138,24 +2169,41 @@ def run_guest_script(
             raise RuntimeError(
                 f"guest exited without completion marker {completion_marker.decode()!r}"
             )
-        return {
+        result = {
             "text": output.decode("utf-8", "replace"),
             "wall_ms": (time.perf_counter_ns() - started_ns) / 1_000_000,
             "peak_rss_bytes": peak_bytes,
         }
     except BaseException as error:
-        terminate(process)
-        if not isinstance(error, Exception):
-            raise
-        tail = output[-4096:].decode("utf-8", "replace")
-        if tail:
-            raise RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}") from error
-        raise
-    finally:
-        if log_path is not None:
+        try:
+            terminate(process)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if isinstance(error, Exception):
+            tail = output[-4096:].decode("utf-8", "replace")
+            if tail:
+                wrapped = RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}")
+                wrapped.__cause__ = error
+                primary_error = wrapped
+            else:
+                primary_error = error
+        else:
+            primary_error = error
+
+    if log_path is not None:
+        try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_bytes(output)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+    try:
         interaction.close()
+    except BaseException as cleanup_error:
+        cleanup_errors.append(cleanup_error)
+
+    _raise_guest_script_failure(primary_error, cleanup_errors)
+    assert result is not None
+    return result
 
 
 def capture_automatic_snapshot(

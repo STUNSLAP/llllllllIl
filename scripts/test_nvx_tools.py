@@ -5913,6 +5913,101 @@ class BenchmarkTests(unittest.TestCase):
         wait.assert_not_called()
         self.assertTrue(log.endswith(b"NVX-RESTORE-PROCESSORS-FAIL unstable-tsc\r\n"))
 
+    def test_guest_runner_preserves_primary_and_close_failures_with_bounded_tail(self):
+        class FakeProcess:
+            pid = 123
+
+            def poll(self):
+                return 7
+
+            def wait(self):
+                return 7
+
+        class FakeInteraction:
+            process = FakeProcess()
+            containment = None
+
+            def read_output(self, chunks: queue.Queue[bytes | None]):
+                chunks.put(benchmark.BOOT_MARKER + b"\n" + b"x" * 5000 + b"\nDONE\n")
+                chunks.put(None)
+
+            def write_input(self, _data: bytes):
+                pass
+
+            def close(self):
+                raise OSError("close failed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "guest.log"
+            with (
+                patch.object(
+                    benchmark, "InteractiveProcess", return_value=FakeInteraction()
+                ),
+                patch.object(benchmark, "_try_peak_rss", return_value=1024),
+                patch.object(benchmark, "terminate") as terminate,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "OpenVMM exited with status 7"
+                ) as raised:
+                    benchmark.run_guest_script(
+                        ["openvmm"],
+                        "guest command\n",
+                        b"DONE",
+                        timeout=1,
+                        log_path=log_path,
+                    )
+
+            error = raised.exception
+            cleanup_errors = cast(
+                tuple[BaseException, ...],
+                error.cleanup_errors,  # type: ignore[attr-defined]
+            )
+            self.assertEqual([str(item) for item in cleanup_errors], ["close failed"])
+            self.assertIn("--- OpenVMM output ---", str(error))
+            self.assertIn("--- cleanup failures ---", str(error))
+            self.assertNotIn(benchmark.BOOT_MARKER.decode(), str(error))
+            self.assertGreater(len(log_path.read_bytes()), 4096)
+            self.assertTrue(log_path.read_bytes().endswith(b"\nDONE\n"))
+            terminate.assert_called_once()
+
+    def test_guest_runner_propagates_success_only_close_failure(self):
+        class FakeProcess:
+            pid = 123
+
+            def poll(self):
+                return 0
+
+            def wait(self):
+                return 0
+
+        class FakeInteraction:
+            process = FakeProcess()
+            containment = None
+
+            def read_output(self, chunks: queue.Queue[bytes | None]):
+                chunks.put(benchmark.BOOT_MARKER + b"\nDONE\n")
+                chunks.put(None)
+
+            def write_input(self, _data: bytes):
+                pass
+
+            def close(self):
+                raise OSError("close after success")
+
+        with (
+            patch.object(
+                benchmark, "InteractiveProcess", return_value=FakeInteraction()
+            ),
+            patch.object(benchmark, "_try_peak_rss", return_value=1024),
+        ):
+            with self.assertRaisesRegex(OSError, "close after success"):
+                benchmark.run_guest_script(
+                    ["openvmm"],
+                    "guest command\n",
+                    b"DONE",
+                    timeout=1,
+                )
+
     def test_live_peak_rss_samples_linux_process_without_reaping(self):
         process = MagicMock(pid=123)
         with (

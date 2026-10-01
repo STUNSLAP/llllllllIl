@@ -1425,10 +1425,15 @@ def run_l3_l4_egress_policy(
     tcp_ports = tuple(int(endpoint.getsockname()[1]) for endpoint in tcp)
     udp_ports = tuple(int(endpoint.getsockname()[1]) for endpoint in udp)
     server_errors: list[Exception] = []
+    allowed_observations: list[str] = []
+    blocked_observations: list[str] = []
 
     def serve_allowed() -> None:
         try:
-            for listener, suffix in ((tcp[1], b"START"), (tcp[3], b"END")):
+            for listener, suffix, observation in (
+                (tcp[1], b"START", "tcp:start"),
+                (tcp[3], b"END", "tcp:end"),
+            ):
                 connection, _ = listener.accept()
                 with connection:
                     connection.settimeout(timeout)
@@ -1444,10 +1449,15 @@ def run_l3_l4_egress_policy(
                         + b"\r\nConnection: close\r\n\r\n"
                         + body
                     )
-            for endpoint, suffix in ((udp[1], b"START"), (udp[3], b"END")):
+                allowed_observations.append(observation)
+            for endpoint, suffix, observation in (
+                (udp[1], b"START", "udp:start"),
+                (udp[3], b"END", "udp:end"),
+            ):
                 payload, _ = endpoint.recvfrom(128)
                 if payload != b"NVX-L3-L4-UDP-ALLOW-" + suffix:
                     raise RuntimeError(f"unexpected allowed UDP payload: {payload!r}")
+                allowed_observations.append(observation)
         except Exception as error:
             server_errors.append(error)
 
@@ -1517,22 +1527,36 @@ def run_l3_l4_egress_policy(
             raise RuntimeError(
                 "L3/L4 allowed endpoint server failed"
             ) from server_errors[0]
+        expected_allowed = ["tcp:start", "tcp:end", "udp:start", "udp:end"]
+        if allowed_observations != expected_allowed:
+            raise RuntimeError(
+                "L3/L4 allowed endpoint observations were incomplete: "
+                f"{allowed_observations!r}"
+            )
 
-        for endpoint in (tcp[0], tcp[2], tcp[4]):
+        for endpoint, observation in (
+            (tcp[0], "tcp:adjacent-low"),
+            (tcp[2], "tcp:interior"),
+            (tcp[4], "tcp:adjacent-high"),
+        ):
             endpoint.settimeout(NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS)
             try:
                 unexpected, _ = endpoint.accept()
             except TimeoutError:
-                pass
+                blocked_observations.append(observation)
             else:
                 unexpected.close()
                 raise RuntimeError("blocked TCP range port reached the host")
-        for endpoint in (udp[0], udp[2], udp[4]):
+        for endpoint, observation in (
+            (udp[0], "udp:adjacent-low"),
+            (udp[2], "udp:interior"),
+            (udp[4], "udp:adjacent-high"),
+        ):
             endpoint.settimeout(NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS)
             try:
                 unexpected, _ = endpoint.recvfrom(128)
             except TimeoutError:
-                pass
+                blocked_observations.append(observation)
             else:
                 raise RuntimeError(
                     f"blocked UDP range port reached the host: {unexpected!r}"
@@ -1599,15 +1623,8 @@ def run_l3_l4_egress_policy(
                         "adjacent_high": udp_ports[4],
                     },
                     "observed": {
-                        "allowed": ["tcp:start", "tcp:end", "udp:start", "udp:end"],
-                        "blocked": [
-                            "tcp:adjacent-low",
-                            "tcp:interior",
-                            "tcp:adjacent-high",
-                            "udp:adjacent-low",
-                            "udp:interior",
-                            "udp:adjacent-high",
-                        ],
+                        "allowed": allowed_observations,
+                        "blocked": blocked_observations,
                     },
                 },
                 indent=2,
