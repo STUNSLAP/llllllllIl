@@ -7,6 +7,7 @@ import ctypes
 import hashlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -58,6 +59,7 @@ from nvx_tools.adversarial_executor import (
 from nvx_tools.adversarial_oracles import (
     BoundedProcessResult,
     OracleSession,
+    _freeze_linux_process_tree,
     _WindowsJob,
     run_bounded_process,
 )
@@ -554,6 +556,36 @@ class AdversarialBrokerTests(unittest.TestCase):
 
 
 class AdversarialOracleTests(unittest.TestCase):
+    def test_process_tree_enumeration_waits_for_every_thread_to_stop(self) -> None:
+        events: list[str] = []
+
+        def task_states(_pid: int) -> tuple[tuple[int, str], ...]:
+            events.append("observe")
+            if events.count("observe") == 1:
+                return ((123, "R"), (124, "T"))
+            return ((123, "T"), (124, "t"))
+
+        def direct_children(_pid: int) -> tuple[int, ...]:
+            events.append("enumerate")
+            return ()
+
+        with (
+            patch.object(signal, "SIGSTOP", 19, create=True),
+            patch("nvx_tools.adversarial_oracles.os.kill"),
+            patch(
+                "nvx_tools.adversarial_oracles._linux_task_states",
+                side_effect=task_states,
+            ),
+            patch(
+                "nvx_tools.adversarial_oracles._linux_direct_children",
+                side_effect=direct_children,
+            ),
+            patch("nvx_tools.adversarial_oracles.time.sleep"),
+        ):
+            self.assertEqual(_freeze_linux_process_tree(123), [123])
+
+        self.assertEqual(events, ["observe", "observe", "observe", "enumerate"])
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process ownership")
     def test_contained_guest_runner_cleans_threaded_detached_child_only(self) -> None:
         for completion_marker in (b"SYNTHETIC-COMPLETE", b"NEVER-COMPLETE"):

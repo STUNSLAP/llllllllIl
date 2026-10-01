@@ -386,7 +386,63 @@ def _linux_direct_children(pid: int) -> tuple[int, ...]:
     return tuple(sorted(children))
 
 
-def _freeze_linux_process_tree(pid: int) -> list[int]:
+def _linux_task_states(pid: int) -> tuple[tuple[int, str], ...]:
+    task_path = Path(f"/proc/{pid}/task")
+    try:
+        task_paths = tuple(task_path.iterdir())
+    except FileNotFoundError:
+        return ()
+    except OSError as error:
+        raise ScriptError(f"cannot observe process {pid} threads: {error}") from error
+
+    states: list[tuple[int, str]] = []
+    for task_path in task_paths:
+        stat_path = task_path / "stat"
+        try:
+            stat = stat_path.read_text()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ScriptError(
+                f"cannot observe process {pid} thread {task_path.name}: {error}"
+            ) from error
+        comm_end = stat.rfind(")")
+        fields = stat[comm_end + 1 :].split() if comm_end >= 0 else []
+        if not fields or len(fields[0]) != 1:
+            raise ScriptError(f"cannot parse process stat file {stat_path}")
+        try:
+            task_id = int(task_path.name)
+        except ValueError as error:
+            raise ScriptError(f"cannot parse task ID {task_path.name}") from error
+        states.append((task_id, fields[0]))
+    return tuple(sorted(states))
+
+
+def _wait_linux_process_quiescent(pid: int, deadline: float) -> bool:
+    quiescent_task_ids: tuple[int, ...] | None = None
+    while True:
+        states = _linux_task_states(pid)
+        if not states:
+            return False
+        task_ids = tuple(task_id for task_id, _ in states)
+        if all(state in {"T", "t", "Z", "X", "x"} for _, state in states):
+            if task_ids == quiescent_task_ids:
+                return True
+            quiescent_task_ids = task_ids
+        else:
+            quiescent_task_ids = None
+        if time.monotonic() >= deadline:
+            raise ScriptError(f"timed out stopping process {pid} for cleanup")
+        time.sleep(0.01)
+
+
+def _freeze_linux_process_tree(
+    pid: int,
+    *,
+    deadline: float | None = None,
+) -> list[int]:
+    if deadline is None:
+        deadline = time.monotonic() + PROCESS_TERMINATION_WAIT_SECONDS
     sigstop = cast(int, getattr(signal, "SIGSTOP"))  # noqa: B009
     try:
         os.kill(pid, sigstop)
@@ -394,6 +450,9 @@ def _freeze_linux_process_tree(pid: int) -> list[int]:
         return []
     except PermissionError as error:
         raise ScriptError(f"cannot stop process {pid} for cleanup: {error}") from error
+
+    if not _wait_linux_process_quiescent(pid, deadline):
+        return []
 
     frozen: list[int] = []
     seen_children: set[int] = set()
@@ -404,7 +463,7 @@ def _freeze_linux_process_tree(pid: int) -> list[int]:
             break
         seen_children.update(new_children)
         for child in new_children:
-            frozen.extend(_freeze_linux_process_tree(child))
+            frozen.extend(_freeze_linux_process_tree(child, deadline=deadline))
     frozen.append(pid)
     return frozen
 
