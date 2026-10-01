@@ -42,7 +42,7 @@ from .build_constants import (
     OpenVMMBuildConstants,
 )
 from .common import bytes_to_mib, sha256_file
-from .time_abi import TimeAbiMonitor
+from .time_abi import TimeAbiMonitor, status_script
 
 BOOT_MARKER = b"ALPINE-MICROVM-BOOT-OK"
 RESTORE_MARKER = b"OPENVMM-SNAPSHOT-RESTORE-OK"
@@ -2434,7 +2434,15 @@ def run_guest_script(
     log_path: Path | None = None,
     boot_marker: bytes = BOOT_MARKER,
     contain_process_tree: bool = False,
+    time_abi_status: bool = False,
 ) -> GuestCommandResult:
+    """Run ``script`` once the guest boots and wait for ``completion_marker``.
+
+    With ``time_abi_status``, a cold boot first asks the guest for its time
+    ABI status and sends ``script`` only after the query exits, so the
+    guest's tty cannot echo script bytes into the status lines. The run
+    fails unless the guest reported a valid boot line.
+    """
     environment = os.environ.copy()
     environment["OPENVMM_LOG"] = "off"
     started_ns = time.perf_counter_ns()
@@ -2445,6 +2453,7 @@ def run_guest_script(
     )
     process = interaction.process
     monitor = TimeAbiMonitor(command)
+    query_status = time_abi_status and monitor.cold_boot
     if windows_cpus is not None:
         set_windows_affinity(process.pid, windows_cpus)
 
@@ -2454,6 +2463,7 @@ def run_guest_script(
     ).start()
     deadline = time.monotonic() + timeout
     output = bytearray()
+    status_sent = False
     input_sent = False
     completed = False
     peak_bytes = 0
@@ -2479,7 +2489,14 @@ def run_guest_script(
             output.extend(chunk)
             monitor.feed(chunk)
             peak_bytes = _try_peak_rss(process, peak_bytes)
-            if not input_sent and boot_marker in output:
+            if query_status and not status_sent and boot_marker in output:
+                interaction.write_input(status_script().encode("utf-8"))
+                status_sent = True
+            if (
+                not input_sent
+                and boot_marker in output
+                and (not query_status or monitor.status_queries > 0)
+            ):
                 interaction.write_input(script.encode("utf-8"))
                 input_sent = True
             if input_sent and contains_output_line(output, completion_marker):
@@ -2497,6 +2514,8 @@ def run_guest_script(
         if teardown_mode == "guest-exit" and returncode != 0:
             raise monitor.exit_error(returncode)
         if not input_sent:
+            if status_sent:
+                monitor.require_status("the guest exited")
             raise RuntimeError("guest exited before its boot marker")
         if not completed:
             raise RuntimeError(
@@ -4670,11 +4689,14 @@ def capture_snapshot(
     post_restore_script: str | None = None,
     log_path: Path | None = None,
     boot_marker: bytes = BOOT_MARKER,
+    time_abi_status: bool = False,
 ) -> tuple[float, float, float, int]:
     """Capture one guest-requested snapshot and time its generation.
 
     Guest markers match only the guest console, and the profile records that
-    time generation come only from OpenVMM's stderr.
+    time generation come only from OpenVMM's stderr. With ``time_abi_status``,
+    the source guest first answers a time ABI status query, and the capture
+    starts only after the query exits.
     """
     if snapshot_path.exists():
         shutil.rmtree(snapshot_path)
@@ -4685,6 +4707,7 @@ def capture_snapshot(
     interaction = InteractiveProcess(command, environment, separate_stderr=True)
     process = interaction.process
     monitor = TimeAbiMonitor(command)
+    query_status = time_abi_status and monitor.cold_boot
     profile = SnapshotProfileCollector(
         process.pid,
         process_started_ns,
@@ -4695,6 +4718,7 @@ def capture_snapshot(
 
     output = SeparatedOutput(interaction)
     deadline = time.monotonic() + timeout
+    status_sent = False
     boot_seen = False
     snapshot_requested = False
     snapshot_started_ns = None
@@ -4762,7 +4786,19 @@ def capture_snapshot(
                 and contains_output_line(console, SNAPSHOT_GUEST_DISPATCH_MARKER)
             ):
                 snapshot_guest_dispatched_ns = time.perf_counter_ns()
-            if not boot_seen and boot_marker in console:
+            if (
+                not boot_seen
+                and query_status
+                and not status_sent
+                and (boot_marker in console)
+            ):
+                interaction.write_input(status_script().encode("utf-8"))
+                status_sent = True
+            if (
+                not boot_seen
+                and boot_marker in console
+                and (not query_status or monitor.status_queries > 0)
+            ):
                 boot_seen = True
                 if processors is None:
                     request_snapshot()
@@ -4793,6 +4829,8 @@ def capture_snapshot(
             snapshot_published_ns = source_exited_ns
         if returncode != 0:
             raise monitor.exit_error(returncode, "snapshot source")
+        if status_sent:
+            monitor.require_status("the snapshot source exited")
         if not snapshot_requested:
             raise RuntimeError("source guest exited before its snapshot request")
         if not snapshot_path.is_dir():
