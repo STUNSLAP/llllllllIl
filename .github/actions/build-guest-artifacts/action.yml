@@ -8,11 +8,18 @@ inputs:
       and cache saves for artifacts that miss the cache
     required: false
     default: "false"
+  debug-kernel:
+    description: Also cache or build the CI debug kernel (build/vmlinux-debug)
+    required: false
+    default: "false"
 
 outputs:
   kernel-cache-key:
     description: Exact cache key for the Linux kernel artifacts
     value: ${{ steps.guest-cache-keys.outputs.kernel }}
+  debug-kernel-cache-key:
+    description: Exact cache key for the Linux debug kernel artifacts
+    value: ${{ steps.guest-cache-keys.outputs.kernel-debug }}
   alpine-cache-key:
     description: Exact cache key for the Alpine disk image artifacts
     value: ${{ steps.guest-cache-keys.outputs.alpine }}
@@ -59,6 +66,7 @@ runs:
         UBUNTU_VERSION: ${{ steps.guest-versions.outputs.ubuntu-version }}
         AZURELINUX_VERSION: ${{ steps.guest-versions.outputs.azurelinux-version }}
         KERNEL_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'kernel/config-microvm', 'kernel/patches/**', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py') }}
+        DEBUG_KERNEL_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'kernel/config-microvm', 'kernel/config-microvm-debug', 'kernel/patches/**', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py') }}
         ALPINE_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'guest/alpine/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/guests.py') }}
         UBUNTU_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'guest/ubuntu/**', 'ubuntu/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/guests.py', 'scripts/nvx_tools/ubuntu.py') }}
         AZURELINUX_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'azurelinux/**', 'docker/Dockerfile', 'scripts/nvx_tools/azurelinux.py', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/guests.py') }}
@@ -66,6 +74,7 @@ runs:
         set -euo pipefail
         {
           echo "kernel=linux-kernel-v1-${KERNEL_VERSION}-${KERNEL_INPUT_HASH}"
+          echo "kernel-debug=linux-kernel-debug-v1-${KERNEL_VERSION}-${DEBUG_KERNEL_INPUT_HASH}"
           echo "alpine=alpine-image-v1-${ALPINE_VERSION}-${ALPINE_INPUT_HASH}"
           echo "ubuntu=ubuntu-initramfs-v1-${UBUNTU_VERSION}-${UBUNTU_INPUT_HASH}"
           echo "ubuntu-distro=ubuntu-distro-v1-${UBUNTU_VERSION}-${UBUNTU_INPUT_HASH}"
@@ -143,6 +152,45 @@ runs:
           build/vmlinux.config
           build/vmlinux.provenance.json
         key: ${{ steps.guest-cache-keys.outputs.kernel }}
+        enableCrossOsArchive: true
+
+    - name: Restore Linux debug kernel (zstd)
+      id: cache-linux-debug-kernel-zstd
+      if: inputs.debug-kernel == 'true'
+      uses: actions/cache/restore@v5
+      with:
+        path: |
+          build/vmlinux-debug
+          build/vmlinux-debug.config
+          build/vmlinux-debug.provenance.json
+        key: ${{ steps.guest-cache-keys.outputs.kernel-debug }}
+        enableCrossOsArchive: true
+
+    - name: Build Linux debug kernel (Docker)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.debug-kernel == 'true' &&
+        steps.cache-linux-debug-kernel-zstd.outputs.cache-hit != 'true'
+      shell: bash
+      run: >-
+        docker build
+        --file docker/Dockerfile
+        --target kernel-debug-artifacts
+        --output type=local,dest=build
+        .
+
+    - name: Save Linux debug kernel (zstd)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.debug-kernel == 'true' &&
+        steps.cache-linux-debug-kernel-zstd.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: |
+          build/vmlinux-debug
+          build/vmlinux-debug.config
+          build/vmlinux-debug.provenance.json
+        key: ${{ steps.guest-cache-keys.outputs.kernel-debug }}
         enableCrossOsArchive: true
 
     - name: Build Alpine disk image (Docker)
