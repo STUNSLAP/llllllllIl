@@ -12,6 +12,12 @@ inputs:
     description: Also cache or build the CI debug kernel (build/vmlinux-debug)
     required: false
     default: "false"
+  guest-images:
+    description: >-
+      Cache or build the kernel and guest images; "false" with debug-kernel
+      builds only the CI debug kernel, for a job that runs beside this one
+    required: false
+    default: "true"
 
 outputs:
   kernel-cache-key:
@@ -83,6 +89,7 @@ runs:
 
     - name: Restore Linux kernel (zstd)
       id: cache-linux-kernel-zstd
+      if: inputs.guest-images == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -94,6 +101,7 @@ runs:
 
     - name: Restore Alpine disk image (zstd)
       id: cache-alpine-image-zstd
+      if: inputs.guest-images == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -105,6 +113,7 @@ runs:
 
     - name: Restore Ubuntu initramfs (zstd)
       id: cache-ubuntu-initramfs-zstd
+      if: inputs.guest-images == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -115,6 +124,7 @@ runs:
 
     - name: Restore Ubuntu distro layer (zstd)
       id: cache-ubuntu-distro-zstd
+      if: inputs.guest-images == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -125,6 +135,7 @@ runs:
 
     - name: Restore Azure Linux initramfs (zstd)
       id: cache-azurelinux-initramfs-zstd
+      if: inputs.guest-images == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -134,7 +145,10 @@ runs:
         enableCrossOsArchive: true
 
     - name: Build Linux kernel (Docker)
-      if: inputs.restore-only != 'true' && steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
       shell: bash
       run: >-
         docker build
@@ -144,7 +158,10 @@ runs:
         .
 
     - name: Save Linux kernel (zstd)
-      if: inputs.restore-only != 'true' && steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
         path: |
@@ -194,7 +211,10 @@ runs:
         enableCrossOsArchive: true
 
     - name: Build Alpine disk image (Docker)
-      if: inputs.restore-only != 'true' && steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
       shell: bash
       run: >-
         docker build
@@ -204,7 +224,10 @@ runs:
         .
 
     - name: Save Alpine disk image (zstd)
-      if: inputs.restore-only != 'true' && steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
         path: |
@@ -215,7 +238,10 @@ runs:
         enableCrossOsArchive: true
 
     - name: Build Ubuntu initramfs (Docker)
-      if: inputs.restore-only != 'true' && steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
       shell: bash
       run: >-
         docker build
@@ -228,8 +254,11 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         (
-          steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true' ||
-          steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
+          inputs.guest-images == 'true' &&
+          (
+            steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true' ||
+            steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
+          )
         )
       shell: bash
       run: >-
@@ -239,7 +268,10 @@ runs:
         .
 
     - name: Save Ubuntu initramfs (zstd)
-      if: inputs.restore-only != 'true' && steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
         path: |
@@ -249,7 +281,10 @@ runs:
         enableCrossOsArchive: true
 
     - name: Build Azure Linux initramfs (Docker)
-      if: inputs.restore-only != 'true' && steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
       shell: bash
       env:
         AZURELINUX_IMAGE: ${{ steps.guest-versions.outputs.azurelinux-image }}
@@ -264,7 +299,10 @@ runs:
         .
 
     - name: Save Azure Linux initramfs (zstd)
-      if: inputs.restore-only != 'true' && steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
         path: |
@@ -274,7 +312,10 @@ runs:
         enableCrossOsArchive: true
 
     - name: Build Ubuntu distro layer (Docker)
-      if: inputs.restore-only != 'true' && steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
       shell: bash
       run: >-
         docker build
@@ -284,7 +325,10 @@ runs:
         .
 
     - name: Save Ubuntu distro layer (zstd)
-      if: inputs.restore-only != 'true' && steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
         path: |
@@ -294,6 +338,7 @@ runs:
         enableCrossOsArchive: true
 
     - name: Prepare Ubuntu sandbox scratch template
+      if: inputs.guest-images == 'true'
       shell: bash
       run: |
         set -euo pipefail

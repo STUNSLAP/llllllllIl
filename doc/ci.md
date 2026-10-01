@@ -21,7 +21,10 @@ The `nvx-microvm-tests-{kvm,mshv,whp}` jobs consume the NVX Linux kernel and
 the NVX Linux kernel plus the selected Alpine or Ubuntu initramfs and exercises
 Linux, SMP, virtio, sandbox, and snapshot behavior through the public OpenVMM
 CLI. Alpine-control-only scenarios remain explicit and are rejected for the
-Ubuntu initramfs. Failure logs from the NVX layer are uploaded per backend.
+Ubuntu initramfs. Each job also boots the Azure Linux initramfs through its
+one-vCPU smoke set, under the same time ABI checks; the debug-kernel jobs skip
+it, as they skip the Ubuntu tests. Failure logs from the NVX layer are uploaded
+per backend.
 Every harness launch, in the tests and the benchmarks, scans the OpenVMM
 console for the guest's [time ABI](design/time-abi.md) output. An
 `NVX-TIME-ABI-VIOLATION` event or a failed `NVX-TIME-ABI` conformance line
@@ -84,6 +87,24 @@ every CPU, a summary with `status=ok`, the requested CPU count, and no
 failures, and exit status 0; a failure lists each failing check with the
 guest's detail. The guest command fits on one console line, so the console's
 echo of it ends before the check prints.
+
+The `nvx-microvm-debug-{kvm,mshv,whp}` jobs run
+`test-microvm --debug-kernel` on the CI debug kernel (`build/vmlinux-debug`,
+built from `kernel/config-microvm-debug`), whose soft-lockup and hung-task
+detectors production kernels leave out. It selects the same-host restore
+scenarios `smp`, `smp-snapshot`, `restore-processors`, `restore-downtime`, and
+`snapshot-tiers`. Any RCU stall, soft lockup, or hung task makes the guest's
+time ABI watcher power off with status 194, which fails the run. The harness
+refuses a kernel whose `vmlinux-debug.config` lacks the detectors, because the
+guest's `C11` check passes vacuously without them. To bound the cost, pull
+requests run the debug kernel on KVM only and `dev` pushes run it on every
+backend; each job takes about five minutes on its own runner, in parallel with
+the other microVM jobs. The jobs gate the required status check, the
+development release, and performance persistence. The GitHub-hosted
+`debug-kernel` job builds the debug kernel beside the shared `artifacts` job
+(`build-guest-artifacts` with `guest-images: "false"`) and caches it under its
+own key, so a kernel rebuild delays only the debug jobs, and a failed debug
+kernel build fails the required status check and blocks the release.
 
 Every job that uses the `validate-runner` action first qualifies its runner
 for the time ABI with `nvx.py doctor --checks H1 H2 H4 --no-openvmm
@@ -258,7 +279,8 @@ Linux/Windows result to be successful; failed, cancelled, or skipped crate
 checks cannot publish a release.
 
 Each `nvx-microvm-tests-{kvm,mshv,whp}` job then runs
-`nvx.py test-aci-edge-sandboxes` on its self-hosted runner. This command drives a
+`nvx.py test-aci-edge-sandboxes` on its self-hosted runner; the debug-kernel
+jobs skip it, because it boots the production kernel. This command drives a
 complete provision, start, exec, stop, start, and deprovision cycle of the
 Alpine guest with the crate's OpenVMM backend. It also checks cancellation,
 that guest state lasts only until a stop, that a start terminates the VM of an
