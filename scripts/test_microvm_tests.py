@@ -2546,7 +2546,7 @@ class MicrovmTests(unittest.TestCase):
         def require(path: Path, _description: str) -> Path:
             return path
 
-        for guest, memory_mib in (("alpine", 128), ("ubuntu", 256)):
+        for guest, memory_mib in (("alpine", 128), ("ubuntu", 512)):
             with (
                 self.subTest(guest=guest),
                 tempfile.TemporaryDirectory() as temporary,
@@ -3538,7 +3538,7 @@ class MicrovmTests(unittest.TestCase):
             BuildConstants.BUILD_DIR / "initramfs-ubuntu.cpio.gz",
             requested,
         )
-        self.assertEqual(run_guest_boot.call_args.kwargs["memory_mib"], 256)
+        self.assertEqual(run_guest_boot.call_args.kwargs["memory_mib"], 512)
 
     def test_runner_omits_console_snapshot_from_ubuntu_defaults(self):
         def require(path: Path, _description: str) -> Path:
