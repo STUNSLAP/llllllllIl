@@ -1831,9 +1831,7 @@ def measure_once(
                 if process.poll() is not None:
                     drain_exited_output(output, monitor)
                     monitor.check_exit(process.returncode)
-                    raise RuntimeError(
-                        f"OpenVMM exited with status {process.returncode}"
-                    ) from None
+                    raise monitor.exit_error(process.returncode) from None
                 continue
             if stream == "stderr":
                 if profile is not None and chunk is not None:
@@ -1843,7 +1841,7 @@ def measure_once(
                 monitor.finish()
                 returncode = exit_status_after_eof(process)
                 monitor.check_exit(returncode)
-                raise RuntimeError(f"OpenVMM exited with status {returncode}")
+                raise monitor.exit_error(returncode)
             monitor.feed(chunk)
             console = output.console
             if failure_marker is not None:
@@ -1903,9 +1901,7 @@ def measure_once(
                     # finish_output() would drain them.
                     drain_exited_output(output, monitor)
                     monitor.check_exit(returncode)
-                    raise RuntimeError(
-                        f"OpenVMM exited with status {returncode} during teardown"
-                    )
+                    raise monitor.exit_error(returncode, when="during teardown")
                 finish_output(marker_reached, readiness_counters)
                 return elapsed_ms, peak_bytes, teardown_ms, wall_ms
     except GuestFailureReported:
@@ -2519,7 +2515,7 @@ def run_guest_script(
         returncode = process.wait()
         monitor.check_exit(returncode)
         if teardown_mode == "guest-exit" and returncode != 0:
-            raise RuntimeError(f"OpenVMM exited with status {returncode}")
+            raise monitor.exit_error(returncode)
         if not input_sent:
             raise RuntimeError("guest exited before its boot marker")
         if not completed:
@@ -2608,7 +2604,7 @@ def capture_automatic_snapshot(
         returncode = process.wait()
         monitor.check_exit(returncode)
         if returncode != 0:
-            raise RuntimeError(f"snapshot source exited with status {returncode}")
+            raise monitor.exit_error(returncode, "snapshot source")
         for marker in required_markers:
             if marker not in output:
                 raise RuntimeError(
@@ -2698,9 +2694,7 @@ def capture_device_restore_snapshot(
         returncode = process.wait()
         monitor.check_exit(returncode)
         if returncode != 0:
-            raise RuntimeError(
-                f"{device}/{mode} snapshot source exited with status {returncode}"
-            )
+            raise monitor.exit_error(returncode, f"{device}/{mode} snapshot source")
         markers = _device_restore_markers(
             output.decode("utf-8", "replace"), device, mode
         )
@@ -2816,9 +2810,7 @@ def run_device_restore_sample(
         returncode = process.wait()
         monitor.check_exit(returncode)
         if returncode != 0:
-            raise RuntimeError(
-                f"{device}/{mode} restore exited with status {returncode}"
-            )
+            raise monitor.exit_error(returncode, f"{device}/{mode} restore")
         for phase in ("restore-ready", "trigger", "io-success"):
             if phase not in phase_times:
                 raise RuntimeError(f"{device}/{mode} restore is missing {phase!r}")
@@ -4790,9 +4782,7 @@ def capture_snapshot(
                 if process.poll() is not None and snapshot_published_ns is None:
                     drain_exited_output(output, monitor)
                     monitor.check_exit(process.returncode)
-                    raise RuntimeError(
-                        f"OpenVMM exited with status {process.returncode}"
-                    ) from None
+                    raise monitor.exit_error(process.returncode) from None
                 continue
             if chunk is None:
                 if output.closed:
@@ -4841,10 +4831,10 @@ def capture_snapshot(
         monitor.check_exit(returncode)
         if snapshot_published_ns is None and snapshot_path.is_dir():
             snapshot_published_ns = source_exited_ns
+        if returncode != 0:
+            raise monitor.exit_error(returncode, "snapshot source")
         if not snapshot_requested:
             raise RuntimeError("source guest exited before its snapshot request")
-        if returncode != 0:
-            raise RuntimeError(f"snapshot source exited with status {returncode}")
         if not snapshot_path.is_dir():
             raise RuntimeError(f"snapshot was not published at {snapshot_path}")
         if snapshot_guest_dispatched_ns is None:
