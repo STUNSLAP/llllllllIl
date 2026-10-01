@@ -75,7 +75,12 @@ from nvx_tools.release import (
     package_release,
     verify_source_tree,
 )
-from nvx_tools.sandbox import SandboxLaunch, SandboxLayer, parse_workload_identity
+from nvx_tools.sandbox import (
+    SandboxLaunch,
+    SandboxLayer,
+    SandboxMount,
+    parse_workload_identity,
+)
 
 DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
 HYPERVISORS = ("auto", "whp", "kvm", "mshv")
@@ -377,6 +382,10 @@ def command_sandbox(args: argparse.Namespace) -> None:
         raise ScriptError(
             "--outcome-report is only valid for one-shot run or managed exec"
         )
+    if args.mount_deny and args.mount is None:
+        raise ScriptError("--mount-deny requires --mount")
+    if args.mount is not None and operation not in ("run", "provision"):
+        raise ScriptError("--mount is only valid for sandbox run or provision")
     if operation in ("run", "provision"):
         if (args.net is None) != (args.network_profile is None):
             raise ScriptError("--net and --network-profile must be specified together")
@@ -391,6 +400,11 @@ def command_sandbox(args: argparse.Namespace) -> None:
             workload_identity=args.workload_user,
             memory_max=args.memory_max,
             pids_max=args.pids_max,
+            mount=(
+                None
+                if args.mount is None
+                else SandboxMount.parse(args.mount, tuple(args.mount_deny))
+            ),
         ).validated()
         _validate_sandbox_systemd_policy(launch)
     else:
@@ -787,6 +801,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="guest workload timeout in milliseconds; zero disables it",
     )
     sandbox.add_argument("--hypervisor", choices=HYPERVISORS, default="auto")
+    sandbox.add_argument(
+        "--mount",
+        metavar="GUEST_TARGET,HOST_PATH[,ro|rw]",
+        help="live-share one host directory inside the container rootfs",
+    )
+    sandbox.add_argument(
+        "--mount-deny",
+        action="append",
+        default=[],
+        metavar="HOST_PATH",
+        help="hide one existing path inside the --mount host directory",
+    )
     sandbox.add_argument("--net", metavar="IPV4/PREFIX")
     sandbox.add_argument("--network-profile", choices=NETWORK_PROFILES)
     sandbox.add_argument("--network-egress", choices=("allow", "deny"))

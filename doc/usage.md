@@ -368,6 +368,8 @@ python3 scripts/nvx.py sandbox
     [--timeout SECONDS]
     [--exec-timeout-ms MILLISECONDS]
     [--hypervisor {auto,whp,kvm,mshv}]
+    [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]
+    [--mount-deny HOST_PATH]...
     [--net IPV4/PREFIX]
     [--network-profile {portable}]
     [--network-egress {allow,deny}]
@@ -382,7 +384,8 @@ python3 scripts/nvx.py sandbox
     [--dry-run]
 ```
 
-Network policy options configure only the `run` and `provision` launches.
+Network policy and live-share options configure only the `run` and `provision`
+launches.
 
 | Option | Default | Description |
 | --- | --- | --- |
@@ -400,6 +403,8 @@ Network policy options configure only the `run` and `provision` launches.
 | `--timeout SECONDS` | `60` | Set the control response timeout for managed `start`, `exec`, and `stop`. |
 | `--exec-timeout-ms MILLISECONDS` | `0` | Set the managed `exec` guest workload timeout; zero disables it. |
 | `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the host hypervisor. |
+| `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Live-share one host directory at the absolute target inside the container rootfs for `run` or `provision`; defaults to `ro`. `/`, `/etc`, and the `/proc`, `/sys`, `/dev`, and `/.nvx-agent` trees are reserved. |
+| `--mount-deny HOST_PATH` | none | Hide one existing file or directory inside the `--mount` host directory; relative paths are resolved inside it. Repeat to deny multiple paths. |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with a static guest address. |
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
 | `--network-egress {allow,deny}` | `allow` | Set the default guest egress policy for `run` or `provision`. |
@@ -410,7 +415,7 @@ Network policy options configure only the `run` and `provision` launches.
 | `--network-proxy IPV4:TCP-PORT` | none | Allow one explicit host TCP proxy endpoint; the IPv4 address must match the guest gateway. |
 | `--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT` | none | Publish one TCP or UDP localhost port to the guest; repeat to add forwards and set `--host-loopback allow`. |
 | `--outcome-report PATH` | none | Write a bounded local JSON outcome report for one-shot `run` or managed `exec`. |
-| `--cmdline TEXT` | empty | Append non-sandbox kernel parameters; `nvx_*` and `tsc=` tokens are reserved. |
+| `--cmdline TEXT` | empty | Append non-sandbox kernel parameters; `nvx_*`, `virtfs_*`, and `tsc=` tokens are reserved. |
 | `--dry-run` | off | Print the generated OpenVMM microVM command without running it. |
 
 See [Run](run.md) for artifact preparation, the security boundary, and current
