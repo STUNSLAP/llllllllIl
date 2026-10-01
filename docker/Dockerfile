@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gzip \
         libelf-dev \
         libssl-dev \
+        musl-tools \
         patch \
         python3 \
         rsync \
