@@ -196,6 +196,7 @@ jobs:
           test "$(readlink "${share}/nvx-links/absolute")" = /nvx/absolute/target
           test "$(readlink "${share}/nvx-links/outside")" = ../../nvx-outside-marker
           test "$(readlink "${share}/nvx-links/denied")" = ../nvx-denied/secret
+          test "$(readlink "${share}/nvx-links/denied-directory")" = ../nvx-denied
           test ! -L "${share}/nvx-links/marker"
           test "$(cat "${outside}")" = host-outside
           test "$(cat "${share}/nvx-denied/secret")" = secret
@@ -281,7 +282,11 @@ jobs:
           test "$(cat "${share}/nvx-guest-marker")" = guest-to-host
           test -d "${share}/nvx-guest-directory"
           test "$(readlink "${share}/nvx-links/nvx-tool")" = ../nvx-tool
+          test "$(readlink "${share}/nvx-links/absolute")" = /nvx/absolute/target
           test "$(readlink "${share}/nvx-links/outside")" = ../../nvx-outside-marker
+          test "$(readlink "${share}/nvx-links/denied")" = ../nvx-denied/secret
+          test "$(readlink "${share}/nvx-links/denied-directory")" = ../nvx-denied
+          test ! -L "${share}/nvx-links/marker"
           test "$(cat "${outside}")" = host-outside
           test "$(cat "${share}/nvx-denied/secret")" = secret
           python3 scripts/nvx.py sandbox deprovision --state-dir "${state}"
@@ -354,6 +359,7 @@ jobs:
               ("absolute", "/nvx/absolute/target"),
               ("outside", "../../nvx-outside-marker"),
               ("denied", "../nvx-denied/secret"),
+              ("denied-directory", "../nvx-denied"),
           ):
               assert_guest_symlink(links / name, target)
           '@ | python - (Join-Path $share "nvx-links")
@@ -461,11 +467,15 @@ jobs:
           links = Path(sys.argv[1])
           for name, target in (
               ("nvx-tool", "../nvx-tool"),
+              ("absolute", "/nvx/absolute/target"),
               ("outside", "../../nvx-outside-marker"),
+              ("denied", "../nvx-denied/secret"),
+              ("denied-directory", "../nvx-denied"),
           ):
               assert_guest_symlink(links / name, target)
           '@ | python - (Join-Path $share "nvx-links")
           if ($LASTEXITCODE -ne 0) { throw "managed guest links are not inert WSL-style links with exact targets" }
+          if ([IO.File]::Exists((Join-Path $share "nvx-links\marker"))) { throw "managed guest link removal did not reach the host" }
           if ([IO.File]::ReadAllText($outside) -ne "host-outside`n") { throw "a managed guest link reached host data outside the share" }
           if ([IO.File]::ReadAllText((Join-Path $share "nvx-denied\secret")) -ne "secret`n") { throw "a managed guest link reached a denied file" }
           Invoke-Nvx sandbox deprovision --state-dir $state

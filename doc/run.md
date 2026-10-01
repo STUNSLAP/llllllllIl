@@ -279,8 +279,9 @@ each target exactly as given. The guest resolves links in its own namespace;
 OpenVMM never follows a link while resolving a host path, so a link to an
 absolute host path, outside the root, or into a denied path cannot reach host
 data. An `ro` mapping rejects link creation with `EROFS`. On Windows, links
-are WSL-style reparse points that Windows tools cannot open. Treat links in a
-writable share as untrusted when host software later reads the directory.
+are WSL-style reparse points, which Windows path resolution never follows.
+Treat links in a writable share as untrusted when host software later reads
+the directory.
 A snapshot captured without a mapping may restore with a new `--mount`; after
 resume, mount it explicitly inside the guest because the initramfs hook has
 already completed:
