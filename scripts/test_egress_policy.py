@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterable
 from pathlib import Path
 from unittest import mock
 
@@ -390,32 +391,50 @@ class EgressPolicyTests(unittest.TestCase):
 
     def test_address_only_rule_prunes_redundant_port_events_before_sweep(self):
         covering = {"cidr": "0.0.0.0/0"}
+        first_address = int(ipaddress.IPv4Address("192.0.0.0"))
         protocol_rules = [
             {
-                "cidr": "192.0.2.1",
+                "cidr": f"{ipaddress.IPv4Address(first_address + start)}/32",
                 "protocol": "tcp",
                 "port": start,
                 "endPort": 2001 - start,
             }
             for start in range(1, 1001)
         ]
-        original_convert = egress_policy._intervals_to_networks
+        original_merge = egress_policy._merge_intervals
 
-        for rules in (
-            [covering, *protocol_rules],
-            [*protocol_rules, covering],
-        ):
-            with (
-                self.subTest(covering_first=rules[0] is covering),
-                mock.patch.object(
-                    egress_policy,
-                    "_intervals_to_networks",
-                    wraps=original_convert,
-                ) as convert,
+        for category in ("allow", "deny"):
+            for rules in (
+                [covering, *protocol_rules],
+                [*protocol_rules, covering],
             ):
-                compiled = self.compile({"allow": rules})
-                self.assertEqual(compiled.allow, ("0.0.0.0/0",))
-                self.assertEqual(convert.call_count, 2)
+                merged_interval_counts: list[int] = []
+
+                def record_merge(
+                    intervals: Iterable[tuple[int, int]],
+                    counts: list[int] = merged_interval_counts,
+                ) -> tuple[tuple[int, int], ...]:
+                    materialized = tuple(intervals)
+                    counts.append(len(materialized))
+                    return original_merge(materialized)
+
+                with (
+                    self.subTest(
+                        category=category,
+                        covering_first=rules[0] is covering,
+                    ),
+                    mock.patch.object(
+                        egress_policy,
+                        "_merge_intervals",
+                        side_effect=record_merge,
+                    ),
+                ):
+                    compiled = self.compile({category: rules})
+                    self.assertEqual(
+                        getattr(compiled, category),
+                        ("0.0.0.0/0",),
+                    )
+                    self.assertEqual(sum(merged_interval_counts), 1)
 
 
 if __name__ == "__main__":
