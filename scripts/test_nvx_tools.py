@@ -4719,6 +4719,161 @@ class BuildTests(unittest.TestCase):
                 build._assert_shared_status_kernel_config(config)
 
 
+def _posix_shell() -> str | None:
+    shell = shutil.which("sh")
+    if shell is None:
+        git = shutil.which("git")
+        git_shell = Path(git).parent.parent / "bin" / "sh.exe" if git else None
+        if git_shell is not None and git_shell.is_file():
+            shell = str(git_shell)
+    return shell
+
+
+def _shell_function(source: str, name: str) -> str:
+    start = source.index(f"{name}() {{\n")
+    return source[start : source.index("\n}\n", start) + 3]
+
+
+class SandboxShareAgentTests(unittest.TestCase):
+    AGENT = Path(__file__).parents[1] / "guest" / "common" / "nvx-init-agent"
+
+    def setUp(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        self.shell = shell
+        self.source = self.AGENT.read_text(encoding="utf-8")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.rootfs = self.root / "rootfs"
+        self.rootfs.mkdir()
+
+    def _run(self, cmdline: str) -> tuple[subprocess.CompletedProcess[str], str]:
+        mount_log = self.root / "mount.log"
+        mount_log.unlink(missing_ok=True)
+        functions = "".join(
+            _shell_function(self.source, name)
+            for name in ("cmdline_value", "validate_share_target", "mount_live_share")
+        )
+        script = (
+            "set -eu\n"
+            "rootfs=$1\ncmdline=$2\nmount_log=$3\nshare_mountpoint=\n"
+            'fatal() { echo "FATAL: $*" >&2; exit 125; }\n'
+            'mount() { printf "%s\\n" "$*" >>"$mount_log"; }\n'
+            f"{functions}"
+            "mount_live_share\n"
+            'echo "mountpoint=$share_mountpoint"\n'
+        )
+        result = subprocess.run(
+            [
+                self.shell,
+                "-s",
+                "--",
+                self.rootfs.as_posix(),
+                cmdline,
+                mount_log.as_posix(),
+            ],
+            input=script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        log = mount_log.read_text(encoding="utf-8") if mount_log.exists() else ""
+        return result, log
+
+    def test_agent_mounts_share_after_identity_checks_and_unmounts_it_first(self):
+        mount_call = self.source.index("\nmount_live_share\n")
+        self.assertLess(
+            self.source.index('fatal "configured workload home is unavailable"'),
+            mount_call,
+        )
+        self.assertLess(mount_call, self.source.index('case "$workload_lifecycle"'))
+        self.assertLess(
+            self.source.index('umount "$share_mountpoint"'),
+            self.source.index('if ! umount "$rootfs"; then'),
+        )
+
+    def test_agent_skips_share_without_bootstrap_tokens(self):
+        result, log = self._run("console=hvc0 nvx_sandbox=1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mountpoint=\n", result.stdout)
+        self.assertEqual(log, "")
+
+    def test_agent_mounts_share_inside_container_rootfs(self):
+        (self.rootfs / "opt").mkdir()
+        for mode in ("rw", "ro"):
+            with self.subTest(mode=mode):
+                result, log = self._run(
+                    "nvx_sandbox=1 virtfs_dir=/opt/hostedtoolcache "
+                    f"virtfs_tag=microvm virtfs_mode={mode}"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.rootfs / "opt" / "hostedtoolcache").is_dir())
+                self.assertIn(
+                    f"NVX-SANDBOX-SHARE: target=/opt/hostedtoolcache mode={mode}",
+                    result.stdout,
+                )
+                self.assertEqual(
+                    log.split(),
+                    [
+                        "-t",
+                        "virtiofs",
+                        "-o",
+                        f"{mode},nosuid,nodev",
+                        "microvm",
+                        f"{self.rootfs.as_posix()}/opt/hostedtoolcache",
+                    ],
+                )
+                self.assertIn(
+                    f"mountpoint={self.rootfs.as_posix()}/opt/hostedtoolcache",
+                    result.stdout,
+                )
+
+    def test_agent_fails_closed_for_invalid_share_bootstrap(self):
+        (self.rootfs / "file").write_text("x", encoding="utf-8")
+        for cmdline, message in (
+            ("virtfs_dir=/workspace", "incomplete"),
+            ("virtfs_dir=/workspace virtfs_tag=microvm", "incomplete"),
+            ("virtfs_dir=/workspace virtfs_tag=bad/tag virtfs_mode=rw", "tag"),
+            ("virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rx", "mode"),
+            ("virtfs_dir=workspace virtfs_tag=microvm virtfs_mode=rw", "absolute"),
+            ("virtfs_dir=/ virtfs_tag=microvm virtfs_mode=rw", "canonical"),
+            ("virtfs_dir=/a//b virtfs_tag=microvm virtfs_mode=rw", "canonical"),
+            ("virtfs_dir=/a/ virtfs_tag=microvm virtfs_mode=rw", "canonical"),
+            ("virtfs_dir=/a/./b virtfs_tag=microvm virtfs_mode=rw", "canonical"),
+            ("virtfs_dir=/a/../b virtfs_tag=microvm virtfs_mode=rw", "canonical"),
+            ("virtfs_dir=/a=b virtfs_tag=microvm virtfs_mode=rw", "reserved char"),
+            ("virtfs_dir=/proc virtfs_tag=microvm virtfs_mode=rw", "reserved"),
+            ("virtfs_dir=/sys/fs virtfs_tag=microvm virtfs_mode=rw", "reserved"),
+            ("virtfs_dir=/dev/shm virtfs_tag=microvm virtfs_mode=rw", "reserved"),
+            ("virtfs_dir=/.nvx-agent virtfs_tag=microvm virtfs_mode=ro", "reserved"),
+            ("virtfs_dir=/etc virtfs_tag=microvm virtfs_mode=ro", "reserved"),
+            ("virtfs_dir=/file virtfs_tag=microvm virtfs_mode=ro", "not a directory"),
+        ):
+            with self.subTest(cmdline=cmdline):
+                result, log = self._run(cmdline)
+                self.assertEqual(result.returncode, 125, result.stdout)
+                self.assertIn("FATAL: live share", result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(log, "")
+
+    def test_agent_rejects_symbolic_link_in_share_target(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        try:
+            (self.rootfs / "workspace").symlink_to(outside, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"symbolic links are unavailable: {error}")
+        result, log = self._run(
+            "virtfs_dir=/workspace/project virtfs_tag=microvm virtfs_mode=rw"
+        )
+        self.assertEqual(result.returncode, 125, result.stdout)
+        self.assertIn("crosses a symbolic link", result.stderr)
+        self.assertEqual(log, "")
+        self.assertFalse((outside / "project").exists())
+
+
 class SandboxTests(unittest.TestCase):
     def test_launch_contract_orders_roles_and_builds_agent_command_line(self):
         custom = sandbox.SandboxLayer.parse(
@@ -4799,6 +4954,365 @@ class SandboxTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(common.ScriptError, "UUID is invalid"):
             sandbox.SandboxLayer.parse("distro,layer.erofs,not-a-uuid")
+
+    def test_mount_parser_defaults_to_read_only_and_accepts_rw(self):
+        default = sandbox.SandboxMount.parse("/workspace,host-dir")
+        self.assertEqual(default.guest_target, "/workspace")
+        self.assertEqual(default.host_path, Path("host-dir"))
+        self.assertEqual(default.access, "ro")
+        self.assertEqual(default.denied_paths, ())
+
+        writable = sandbox.SandboxMount.parse(
+            "/opt/hostedtoolcache,host-dir,rw", ("logs", "secrets")
+        )
+        self.assertEqual(writable.access, "rw")
+        self.assertEqual(writable.denied_paths, ("logs", "secrets"))
+        self.assertEqual(
+            writable.openvmm_arguments(),
+            [
+                "--mount",
+                f"/opt/hostedtoolcache,{os.fspath(Path('host-dir'))},rw",
+                "--mount-deny",
+                "logs",
+                "--mount-deny",
+                "secrets",
+            ],
+        )
+        self.assertEqual(
+            writable.command_line_fragment(),
+            " virtfs_dir=/opt/hostedtoolcache virtfs_tag=microvm virtfs_mode=rw",
+        )
+
+    def test_mount_parser_rejects_malformed_specifications(self):
+        for value, message in (
+            ("/workspace", "GUEST_TARGET,HOST_PATH"),
+            ("/workspace,host,rw,extra", "GUEST_TARGET,HOST_PATH"),
+            ("/workspace,", "host path is empty"),
+            ("/workspace,host,rx", "unsupported sandbox mount mode"),
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(common.ScriptError, message):
+                    sandbox.SandboxMount.parse(value)
+        with self.assertRaisesRegex(common.ScriptError, "commas"):
+            sandbox.SandboxMount(guest_target="/workspace", host_path=Path("a,b"))
+        with self.assertRaisesRegex(common.ScriptError, "parent component"):
+            sandbox.SandboxMount.parse("/workspace,link/../share")
+        with self.assertRaisesRegex(common.ScriptError, "unique"):
+            sandbox.SandboxMount.parse("/workspace,host", ("logs", "logs"))
+        with self.assertRaisesRegex(common.ScriptError, "nonempty"):
+            sandbox.SandboxMount.parse("/workspace,host", ("",))
+        with self.assertRaisesRegex(common.ScriptError, "at most 128"):
+            sandbox.SandboxMount.parse(
+                "/workspace,host", tuple(f"path-{index}" for index in range(129))
+            )
+
+    def test_mount_target_validation_rejects_unsafe_and_reserved_targets(self):
+        for target in (
+            "",
+            "/",
+            "workspace",
+            "/workspace/",
+            "/work//space",
+            "/work/./space",
+            "/work/../space",
+            "/work space",
+            "/work=space",
+            "/work\\space",
+            "/" + "x" * 4096,
+        ):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(common.ScriptError, "invalid sandbox"):
+                    sandbox.validate_mount_target(target)
+        for target in (
+            "/proc",
+            "/proc/self",
+            "/sys",
+            "/sys/fs",
+            "/dev",
+            "/dev/shm",
+            "/.nvx-agent",
+            "/.nvx-agent/tools",
+            "/etc",
+        ):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(common.ScriptError, "reserved"):
+                    sandbox.validate_mount_target(target)
+        for target in ("/workspace", "/procfs", "/etc/app", "/opt/hostedtoolcache"):
+            with self.subTest(target=target):
+                self.assertEqual(sandbox.validate_mount_target(target), target)
+
+    def test_launch_contract_attaches_mount_and_reserves_bootstrap_tokens(self):
+        distro = sandbox.SandboxLayer.parse(
+            "distro,distro.erofs,11111111-1111-1111-1111-111111111111"
+        )
+        launch = sandbox.SandboxLaunch(
+            layers=(distro,),
+            scratch=Path("scratch.ext4"),
+            mount=sandbox.SandboxMount.parse("/workspace,share,rw", ("secrets",)),
+        )
+
+        arguments = launch.openvmm_arguments()
+        self.assertEqual(
+            arguments[arguments.index("--mount") :],
+            [
+                "--mount",
+                f"/workspace,{os.fspath(Path('share'))},rw",
+                "--mount-deny",
+                "secrets",
+            ],
+        )
+        self.assertNotIn("virtfs_", launch.kernel_command_line("quiet"))
+        for token in ("virtfs_dir=/other", "virtfs_tag=other", "virtfs_mode=rw"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(common.ScriptError, "--mount option"):
+                    launch.kernel_command_line(token)
+
+        unmounted = sandbox.SandboxLaunch(layers=(distro,), scratch=Path("s.ext4"))
+        base = unmounted.kernel_command_line()
+        fragment = launch.mount.command_line_fragment() if launch.mount else ""
+        fitting = "x" * (
+            sandbox.SANDBOX_COMMAND_LINE_MAX_SIZE - len(base) - len(fragment) - 2
+        )
+        launch.kernel_command_line(fitting)
+        with self.assertRaisesRegex(common.ScriptError, "1024-byte"):
+            launch.kernel_command_line(fitting + "x")
+
+    def test_launch_validation_requires_plain_mount_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            share = root / "share"
+            layer.write_bytes(b"layer")
+            scratch.write_bytes(b"scratch")
+
+            def launch(host_path: Path) -> sandbox.SandboxLaunch:
+                return sandbox.SandboxLaunch(
+                    layers=(
+                        sandbox.SandboxLayer(
+                            role="distro",
+                            path=layer,
+                            uuid="11111111-1111-1111-1111-111111111111",
+                        ),
+                    ),
+                    scratch=scratch,
+                    mount=sandbox.SandboxMount(
+                        guest_target="/workspace", host_path=host_path
+                    ),
+                )
+
+            with self.assertRaisesRegex(common.ScriptError, "plain directory"):
+                launch(share).validated()
+            share.write_bytes(b"file")
+            with self.assertRaisesRegex(common.ScriptError, "plain directory"):
+                launch(share).validated()
+            share.unlink()
+            share.mkdir()
+            validated = launch(share).validated()
+            assert validated.mount is not None
+            self.assertEqual(validated.mount.host_path, share)
+
+    def test_sandbox_command_forwards_mount_to_openvmm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            share = root / "share"
+            layer.write_bytes(b"distro")
+            scratch.write_bytes(b"scratch")
+            share.mkdir()
+            args = nvx.parse_args(
+                [
+                    "sandbox",
+                    "--layer",
+                    f"distro,{layer},11111111-1111-1111-1111-111111111111",
+                    "--scratch",
+                    str(scratch),
+                    "--mount",
+                    f"/workspace,{share},rw",
+                    "--mount-deny",
+                    "secrets",
+                    "--dry-run",
+                ]
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(nvx, "require_file", side_effect=require),
+                patch.object(
+                    nvx, "_format_command", return_value="formatted"
+                ) as format_command,
+            ):
+                nvx.command_sandbox(args)
+
+            command = format_command.call_args.args[0]
+            self.assertEqual(
+                command[command.index("--mount") + 1], f"/workspace,{share},rw"
+            )
+            self.assertEqual(command[command.index("--mount-deny") + 1], "secrets")
+
+    def test_sandbox_command_rejects_misplaced_mount_options(self):
+        deny_only = nvx.parse_args(
+            [
+                "sandbox",
+                "--layer",
+                "distro,distro.erofs,11111111-1111-1111-1111-111111111111",
+                "--scratch",
+                "scratch.ext4",
+                "--mount-deny",
+                "secrets",
+            ]
+        )
+        with self.assertRaisesRegex(common.ScriptError, "requires --mount"):
+            nvx.command_sandbox(deny_only)
+        for operation in ("start", "exec", "stop", "deprovision"):
+            with self.subTest(operation=operation):
+                args = nvx.parse_args(
+                    [
+                        "sandbox",
+                        operation,
+                        "--state-dir",
+                        "state",
+                        "--mount",
+                        "/workspace,share,rw",
+                    ]
+                )
+                with self.assertRaisesRegex(common.ScriptError, "only valid"):
+                    nvx.command_sandbox(args)
+
+    def test_managed_lifecycle_persists_and_replays_mount(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            layer_path = root / "distro.erofs"
+            scratch_path = root / "scratch.ext4"
+            share = root / "share"
+            layer_path.write_bytes(b"layer")
+            scratch_path.write_bytes(b"scratch")
+            share.mkdir()
+            state = root / "state"
+            previous = Path.cwd()
+            os.chdir(root)
+            try:
+                sandbox_lifecycle.provision(
+                    state,
+                    sandbox.SandboxLaunch(
+                        layers=(
+                            sandbox.SandboxLayer(
+                                role="distro",
+                                path=layer_path,
+                                uuid="11111111-1111-1111-1111-111111111111",
+                            ),
+                        ),
+                        scratch=scratch_path,
+                        mount=sandbox.SandboxMount.parse(
+                            "/workspace,share,rw", ("secrets",)
+                        ),
+                    ),
+                    hypervisor="whp",
+                    memory_mib=256,
+                    net=None,
+                    network_profile=None,
+                    network_egress=None,
+                    network_ingress=None,
+                    network_egress_allow=(),
+                    network_egress_deny=(),
+                    host_loopback=None,
+                    network_proxy=None,
+                    host_loopback_forward=(),
+                    cmdline="quiet",
+                )
+            finally:
+                os.chdir(previous)
+
+            config = json.loads(
+                (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(config["format"], sandbox_lifecycle.MOUNT_CONFIG_FORMAT)
+            self.assertEqual(
+                config["mount"],
+                {
+                    "guest_target": "/workspace",
+                    "host_path": os.fspath(share),
+                    "access": "rw",
+                    "denied_paths": ["secrets"],
+                },
+            )
+
+            process = MagicMock()
+            process.pid = 123
+            process.stdin = io.BytesIO()
+            context = MagicMock()
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(sandbox_lifecycle, "require_file", side_effect=require),
+                patch.object(
+                    sandbox_lifecycle.subprocess, "Popen", return_value=process
+                ) as popen,
+                patch.object(
+                    sandbox_lifecycle.ControlSession, "connect", return_value=context
+                ),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            command = popen.call_args.args[0]
+            self.assertEqual(
+                command[command.index("--mount") + 1], f"/workspace,{share},rw"
+            )
+            self.assertEqual(command[command.index("--mount-deny") + 1], "secrets")
+
+    def test_managed_lifecycle_accepts_configuration_without_mount(self):
+        config: dict[str, object] = {
+            "format": sandbox_lifecycle.STATE_FORMAT,
+            "layers": [
+                {
+                    "role": "distro",
+                    "path": "distro.erofs",
+                    "uuid": "11111111-1111-1111-1111-111111111111",
+                }
+            ],
+            "scratch": "scratch.ext4",
+            "hostname": "nvx-sandbox",
+            "workload_uid": 65534,
+            "workload_gid": 65534,
+            "memory_max": None,
+            "pids_max": None,
+        }
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with (
+            patch.object(sandbox, "require_file", side_effect=require),
+        ):
+            self.assertIsNone(sandbox_lifecycle._deserialize_launch(config).mount)
+            config["format"] = sandbox_lifecycle.MOUNT_CONFIG_FORMAT
+            with self.assertRaisesRegex(common.ScriptError, "does not match"):
+                sandbox_lifecycle._deserialize_launch(config)
+            config["mount"] = {"guest_target": "/workspace"}
+            with self.assertRaisesRegex(common.ScriptError, "malformed"):
+                sandbox_lifecycle._deserialize_launch(config)
+            config["mount"] = {
+                "guest_target": "/proc",
+                "host_path": "share",
+                "access": "rw",
+                "denied_paths": [],
+            }
+            with self.assertRaisesRegex(common.ScriptError, "reserved"):
+                sandbox_lifecycle._deserialize_launch(config)
+            config["mount"] = {
+                "guest_target": "/workspace",
+                "host_path": "share",
+                "access": "rw",
+                "denied_paths": [],
+            }
+            config["format"] = sandbox_lifecycle.STATE_FORMAT
+            with self.assertRaisesRegex(common.ScriptError, "does not match"):
+                sandbox_lifecycle._deserialize_launch(config)
 
     def test_managed_lifecycle_provisions_and_deprovisions_state(self):
         with tempfile.TemporaryDirectory() as temporary:

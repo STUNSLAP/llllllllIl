@@ -88,8 +88,12 @@ descriptor modules, converter implementation, and Dockerfile. Artifact upload
 retains the Alpine filenames and adds the distinct Ubuntu filenames. Each
 backend also boots the Ubuntu initramfs and runs
 `/sbin/nvx-sandbox-smoke` from the Ubuntu EROFS layer as UID/GID 65534 over a
-fresh ext4 scratch copy. Linux/KVM runs the broader Ubuntu SMP, managed
-lifecycle, network snapshot, blockless snapshot, and workload-identity set.
+fresh ext4 scratch copy. The same entrypoint then verifies a live virtio-fs
+share inside the container: a read-write `/workspace` share with a denied
+subdirectory must round-trip guest writes to the host, and a read-only
+`/opt/hostedtoolcache` share must reject writes. Linux/KVM runs the broader
+Ubuntu SMP, managed lifecycle, network snapshot, blockless snapshot, and
+workload-identity set.
 
 OpenVMM release executables and provenance are built once by the independently
 addressable `build-openvmm-linux-gnu`, `build-openvmm-linux-musl`, and

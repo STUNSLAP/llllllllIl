@@ -126,6 +126,71 @@ mount_layer() {
     fi
 }
 
+validate_share_target() {
+    case "$1" in
+        /*) ;;
+        *) fatal "live share target must be an absolute path" ;;
+    esac
+    case "$1/" in
+        //* | *//* | */./* | */../*) fatal "live share target is not canonical: $1" ;;
+    esac
+    case "$1" in
+        *[\\=,]*) fatal "live share target contains a reserved character: $1" ;;
+    esac
+    # The container runtime mounts or binds these paths after the share, so a
+    # share there would be shadowed or would expose host data to runtime writes.
+    case "$1" in
+        /proc | /proc/* | /sys | /sys/* | /dev | /dev/* | /.nvx-agent | /.nvx-agent/* | /etc)
+            fatal "live share target is reserved: $1"
+            ;;
+    esac
+}
+
+share_mountpoint=
+mount_live_share() {
+    share_tag=$(cmdline_value virtfs_tag || true)
+    share_target=$(cmdline_value virtfs_dir || true)
+    share_mode=$(cmdline_value virtfs_mode || true)
+    [ -n "$share_tag$share_target$share_mode" ] || return 0
+    [ -n "$share_tag" ] && [ -n "$share_target" ] && [ -n "$share_mode" ] ||
+        fatal "live share bootstrap is incomplete"
+    case "$share_tag" in
+        *[!A-Za-z0-9_-]*) fatal "live share tag is invalid" ;;
+    esac
+    case "$share_mode" in
+        ro | rw) ;;
+        *) fatal "live share mode is unsupported: $share_mode" ;;
+    esac
+    validate_share_target "$share_target"
+
+    # Create the mount point one component at a time so that a symbolic link in
+    # a container layer cannot redirect the share outside the container rootfs.
+    share_path=$rootfs
+    share_remainder=${share_target#/}
+    while [ -n "$share_remainder" ]; do
+        share_component=${share_remainder%%/*}
+        if [ "$share_component" = "$share_remainder" ]; then
+            share_remainder=
+        else
+            share_remainder=${share_remainder#*/}
+        fi
+        share_path=$share_path/$share_component
+        if [ -L "$share_path" ]; then
+            fatal "live share target crosses a symbolic link: $share_target"
+        elif [ -e "$share_path" ]; then
+            [ -d "$share_path" ] ||
+                fatal "live share target is not a directory: $share_target"
+        else
+            mkdir -m 0755 "$share_path" ||
+                fatal "failed to create live share target $share_target"
+        fi
+    done
+    mount -t virtiofs -o "$share_mode,nosuid,nodev" "$share_tag" "$share_path" ||
+        fatal "failed to mount live share $share_tag at $share_target"
+    share_mountpoint=$share_path
+    echo "NVX-SANDBOX-SHARE: target=$share_target mode=$share_mode"
+}
+
 mkdir -p "$layers" "$scratch" "$rootfs"
 mount -t tmpfs -o mode=755,nosuid,nodev tmpfs /run ||
     fatal "failed to mount runtime tmpfs"
@@ -243,6 +308,7 @@ awk -F: -v gid="$workload_gid" '$3 == gid { found = 1 } END { exit !found }' \
 case "$workload_home" in /*) ;; *) fatal "configured workload home is invalid" ;; esac
 [ -d "$rootfs$workload_home" ] && [ ! -L "$rootfs$workload_home" ] ||
     fatal "configured workload home is unavailable"
+mount_live_share
 workload_lifecycle=$(cmdline_value nvx_lifecycle || true)
 [ -n "$workload_lifecycle" ] || workload_lifecycle=one-shot
 case "$workload_lifecycle" in
@@ -291,6 +357,10 @@ echo "NVX-SANDBOX-READY: pid=$container_pid layers=$layer_count"
 status=0
 wait "$container_pid" || status=$?
 rm -f "$runtime/container.pid" "$runtime/workload-machine-id"
+if [ -n "$share_mountpoint" ] && ! umount "$share_mountpoint"; then
+    echo "NVX-SANDBOX-ERROR: failed to unmount the live share" >&2
+    status=1
+fi
 if ! umount "$rootfs"; then
     echo "NVX-SANDBOX-ERROR: failed to unmount the container overlay" >&2
     status=1
