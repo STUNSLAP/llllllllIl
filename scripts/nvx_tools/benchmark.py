@@ -12,7 +12,6 @@ import contextlib
 import ctypes
 import datetime as dt
 import errno
-import hashlib
 import io
 import ipaddress
 import json
@@ -33,9 +32,19 @@ from pathlib import Path
 from string import Template
 from typing import TextIO, TypedDict, cast
 
+from . import common
+from .build_constants import (
+    AlpineBuildConstants,
+    BuildConstants,
+    KernelBuildConstants,
+    OpenVMMBuildConstants,
+)
+from .common import bytes_to_mib, sha256_file
+
 BOOT_MARKER = b"ALPINE-MICROVM-BOOT-OK"
 RESTORE_MARKER = b"OPENVMM-SNAPSHOT-RESTORE-OK"
 TEARDOWN_TIMEOUT_SECONDS = 15.0
+PEAK_RSS_SAMPLE_ATTEMPTS = 3
 BASE_TUNING = (
     "tsc=reliable no_timer_check random.trust_cpu=on "
     "rcupdate.rcu_expedited=1 nokaslr mitigations=off "
@@ -103,7 +112,7 @@ SNAPSHOT_POST_RESTORE_PATH = "/tmp/nvx-post-restore"
 SNAPSHOT_GUEST_DISPATCH_MARKER = b"NVX-SNAPSHOT-DISPATCHED"
 SNAPSHOT_CAPTURE_TIMING = "openvmm-input-gate-to-publication"
 SNAPSHOT_FILENAMES = ("manifest.bin", "state.bin", "memory.bin")
-SHELL_SNAPSHOT_MEMORY_MIB = (64, 128, 256, 512)
+SHELL_SNAPSHOT_MEMORY_MIB = (128, 256, 512)
 SNAPSHOT_PROFILE_MEMORY_MIB = (*SHELL_SNAPSHOT_MEMORY_MIB, 1024)
 RESTORE_VCPU_TARGETS = (1, 2, 4, 8)
 RESTORE_MEMORY_BASE_MIB = 512
@@ -120,7 +129,6 @@ PERFORMANCE_LOG_FILENAMES = (
 )
 LEGACY_PYTHON_LOG_FILENAMES = ("snapshot.log", "snapshot-hello.log")
 BENCHMARK_METADATA_FILENAME = "benchmark-metadata.json"
-MICROVM_ABI_VERSION = 2
 
 
 class ProfiledResult(TypedDict, total=False):
@@ -148,6 +156,7 @@ class BenchmarkResult(ProfiledResult):
     peak_rss_p50_bytes: int
     peak_rss_min_bytes: int
     peak_rss_max_bytes: int
+    peak_rss_remeasured_count: int
     teardown_samples_ms: list[float | None]
     teardown_completed_samples_ms: list[float]
     teardown_timeout_count: int
@@ -355,8 +364,8 @@ def configure_parser(
         default=None,
         metavar="MIB",
         help=(
-            "snapshot memory sizes (default: 64 128 256 512, or "
-            "64 128 256 512 1024 for --suite snapshot-profile)"
+            "snapshot memory sizes (default: 128 256 512, or "
+            "128 256 512 1024 for --suite snapshot-profile)"
         ),
     )
     parser.add_argument(
@@ -471,6 +480,14 @@ def configure_parser(
         help="write canonical workload logs to this directory",
     )
     parser.add_argument(
+        "--scratch-dir",
+        type=Path,
+        help=(
+            "existing directory for temporary snapshots, guest RAM backing, "
+            "and workload files (default: the system temporary directory)"
+        ),
+    )
+    parser.add_argument(
         "--keep-kvm-stage",
         action="store_true",
         help="keep temporary staged KVM benchmark binaries",
@@ -567,9 +584,10 @@ def append_network_arguments(
 
 def require_file(path: Path, description: str) -> Path:
     path = path.resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"{description} not found: {path}")
-    return path
+    try:
+        return common.require_file(path, description)
+    except common.ScriptError as error:
+        raise FileNotFoundError(str(error)) from error
 
 
 def parse_cpu_set(spec: str) -> set[int]:
@@ -773,6 +791,46 @@ def peak_rss_bytes(pid: int) -> int:
     if sys.platform.startswith("linux"):
         return linux_peak_rss_bytes(pid)
     raise RuntimeError(f"peak RSS measurement is unsupported on {sys.platform}")
+
+
+def _linux_live_peak_rss_bytes(pid: int) -> int | None:
+    # The unreaped child keeps its PID, so this entry cannot be reused.
+    try:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    return _linux_status_bytes(status, "VmHWM")
+
+
+def live_peak_rss_bytes(process: subprocess.Popen[bytes]) -> int | None:
+    """Return the peak RSS of a still-running process, or None after it exits.
+
+    Exit accounting is not an equivalent sample. Linux stops publishing VmHWM
+    once the process releases its address space, and the wait4() maximum RSS
+    also covers the coordinator's pre-exec image. Windows retains a terminated
+    process's counters, but its peak working set then includes teardown.
+    """
+    if os.name == "nt":
+        try:
+            peak = windows_peak_rss_bytes(process.pid)
+        except OSError:
+            if process.poll() is not None:
+                return None
+            raise
+        # The retained Popen handle keeps a terminated process's counters
+        # readable, so accept only a sample completed while it was running.
+        if process.poll() is not None:
+            return None
+    elif sys.platform.startswith("linux"):
+        linux_peak = _linux_live_peak_rss_bytes(process.pid)
+        if linux_peak is None:
+            return None
+        peak = linux_peak
+    else:
+        raise RuntimeError(f"peak RSS measurement is unsupported on {sys.platform}")
+    if peak <= 0:
+        raise RuntimeError(f"process {process.pid} reported peak RSS {peak} bytes")
+    return peak
 
 
 def _linux_status_bytes(status: str, name: str) -> int | None:
@@ -1143,10 +1201,6 @@ def summarize_lifecycle_profiles(
     }
 
 
-def bytes_to_mib(value: int | float) -> float:
-    return value / (1024 * 1024)
-
-
 def terminate(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is None:
         process.kill()
@@ -1178,6 +1232,28 @@ def wait_for_process_exit(process: subprocess.Popen[bytes], timeout: float) -> i
 
 def contains_output_line(output: bytes | bytearray, marker: bytes) -> bool:
     return any(line.removesuffix(b"\r") == marker for line in output.split(b"\n"))
+
+
+def completed_output_line_with_prefix(
+    output: bytes | bytearray, prefix: bytes
+) -> bytes | None:
+    """Return the first newline-terminated output line that starts with prefix."""
+    for line in output.split(b"\n")[:-1]:
+        line = line.removesuffix(b"\r")
+        if line.startswith(prefix):
+            return bytes(line)
+    return None
+
+
+class GuestFailureReported(RuntimeError):
+    """Raised when a guest prints a failure marker before its success marker."""
+
+    def __init__(self, line: str, output_tail: str) -> None:
+        super().__init__(
+            f"guest reported {line}\n--- OpenVMM output ---\n{output_tail}"
+        )
+        self.line = line
+        self.output_tail = output_tail
 
 
 def parse_device_restore_marker(line: str) -> dict[str, str] | None:
@@ -1251,6 +1327,12 @@ class InteractiveProcess:
                 stderr=subprocess.STDOUT,
                 env=environment,
             )
+        try:
+            record_adversarial_openvmm_pid(self.process.pid, environment)
+        except BaseException:
+            terminate(self.process)
+            self.close()
+            raise
 
     def read_output(self, chunks: queue.Queue[bytes | None]) -> None:
         try:
@@ -1287,6 +1369,24 @@ class InteractiveProcess:
         if self.terminal_fd is not None:
             os.close(self.terminal_fd)
             self.terminal_fd = None
+
+
+def record_adversarial_openvmm_pid(
+    pid: int,
+    environment: dict[str, str],
+) -> None:
+    pid_journal = environment.get("NVX_ADVERSARIAL_OPENVMM_PID_JOURNAL")
+    if pid_journal is None:
+        return
+    with Path(pid_journal).open("a", encoding="utf-8", newline="\n") as stream:
+        record = json.dumps(
+            {"pid": pid, "recorded_at_ns": time.time_ns()},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        stream.write(f"{record}\n")
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def cleanup_managed_tap(pid: int) -> None:
@@ -1329,7 +1429,14 @@ def measure_once(
     snapshot_profile: bool = False,
     profile_sink: list[dict[str, object]] | None = None,
     log_path: Path | None = None,
-) -> tuple[float, int, float | None, float]:
+    failure_marker: bytes | None = None,
+) -> tuple[float, int | None, float | None, float]:
+    """Measure one OpenVMM launch through ``marker`` and its teardown.
+
+    Peak RSS is None when OpenVMM exited before it could be sampled at the
+    marker, which a prequeued guest exit makes possible. A completed output
+    line starting with ``failure_marker`` stops the launch immediately.
+    """
     started = time.perf_counter_ns()
     interaction = InteractiveProcess(command, environment)
     process = interaction.process
@@ -1363,6 +1470,13 @@ def measure_once(
             if profile is not None:
                 profile.feed(chunk)
             output.extend(chunk)
+            if failure_marker is not None:
+                failure = completed_output_line_with_prefix(output, failure_marker)
+                if failure is not None:
+                    raise GuestFailureReported(
+                        failure.decode("utf-8", "replace"),
+                        output[-4096:].decode("utf-8", "replace"),
+                    )
             marker_seen = (
                 contains_output_line(output, marker)
                 if marker_must_be_line
@@ -1372,8 +1486,8 @@ def measure_once(
                 marker_reached = time.perf_counter_ns()
                 # A prequeued guest exit can terminate OpenVMM immediately
                 # after writing the marker. Sample RSS before the more detailed
-                # opt-in profile counters, and tolerate an already-gone process.
-                peak_bytes = _try_peak_rss(process, 0)
+                # opt-in profile counters.
+                peak_bytes = live_peak_rss_bytes(process)
                 if profile is not None and profile_sink is not None:
                     profile_sink.append(profile.finish_restore(marker_reached))
                 elapsed_ms = (marker_reached - started) / 1_000_000
@@ -1407,6 +1521,9 @@ def measure_once(
                 return elapsed_ms, peak_bytes, teardown_ms, wall_ms
             if len(output) > 1024 * 1024:
                 del output[: len(output) - 1024 * 1024]
+    except GuestFailureReported:
+        terminate(process)
+        raise
     except Exception as error:
         terminate(process)
         tail = output[-4096:].decode("utf-8", "replace")
@@ -1442,10 +1559,13 @@ def benchmark(
     environment.pop(SNAPSHOT_PROFILE_ENV, None)
     if snapshot_profile:
         environment[SNAPSHOT_PROFILE_ENV] = "1"
-    for index in range(warmups):
+
+    def measure(
+        profile_sink: list[dict[str, object]] | None = None,
+    ) -> tuple[float, int | None, float | None, float]:
         if before_each is not None:
             before_each()
-        value, peak_bytes, teardown_ms, _wall_ms = measure_once(
+        return measure_once(
             command,
             environment=environment,
             timeout=timeout,
@@ -1456,6 +1576,15 @@ def benchmark(
             guest_exit_prequeued=guest_exit_prequeued,
             cleanup_managed_network=cleanup_managed_network,
             snapshot_profile=snapshot_profile,
+            profile_sink=profile_sink,
+        )
+
+    for index in range(warmups):
+        value, peak_bytes, teardown_ms, _wall_ms = measure()
+        peak_rss = (
+            "unavailable"
+            if peak_bytes is None
+            else f"{bytes_to_mib(peak_bytes):.3f} MiB"
         )
         teardown = (
             f"{teardown_ms:.3f} ms"
@@ -1464,7 +1593,7 @@ def benchmark(
         )
         print(
             f"  warmup {index + 1}/{warmups}: {value:.3f} ms, "
-            f"peak RSS={bytes_to_mib(peak_bytes):.3f} MiB, teardown={teardown}",
+            f"peak RSS={peak_rss}, teardown={teardown}",
             flush=True,
         )
 
@@ -1473,22 +1602,33 @@ def benchmark(
     peak_rss_samples: list[int] = []
     teardown_samples: list[float | None] = []
     profile_samples: list[dict[str, object]] = []
-    for index in range(runs):
-        if before_each is not None:
-            before_each()
-        value, peak_bytes, teardown_ms, wall_ms = measure_once(
-            command,
-            environment=environment,
-            timeout=timeout,
-            marker=marker,
-            marker_must_be_line=marker_must_be_line,
-            windows_cpus=windows_cpus,
-            teardown_mode=teardown_mode,
-            guest_exit_prequeued=guest_exit_prequeued,
-            cleanup_managed_network=cleanup_managed_network,
-            snapshot_profile=snapshot_profile,
-            profile_sink=profile_samples,
+    remeasured = 0
+
+    def measure_sample(index: int) -> tuple[float, int, float | None, float]:
+        # An attempt without its marker-time RSS is incomplete. Remeasure it
+        # instead of substituting a value from after the marker.
+        nonlocal remeasured
+        for attempt in range(1, PEAK_RSS_SAMPLE_ATTEMPTS + 1):
+            attempt_profiles: list[dict[str, object]] = []
+            value, peak_bytes, teardown_ms, wall_ms = measure(attempt_profiles)
+            if peak_bytes is not None:
+                profile_samples.extend(attempt_profiles)
+                remeasured += attempt - 1
+                return value, peak_bytes, teardown_ms, wall_ms
+            print(
+                f"  sample {index + 1}/{runs}: discarded attempt "
+                f"{attempt}/{PEAK_RSS_SAMPLE_ATTEMPTS} ({value:.3f} ms); "
+                "OpenVMM exited before its peak RSS was sampled at the marker",
+                flush=True,
+            )
+        raise RuntimeError(
+            f"OpenVMM exited before its peak RSS was sampled at the marker in "
+            f"{PEAK_RSS_SAMPLE_ATTEMPTS} consecutive attempts for sample "
+            f"{index + 1}/{runs}"
         )
+
+    for index in range(runs):
+        value, peak_bytes, teardown_ms, wall_ms = measure_sample(index)
         samples.append(value)
         wall_samples.append(wall_ms)
         peak_rss_samples.append(peak_bytes)
@@ -1520,6 +1660,7 @@ def benchmark(
         "peak_rss_p50_bytes": int(statistics.median(peak_rss_samples)),
         "peak_rss_min_bytes": min(peak_rss_samples),
         "peak_rss_max_bytes": max(peak_rss_samples),
+        "peak_rss_remeasured_count": remeasured,
         "teardown_samples_ms": teardown_samples,
         "teardown_completed_samples_ms": completed_teardowns,
         "teardown_timeout_count": len(teardown_samples) - len(completed_teardowns),
@@ -1564,7 +1705,8 @@ def clocksource_parameter(backend: str) -> str:
     return "clocksource=kvm-clock" if backend == "kvm" else "clocksource=tsc"
 
 
-def whp_stable_clocksource_wait_script() -> str:
+def stable_clocksource_wait_script() -> str:
+    """Wait up to five seconds for Linux to replace its tsc-early clocksource."""
     return "\n".join(
         (
             f"clock_path={CLOCKSOURCE_CURRENT_PATH}",
@@ -1898,6 +2040,7 @@ def run_guest_script(
     windows_cpus: set[int] | None = None,
     teardown_mode: str = "guest-exit",
     log_path: Path | None = None,
+    boot_marker: bytes = BOOT_MARKER,
 ) -> GuestCommandResult:
     environment = os.environ.copy()
     environment["OPENVMM_LOG"] = "off"
@@ -1932,7 +2075,7 @@ def run_guest_script(
                 break
             output.extend(chunk)
             peak_bytes = _try_peak_rss(process, peak_bytes)
-            if not input_sent and BOOT_MARKER in output:
+            if not input_sent and boot_marker in output:
                 interaction.write_input(script.encode("utf-8"))
                 input_sent = True
             if input_sent and contains_output_line(output, completion_marker):
@@ -2681,6 +2824,12 @@ def _device_io_attempt_record(
     return record
 
 
+def _decode_device_io_line(line: str) -> tuple[bool, object]:
+    if not line.startswith(DEVICE_IO_RESULT_PREFIX):
+        return False, None
+    return True, json.loads(line.removeprefix(DEVICE_IO_RESULT_PREFIX))
+
+
 def _device_io_completed_attempts(path: Path | None) -> set[tuple[str, int]]:
     if path is None or not path.is_file():
         return set()
@@ -2688,14 +2837,14 @@ def _device_io_completed_attempts(path: Path | None) -> set[tuple[str, int]]:
     for line_number, line in enumerate(
         path.read_text(encoding="utf-8").splitlines(), 1
     ):
-        if not line.startswith(DEVICE_IO_RESULT_PREFIX):
-            continue
         try:
-            decoded: object = json.loads(line.removeprefix(DEVICE_IO_RESULT_PREFIX))
+            is_record, decoded = _decode_device_io_line(line)
         except json.JSONDecodeError as error:
             raise ValueError(
                 f"invalid resumable device I/O record at {path}:{line_number}: {error}"
             ) from error
+        if not is_record:
+            continue
         if not isinstance(decoded, dict):
             raise ValueError(
                 f"resumable device I/O record at {path}:{line_number} must be an object"
@@ -2737,10 +2886,9 @@ def _append_device_io_record(path: Path | None, record: dict[str, object]) -> No
 def _read_device_io_records(path: Path) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
-        if line.startswith(DEVICE_IO_RESULT_PREFIX):
-            decoded: object = json.loads(line.removeprefix(DEVICE_IO_RESULT_PREFIX))
-            if isinstance(decoded, dict):
-                records.append(cast(dict[str, object], decoded))
+        is_record, decoded = _decode_device_io_line(line)
+        if is_record and isinstance(decoded, dict):
+            records.append(cast(dict[str, object], decoded))
     return records
 
 
@@ -2958,9 +3106,13 @@ def prepare_snapshot_capture_script(
     post_restore_script: str | None = None,
 ) -> str:
     clocksource_ready = ""
-    if backend == "whp":
+    # Until Linux replaces tsc-early, its periodic tick doesn't recover the
+    # jiffies that a restore's downtime skips. The clocksource watchdog can then
+    # compare tsc-early with jiffies across the restore and mark the TSC
+    # unstable. KVM guests leave tsc-early almost immediately after boot.
+    if backend in ("mshv", "whp"):
         clocksource_ready = (
-            whp_stable_clocksource_wait_script()
+            stable_clocksource_wait_script()
             + "\n"
             + 'current_clocksource="$(cat "$clock_path")"\n'
             + '[ "$current_clocksource" != tsc-early ] || { '
@@ -3269,6 +3421,11 @@ def benchmark_snapshot_restore_memory_workload(
                         flush=True,
                     )
                     continue
+                if peak_bytes is None:
+                    raise RuntimeError(
+                        f"OpenVMM exited before its peak RSS was sampled at "
+                        f"the target {target_mib} MiB marker"
+                    )
                 launch_samples.append(launch_ms)
                 activation_samples.append(activation_ms)
                 peak_rss_samples.append(peak_bytes)
@@ -3734,23 +3891,15 @@ def _git_status(repository: Path) -> list[str] | None:
         return None
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _device_io_helper_provenance(
     args: argparse.Namespace, initrd: Path
 ) -> dict[str, str]:
     source = require_file(
-        args.nvx_dir.resolve() / "alpine" / "nvx-device-io.c",
+        args.nvx_dir.resolve() / "guest" / "common" / "nvx-device-io.c",
         "device I/O helper source",
     )
     manifest_path = require_file(
-        initrd.with_name(f"{initrd.name}.packages.json"),
+        initrd.with_name(f"{initrd.name}{BuildConstants.PACKAGE_MANIFEST_SUFFIX}"),
         "initramfs package manifest",
     )
     try:
@@ -3762,7 +3911,7 @@ def _device_io_helper_provenance(
         raise ValueError(
             f"invalid nvx-device-io provenance in {manifest_path}"
         ) from error
-    actual_source_sha256 = _sha256_file(source)
+    actual_source_sha256 = sha256_file(source)
     if source_sha256 != actual_source_sha256:
         raise ValueError(
             "initramfs device I/O helper source does not match the current checkout"
@@ -3778,6 +3927,10 @@ def _device_io_helper_provenance(
     }
 
 
+def _benchmark_platform(args: argparse.Namespace, backend: str) -> str:
+    return args.platform or f"{'windows' if os.name == 'nt' else 'linux'}-{backend}"
+
+
 def write_benchmark_metadata(
     args: argparse.Namespace,
     output_dir: Path,
@@ -3786,9 +3939,9 @@ def write_benchmark_metadata(
     initrd: Path,
     backend: str,
 ) -> Path:
-    platform = args.platform or f"{'windows' if os.name == 'nt' else 'linux'}-{backend}"
+    platform = _benchmark_platform(args, backend)
     device_io = args.suite == "device-io"
-    microvm_abi_version = MICROVM_ABI_VERSION
+    microvm_abi_version = OpenVMMBuildConstants.MICROVM_ABI_VERSION
     processors = 1 if device_io else args.processors
     effective_network = (
         args.net or "10.0.0.2/24"
@@ -3819,6 +3972,7 @@ def write_benchmark_metadata(
         "lifecycle_network": args.net,
         "host_affinity_set": args.cpus,
         "host_cpu_reserve": args.host_cpu_reserve,
+        "scratch_directory": scratch_directory_control(args),
         "memory_mib": {
             "lifecycle": args.memory_mib,
             "virtfs": args.virtfs_memory_mib,
@@ -3852,10 +4006,10 @@ def write_benchmark_metadata(
     }
     if device_io:
         document["artifact_sha256"] = {
-            "openvmm": _sha256_file(executable),
-            "kernel": _sha256_file(kernel),
-            "initrd": _sha256_file(initrd),
-            "benchmark_coordinator": _sha256_file(Path(__file__)),
+            "openvmm": sha256_file(executable),
+            "kernel": sha256_file(kernel),
+            "initrd": sha256_file(initrd),
+            "benchmark_coordinator": sha256_file(Path(__file__)),
         }
         document["device_io_helper"] = _device_io_helper_provenance(args, initrd)
     path = output_dir / BENCHMARK_METADATA_FILENAME
@@ -3897,9 +4051,7 @@ def run_workload_benchmarks(
         requested = [args.suite]
     output_dir = args.output_dir
     if output_dir is None and args.suite in {"performance", "device-io"}:
-        platform = (
-            args.platform or f"{'windows' if os.name == 'nt' else 'linux'}-{backend}"
-        )
+        platform = _benchmark_platform(args, backend)
         if args.suite == "device-io":
             output_dir = (
                 args.nvx_dir.resolve()
@@ -3915,7 +4067,7 @@ def run_workload_benchmarks(
                 args.nvx_dir.resolve()
                 / "data"
                 / "runs"
-                / f"{platform}-microvm-v{MICROVM_ABI_VERSION}-{args.processors}vcpu"
+                / f"{platform}-microvm-v{OpenVMMBuildConstants.MICROVM_ABI_VERSION}-{args.processors}vcpu"
             )
     if args.suite == "device-restore-profile" and output_dir is None:
         raise ValueError("device-restore-profile requires --output-dir")
@@ -4103,6 +4255,7 @@ def capture_snapshot(
     profile_sink: list[dict[str, object]] | None = None,
     post_restore_script: str | None = None,
     log_path: Path | None = None,
+    boot_marker: bytes = BOOT_MARKER,
 ) -> tuple[float, float, float, int]:
     if snapshot_path.exists():
         shutil.rmtree(snapshot_path)
@@ -4188,7 +4341,7 @@ def capture_snapshot(
                 and contains_output_line(output, SNAPSHOT_GUEST_DISPATCH_MARKER)
             ):
                 snapshot_guest_dispatched_ns = time.perf_counter_ns()
-            if not boot_seen and BOOT_MARKER in output:
+            if not boot_seen and boot_marker in output:
                 boot_seen = True
                 if processors is None:
                     request_snapshot()
@@ -4813,7 +4966,7 @@ def build_whp(openvmm_dir: Path) -> Path:
         cwd=openvmm_dir,
     )
     return require_file(
-        openvmm_dir / "target" / "release" / "openvmm.exe",
+        openvmm_dir / "target" / "release" / OpenVMMBuildConstants.WINDOWS_BINARY_NAME,
         "native OpenVMM release binary",
     )
 
@@ -5069,9 +5222,9 @@ def run_kvm_worker(args: argparse.Namespace) -> int:
         "--memory",
         f"{args.memory_mib}M",
         "--kernel",
-        str(stage / "vmlinux"),
+        str(stage / KernelBuildConstants.BINARY_NAME),
         "--initrd",
-        str(stage / "initramfs.cpio.gz"),
+        str(stage / AlpineBuildConstants.INITRAMFS_NAME),
         "--cmdline",
         f"clocksource=kvm-clock {BASE_TUNING}",
     ]
@@ -5169,7 +5322,7 @@ def result_document(
             "memory_mib": args.memory_mib,
             "platform": args.platform,
             "backend": backend or args.backend,
-            "microvm_abi_version": MICROVM_ABI_VERSION,
+            "microvm_abi_version": OpenVMMBuildConstants.MICROVM_ABI_VERSION,
             "processors": args.processors,
             "artifact_revisions": {
                 "nvx": _git_revision(args.nvx_dir.resolve()),
@@ -5233,6 +5386,7 @@ def result_document(
             ),
             "snapshot_profile_environment": SNAPSHOT_PROFILE_ENV,
             "cache_state": args.cache_state,
+            "scratch_directory": scratch_directory_control(args),
         },
         "backends": {},
         "snapshot_capture": {},
@@ -5265,9 +5419,11 @@ def run_native_linux(args: argparse.Namespace) -> int:
     executable = None
     if run_guest:
         artifact_dir = args.nvx_dir.resolve() / "build"
-        kernel = require_file(artifact_dir / "vmlinux", "NVX PVH kernel")
+        kernel = require_file(
+            artifact_dir / KernelBuildConstants.BINARY_NAME, "NVX Linux direct kernel"
+        )
         initrd = require_file(
-            artifact_dir / "initramfs.cpio.gz",
+            artifact_dir / AlpineBuildConstants.INITRAMFS_NAME,
             "NVX initramfs",
         )
         executable = (
@@ -5447,6 +5603,43 @@ def run_native_linux(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_kvm_worker(command: Sequence[str], result_kind: str) -> object:
+    result_prefix = (
+        KVM_RESULT_PREFIX,
+        KVM_E2E_RESULT_PREFIX,
+        KVM_RESTORE_RESULT_PREFIX,
+        KVM_SNAPSHOT_RESULT_PREFIX,
+    )[("", "e2e", "restore", "snapshot").index(result_kind)]
+    worker = f"KVM {result_kind}".rstrip()
+    try:
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        print(completed.stdout, end="")
+        for line in completed.stdout.splitlines():
+            if line.startswith(result_prefix):
+                return json.loads(line.removeprefix(result_prefix))
+        raise RuntimeError(f"{worker} worker did not emit a result")
+    except subprocess.CalledProcessError as error:
+        if error.stdout:
+            print(error.stdout, end="", file=sys.stderr)
+        if error.stderr:
+            print(error.stderr, end="", file=sys.stderr)
+        raise
+
+
+def _resolved_scratch_directory(args: argparse.Namespace) -> Path:
+    scratch = getattr(args, "scratch_dir", None)
+    if scratch is None:
+        scratch = Path(tempfile.gettempdir())
+    return Path(scratch).resolve()
+
+
+def _kvm_worker_scratch_arguments(args: argparse.Namespace) -> list[str]:
+    return [
+        "--scratch-dir",
+        windows_to_wsl(_resolved_scratch_directory(args)),
+    ]
+
+
 def benchmark_kvm(
     args: argparse.Namespace,
     executable: Path,
@@ -5465,6 +5658,7 @@ def benchmark_kvm(
         "--_kvm-worker",
         "--_stage-dir",
         stage_dir,
+        *_kvm_worker_scratch_arguments(args),
         "--suite",
         "boot",
         "--warmups",
@@ -5487,21 +5681,7 @@ def benchmark_kvm(
     if args.net is not None:
         command.extend(("--net", args.net, "--network-profile", args.network_profile))
     try:
-        completed = subprocess.run(command, check=True, capture_output=True, text=True)
-        print(completed.stdout, end="")
-        for line in completed.stdout.splitlines():
-            if line.startswith(KVM_RESULT_PREFIX):
-                return cast(
-                    BenchmarkResult,
-                    json.loads(line.removeprefix(KVM_RESULT_PREFIX)),
-                )
-        raise RuntimeError("KVM worker did not emit a result")
-    except subprocess.CalledProcessError as error:
-        if error.stdout:
-            print(error.stdout, end="", file=sys.stderr)
-        if error.stderr:
-            print(error.stderr, end="", file=sys.stderr)
-        raise
+        return cast(BenchmarkResult, _run_kvm_worker(command, ""))
     finally:
         if not args.keep_kvm_stage:
             cleanup_kvm(stage_dir)
@@ -5525,6 +5705,7 @@ def benchmark_e2e_kvm(
         "--_kvm-worker",
         "--_stage-dir",
         stage_dir,
+        *_kvm_worker_scratch_arguments(args),
         "--suite",
         "e2e",
         "--warmups",
@@ -5547,21 +5728,7 @@ def benchmark_e2e_kvm(
     if args.net is not None:
         command.extend(("--net", args.net))
     try:
-        completed = subprocess.run(command, check=True, capture_output=True, text=True)
-        print(completed.stdout, end="")
-        for line in completed.stdout.splitlines():
-            if line.startswith(KVM_E2E_RESULT_PREFIX):
-                return cast(
-                    KvmE2EResult,
-                    json.loads(line.removeprefix(KVM_E2E_RESULT_PREFIX)),
-                )
-        raise RuntimeError("KVM e2e worker did not emit a result")
-    except subprocess.CalledProcessError as error:
-        if error.stdout:
-            print(error.stdout, end="", file=sys.stderr)
-        if error.stderr:
-            print(error.stderr, end="", file=sys.stderr)
-        raise
+        return cast(KvmE2EResult, _run_kvm_worker(command, "e2e"))
     finally:
         if not args.keep_kvm_stage:
             cleanup_kvm(stage_dir)
@@ -5585,6 +5752,7 @@ def benchmark_snapshot_restore_kvm(
         "--_kvm-worker",
         "--_stage-dir",
         stage_dir,
+        *_kvm_worker_scratch_arguments(args),
         "--suite",
         "restore",
         "--warmups",
@@ -5607,21 +5775,7 @@ def benchmark_snapshot_restore_kvm(
     if args.net is not None:
         command.extend(("--net", args.net, "--network-profile", args.network_profile))
     try:
-        completed = subprocess.run(command, check=True, capture_output=True, text=True)
-        print(completed.stdout, end="")
-        for line in completed.stdout.splitlines():
-            if line.startswith(KVM_RESTORE_RESULT_PREFIX):
-                return cast(
-                    BenchmarkResult,
-                    json.loads(line.removeprefix(KVM_RESTORE_RESULT_PREFIX)),
-                )
-        raise RuntimeError("KVM restore worker did not emit a result")
-    except subprocess.CalledProcessError as error:
-        if error.stdout:
-            print(error.stdout, end="", file=sys.stderr)
-        if error.stderr:
-            print(error.stderr, end="", file=sys.stderr)
-        raise
+        return cast(BenchmarkResult, _run_kvm_worker(command, "restore"))
     finally:
         if not args.keep_kvm_stage:
             cleanup_kvm(stage_dir)
@@ -5645,6 +5799,7 @@ def benchmark_snapshot_kvm(
         "--_kvm-worker",
         "--_stage-dir",
         stage_dir,
+        *_kvm_worker_scratch_arguments(args),
         "--suite",
         "snapshot",
         "--warmups",
@@ -5665,27 +5820,45 @@ def benchmark_snapshot_kvm(
     if args.net is not None:
         command.extend(("--net", args.net, "--network-profile", args.network_profile))
     try:
-        completed = subprocess.run(command, check=True, capture_output=True, text=True)
-        print(completed.stdout, end="")
-        for line in completed.stdout.splitlines():
-            if line.startswith(KVM_SNAPSHOT_RESULT_PREFIX):
-                return cast(
-                    SnapshotCaptureResult,
-                    json.loads(line.removeprefix(KVM_SNAPSHOT_RESULT_PREFIX)),
-                )
-        raise RuntimeError("KVM snapshot worker did not emit a result")
-    except subprocess.CalledProcessError as error:
-        if error.stdout:
-            print(error.stdout, end="", file=sys.stderr)
-        if error.stderr:
-            print(error.stderr, end="", file=sys.stderr)
-        raise
+        return cast(SnapshotCaptureResult, _run_kvm_worker(command, "snapshot"))
     finally:
         if not args.keep_kvm_stage:
             cleanup_kvm(stage_dir)
 
 
+@contextlib.contextmanager
+def benchmark_scratch_directory(args: argparse.Namespace) -> Generator[None]:
+    """Creates benchmark temporary files under the requested scratch directory.
+
+    Snapshot capture writes and flushes guest RAM through these files, so the
+    selected volume's write throughput bounds snapshot generation time.
+    """
+    scratch_dir = getattr(args, "scratch_dir", None)
+    if scratch_dir is None:
+        yield
+        return
+    scratch = _resolved_scratch_directory(args)
+    if not scratch.is_dir():
+        raise ValueError(f"benchmark scratch directory does not exist: {scratch}")
+    args.scratch_dir = scratch
+    previous = tempfile.tempdir
+    tempfile.tempdir = str(scratch)
+    try:
+        yield
+    finally:
+        tempfile.tempdir = previous
+
+
+def scratch_directory_control(args: argparse.Namespace) -> str:
+    return str(_resolved_scratch_directory(args))
+
+
 def run(args: argparse.Namespace) -> int:
+    with benchmark_scratch_directory(args):
+        return run_benchmark(args)
+
+
+def run_benchmark(args: argparse.Namespace) -> int:
     apply_benchmark_suite_defaults(args)
     if (args.net is None) != (args.network_profile is None):
         raise ValueError("--net and --network-profile must be specified together")
@@ -5719,9 +5892,12 @@ def run(args: argparse.Namespace) -> int:
     initrd = None
     if run_guest:
         nvx_dir = args.nvx_dir.resolve()
-        kernel = require_file(nvx_dir / "build" / "vmlinux", "NVX PVH kernel")
+        kernel = require_file(
+            nvx_dir / "build" / KernelBuildConstants.BINARY_NAME,
+            "NVX Linux direct kernel",
+        )
         initrd = require_file(
-            nvx_dir / "build" / "initramfs.cpio.gz",
+            nvx_dir / "build" / AlpineBuildConstants.INITRAMFS_NAME,
             "NVX initramfs",
         )
     cpus = parse_cpu_set(args.cpus)
@@ -5739,7 +5915,10 @@ def run(args: argparse.Namespace) -> int:
     if args.skip_build:
         if run_guest and "whp" in selected:
             boot_binaries["whp"] = require_file(
-                openvmm_dir / "target" / "release" / "openvmm.exe",
+                openvmm_dir
+                / "target"
+                / "release"
+                / OpenVMMBuildConstants.WINDOWS_BINARY_NAME,
                 "native OpenVMM release binary",
             )
         if run_guest and "kvm" in selected:

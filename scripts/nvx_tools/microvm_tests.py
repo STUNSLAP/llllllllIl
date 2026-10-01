@@ -13,32 +13,47 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Sequence
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, cast
 
 from .benchmark import (
-    BOOT_MARKER,
     RESTORE_MARKER,
     SMP_PROBE_COMPLETION_MARKER,
-    capture_snapshot,
+    SNAPSHOT_PROFILE_ENV,
+    GuestCommandResult,
+    GuestFailureReported,
     measure_once,
+    parse_snapshot_profile_line,
     positive_float,
     positive_int,
-    run_guest_script,
+    record_adversarial_openvmm_pid,
     smp_probe_script,
     snapshot_restore_command,
-    whp_stable_clocksource_wait_script,
+    stable_clocksource_wait_script,
     workload_boot_command,
+)
+from .benchmark import (
+    capture_snapshot as _capture_snapshot,
+)
+from .benchmark import (
+    run_guest_script as _run_guest_script,
+)
+from .build_constants import (
+    BuildConstants,
+    KernelBuildConstants,
 )
 from .ci import OPENVMM_TEST_BACKENDS, validate_openvmm_test_backend
 from .common import (
-    BUILD_DIR,
+    ScriptError,
     artifact_path,
     openvmm_binary_path,
     require_file,
     sha256_file,
 )
 from .control_session import ControlSession
+from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
 from .openvmm_process import OpenvmmProcess, TcpConsole
 
 MICROVM_TEST_SCENARIOS = (
@@ -48,6 +63,8 @@ MICROVM_TEST_SCENARIOS = (
     "denied-filesystem-paths",
     "endpoint-policy-snapshot",
     "filesystem-snapshot",
+    "guest-boot",
+    "guest-identity",
     "host-loopback-policy",
     "lifecycle",
     "l3-l4-egress-policy",
@@ -67,6 +84,9 @@ MICROVM_TEST_SCENARIOS = (
     "virtio-net",
     "workload-identity",
 )
+UBUNTU_UNSUPPORTED_SCENARIOS = frozenset(
+    ("console-snapshot", "sandbox-blocks", "scratch-snapshot", "snapshot-tiers")
+)
 MICROVM_PROCESSOR_COUNTS = (1, 2, 4, 8)
 MICROVM_TEST_SCRIPTS_DIR = Path(__file__).with_name("microvm_test_scripts")
 LIFECYCLE_COMPLETION_MARKER = b"NVX-LIFECYCLE-OK"
@@ -79,11 +99,14 @@ DIRECTIONAL_NETWORK_GUEST_IPV4 = "192.0.2.2"
 DIRECTIONAL_NETWORK_GATEWAY_IPV4 = "192.0.2.1"
 DIRECTIONAL_NETWORK_CIDR = f"{DIRECTIONAL_NETWORK_GUEST_IPV4}/24"
 DIRECTIONAL_NETWORK_INGRESS_PORT = 18080
+NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS = 0.25
+NETWORK_SERVER_JOIN_TIMEOUT_SECONDS = 1.0
 L3_L4_EGRESS_COMPLETION_MARKER = b"NVX-L3-L4-EGRESS-OK"
 HOST_LOOPBACK_DENY_MARKER = b"NVX-HOST-LOOPBACK-DENY-OK"
 HOST_LOOPBACK_UDP_CONTROL_MARKER = b"NVX-HOST-LOOPBACK-UDP-CONTROL-OK"
 HOST_LOOPBACK_ALLOW_MARKER = b"NVX-HOST-LOOPBACK-ALLOW-OK"
 HOST_LOOPBACK_INGRESS_READY_MARKER = b"NVX-HOST-LOOPBACK-INGRESS-READY"
+HOST_LOOPBACK_PORT_BIND_ATTEMPTS = 16
 SANDBOX_BLOCK_SIZE = 8 * 1024 * 1024
 SNAPSHOT_CORE_CONTINUED_MARKER = b"NVX-SNAPSHOT-CORE-CONTINUED"
 SNAPSHOT_CORE_COMPLETION_MARKER = b"NVX-SNAPSHOT-CORE-OK"
@@ -110,7 +133,24 @@ NETWORK_AFTER_MARKER = b"NVX-NETWORK-AFTER"
 SCRATCH_PAIRED_POST_MARKER = b"NVX-SCRATCH-PAIRED-POST-OUT"
 SCRATCH_PAIRED_RESTORED_MARKER = b"NVX-SCRATCH-PAIRED-RESTORED"
 SCRATCH_FRESH_POST_MARKER = b"NVX-SCRATCH-FRESH-POST-OUT"
+SCRATCH_FRESH_VALUE_PREFIX = b"NVX-SCRATCH-FRESH-VALUE-"
+SCRATCH_FRESH_VALUE_SUFFIX = b"-END"
 WORKLOAD_IDENTITY_MARKER = b"NVX-WORKLOAD-IDENTITY-OK uid=65534 gid=65534"
+BOOT_MARKER = b"NVX-GUEST-BOOT-OK:"
+GUEST_BOOT_COMPLETION_MARKER = b"NVX-GUEST-BOOT-CHECK-OK"
+GUEST_IDENTITY_COMPLETION_MARKER = b"NVX-GUEST-IDENTITY-OK"
+RESTORE_PROCESSORS_FAILURE_MARKER = b"NVX-RESTORE-PROCESSORS-FAIL"
+RESTORE_UNSTABLE_TSC_FAILURE = "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc"
+# Records each VP's applied restore downtime and which restored MSHV APs were
+# aligned to the BSP counter.
+RESTORE_TSC_LOG_FILTER = (
+    "off,vmm_core::partition_unit::vp_set::tsc=debug,virt_mshv::x86_64::tsc=info"
+)
+TSC_CONTROL_PROCESSORS = 8
+TSC_CONTROL_ROUNDS = 20
+TSC_CONTROL_COMPLETION_MARKER = b"NVX-TSC-CONTROL-DONE"
+TSC_CONTROL_RESULT_PREFIX = "NVX-TSC-CONTROL-RESULT "
+HOST_CPUINFO = Path("/proc/cpuinfo")
 OUTCOME_TOP_LEVEL_FIELDS = frozenset(
     {
         "schema_version",
@@ -144,6 +184,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         choices=OPENVMM_TEST_BACKENDS,
         required=True,
     )
+    parser.add_argument("--guest", choices=GUEST_NAMES, default="alpine")
     parser.add_argument(
         "--scenario",
         action="append",
@@ -159,7 +200,11 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         metavar="COUNT",
         help="processor counts for SMP and restore tests (default: 1 2 4 8)",
     )
-    parser.add_argument("--memory-mib", type=positive_int, default=128)
+    parser.add_argument(
+        "--memory-mib",
+        type=positive_int,
+        help="guest RAM; defaults to the selected guest profile",
+    )
     parser.add_argument(
         "--timeout",
         type=positive_float,
@@ -169,10 +214,66 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=BUILD_DIR / "test-results" / "microvm",
+        default=BuildConstants.BUILD_DIR / "test-results" / "microvm",
         help="directory for complete per-scenario OpenVMM logs",
     )
     parser.set_defaults(handler=run)
+
+
+def run_guest_script(
+    command: Sequence[str],
+    script: str,
+    completion_marker: bytes,
+    *,
+    timeout: float,
+    windows_cpus: set[int] | None = None,
+    teardown_mode: str = "guest-exit",
+    log_path: Path | None = None,
+) -> GuestCommandResult:
+    return _run_guest_script(
+        command,
+        script,
+        completion_marker,
+        timeout=timeout,
+        windows_cpus=windows_cpus,
+        teardown_mode=teardown_mode,
+        log_path=log_path,
+        boot_marker=BOOT_MARKER,
+    )
+
+
+def capture_snapshot(
+    command: Sequence[str],
+    snapshot_path: Path,
+    *,
+    backend: str,
+    timeout: float,
+    windows_cpus: set[int] | None = None,
+    processors: int | None = None,
+    teardown_mode: str = "guest-exit",
+    smp_network_gateway: str | None = None,
+    smp_ioapic_irq: int | None = None,
+    snapshot_profile: bool = False,
+    profile_sink: list[dict[str, object]] | None = None,
+    post_restore_script: str | None = None,
+    log_path: Path | None = None,
+) -> tuple[float, float, float, int]:
+    return _capture_snapshot(
+        command,
+        snapshot_path,
+        backend=backend,
+        timeout=timeout,
+        windows_cpus=windows_cpus,
+        processors=processors,
+        teardown_mode=teardown_mode,
+        smp_network_gateway=smp_network_gateway,
+        smp_ioapic_irq=smp_ioapic_irq,
+        snapshot_profile=snapshot_profile,
+        profile_sink=profile_sink,
+        post_restore_script=post_restore_script,
+        log_path=log_path,
+        boot_marker=BOOT_MARKER,
+    )
 
 
 def _read_script(name: str) -> str:
@@ -223,7 +324,7 @@ def _snapshot_core_script(backend: str) -> str:
             'current_clocksource)" = kvm-clock ] || fail 46'
         )
     elif backend == "whp":
-        select_clocksource = whp_stable_clocksource_wait_script()
+        select_clocksource = stable_clocksource_wait_script()
         validate_clocksource = (
             '[ "$(cat /sys/devices/system/clocksource/clocksource0/'
             'current_clocksource)" != tsc-early ] || fail 46'
@@ -256,7 +357,12 @@ def _read_outcome_report(path: Path) -> dict[str, Any]:
     raw = cast(dict[str, object], value)
     if set(raw) != set(OUTCOME_TOP_LEVEL_FIELDS):
         raise RuntimeError("structured outcome report has unexpected top-level fields")
-    if raw["schema_version"] != 1:
+    schema_version = raw["schema_version"]
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != 1
+    ):
         raise RuntimeError("structured outcome report has an unsupported version")
     instance_id = raw["instance_id"]
     if (
@@ -301,6 +407,14 @@ def _read_outcome_report(path: Path) -> dict[str, Any]:
     return cast(dict[str, Any], raw)
 
 
+def _preserve_outcome_report(path: Path, report: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
 def _count_line_suffix(output: bytes, marker: bytes) -> int:
     return sum(line.endswith(marker) for line in _output_lines(output))
 
@@ -309,6 +423,26 @@ def _single_marker_value(output: bytes, prefix: bytes) -> bytes:
     values = [
         line[len(prefix) :] for line in _output_lines(output) if line.startswith(prefix)
     ]
+    if len(values) != 1:
+        raise RuntimeError(
+            f"expected exactly one {prefix!r} marker, found {len(values)}"
+        )
+    return values[0]
+
+
+def _single_framed_marker_value(output: bytes, prefix: bytes, suffix: bytes) -> bytes:
+    values: list[bytes] = []
+    offset = 0
+    while True:
+        start = output.find(prefix, offset)
+        if start < 0:
+            break
+        value_start = start + len(prefix)
+        value_end = output.find(suffix, value_start)
+        if value_end < 0:
+            raise RuntimeError(f"malformed {prefix!r} marker")
+        values.append(output[value_start:value_end])
+        offset = value_end + len(suffix)
     if len(values) != 1:
         raise RuntimeError(
             f"expected exactly one {prefix!r} marker, found {len(values)}"
@@ -419,6 +553,74 @@ def _restore_environment() -> dict[str, str]:
     environment = os.environ.copy()
     environment["OPENVMM_LOG"] = "off"
     return environment
+
+
+def run_guest_boot(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    descriptor: GuestDescriptor,
+    *,
+    memory_mib: int,
+    timeout: float,
+    log_path: Path,
+) -> None:
+    command = workload_boot_command(
+        executable,
+        backend,
+        kernel,
+        initrd,
+        memory_mib,
+        "quiet loglevel=0",
+    )
+    run_guest_script(
+        command,
+        (
+            "set -e\n"
+            f"grep -Fqx 'ID={descriptor.os_release_id}' /etc/os-release\n"
+            f"grep -Fq '{descriptor.release}' /etc/os-release\n"
+            "echo NVX-GUEST-BOOT-CHECK-OK\n"
+            "nvx-exit 0\n"
+        ),
+        GUEST_BOOT_COMPLETION_MARKER,
+        timeout=timeout,
+        log_path=log_path,
+    )
+
+
+def run_guest_identity(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    descriptor: GuestDescriptor,
+    *,
+    memory_mib: int,
+    timeout: float,
+    log_path: Path,
+) -> None:
+    command = workload_boot_command(
+        executable,
+        backend,
+        kernel,
+        initrd,
+        memory_mib,
+        "quiet loglevel=0",
+    )
+    run_guest_script(
+        command,
+        (
+            "set -e\n"
+            f"grep -Fqx 'ID={descriptor.os_release_id}' /etc/os-release\n"
+            f"grep -Fq '{descriptor.release}' /etc/os-release\n"
+            "echo NVX-GUEST-IDENTITY-OK\n"
+            "nvx-exit 0\n"
+        ),
+        GUEST_IDENTITY_COMPLETION_MARKER,
+        timeout=timeout,
+        log_path=log_path,
+    )
 
 
 def run_lifecycle(
@@ -556,6 +758,7 @@ def run_managed_lifecycle(
                     stderr=subprocess.STDOUT,
                     env=environment,
                 )
+                record_adversarial_openvmm_pid(process.pid, environment)
                 if process.stdin is None:
                     raise RuntimeError("failed to create control capability pipe")
                 process.stdin.write(capability)
@@ -620,6 +823,10 @@ def run_managed_lifecycle(
                         f"managed OpenVMM process exited with status {result}"
                     )
                 report = _read_outcome_report(report_path)
+                _preserve_outcome_report(
+                    output_dir / "managed-outcome.json",
+                    report,
+                )
                 if report["backend"] != backend or report["outcome"] != {
                     "operation": "managed",
                     "category": "success",
@@ -724,6 +931,10 @@ def run_structured_outcome(
             raise RuntimeError("structured outcome run lost the guest exit result")
 
         report = _read_outcome_report(report_path)
+        _preserve_outcome_report(
+            output_dir / "structured-outcome.json",
+            report,
+        )
         if report["backend"] != backend or report["outcome"] != {
             "operation": "run",
             "category": "guest-exit",
@@ -753,7 +964,6 @@ def run_structured_outcome(
                 raise RuntimeError(
                     f"structured outcome exposed sensitive value {forbidden!r}"
                 )
-
         rejected_path = root / "rejected.json"
         rejected = workload_boot_command(
             executable,
@@ -782,6 +992,10 @@ def run_structured_outcome(
                 "structured policy rejection did not fail before guest boot"
             )
         rejected_report = _read_outcome_report(rejected_path)
+        _preserve_outcome_report(
+            output_dir / "structured-outcome-rejected.json",
+            rejected_report,
+        )
         if rejected_report["outcome"] != {
             "operation": "run",
             "category": "vmm-failure",
@@ -1071,7 +1285,7 @@ def run_directional_network_policy(
             timeout=timeout,
             log_path=output_dir / "directional-network-deny.log",
         )
-        listener.settimeout(0.25)
+        listener.settimeout(NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS)
         try:
             unexpected, _ = listener.accept()
         except TimeoutError:
@@ -1104,7 +1318,7 @@ def run_directional_network_policy(
             )
     finally:
         listener.close()
-        server.join(timeout=1)
+        server.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
 
 
 def run_l3_l4_egress_policy(
@@ -1207,7 +1421,7 @@ def run_l3_l4_egress_policy(
                 "L3/L4 allowed endpoint server failed"
             ) from server_errors[0]
 
-        denied_tcp.settimeout(0.25)
+        denied_tcp.settimeout(NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS)
         try:
             unexpected, _ = denied_tcp.accept()
         except TimeoutError:
@@ -1215,7 +1429,7 @@ def run_l3_l4_egress_policy(
         else:
             unexpected.close()
             raise RuntimeError("deny rule did not override the TCP allow rule")
-        denied_udp.settimeout(0.25)
+        denied_udp.settimeout(NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS)
         try:
             unexpected, _ = denied_udp.recvfrom(128)
         except TimeoutError:
@@ -1268,7 +1482,7 @@ def run_l3_l4_egress_policy(
     finally:
         for endpoint in (allowed_tcp, denied_tcp, allowed_udp, denied_udp):
             endpoint.close()
-        server.join(timeout=1)
+        server.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
 
 
 def _http_server(
@@ -1297,6 +1511,37 @@ def _http_server(
         errors.append(error)
 
 
+def _bind_tcp_udp_listener_pair(
+    tcp_timeout: float, udp_timeout: float
+) -> tuple[socket.socket, socket.socket]:
+    last_error: OSError | None = None
+    for _ in range(HOST_LOOPBACK_PORT_BIND_ATTEMPTS):
+        with ExitStack() as sockets:
+            udp_listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sockets.callback(udp_listener.close)
+            udp_listener.bind(("127.0.0.1", 0))
+            port = int(udp_listener.getsockname()[1])
+
+            tcp_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sockets.callback(tcp_listener.close)
+            try:
+                tcp_listener.bind(("0.0.0.0", port))
+            except OSError as error:
+                last_error = error
+                continue
+
+            tcp_listener.listen(1)
+            tcp_listener.settimeout(tcp_timeout)
+            udp_listener.settimeout(udp_timeout)
+            sockets.pop_all()
+            return tcp_listener, udp_listener
+
+    raise RuntimeError(
+        "failed to allocate a port available to both TCP and UDP "
+        f"after {HOST_LOOPBACK_PORT_BIND_ATTEMPTS} attempts"
+    ) from last_error
+
+
 def run_host_loopback_policy(
     executable: Path,
     kernel: Path,
@@ -1307,12 +1552,18 @@ def run_host_loopback_policy(
     timeout: float,
     output_dir: Path,
 ) -> None:
-    denied_general = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    proxy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    for listener in (denied_general, proxy):
-        listener.bind(("0.0.0.0", 0))
-        listener.listen(1)
-        listener.settimeout(timeout)
+    with ExitStack() as listeners:
+        denied_general, denied_general_udp = _bind_tcp_udp_listener_pair(
+            timeout, NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS
+        )
+        listeners.callback(denied_general.close)
+        listeners.callback(denied_general_udp.close)
+        proxy, proxy_udp = _bind_tcp_udp_listener_pair(
+            timeout, NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS
+        )
+        listeners.callback(proxy.close)
+        listeners.callback(proxy_udp.close)
+        listeners.pop_all()
     denied_general_port = int(denied_general.getsockname()[1])
     proxy_port = int(proxy.getsockname()[1])
     proxy_errors: list[Exception] = []
@@ -1328,13 +1579,8 @@ def run_host_loopback_policy(
         name="nvx-host-loopback-proxy",
         daemon=True,
     )
-    denied_udp: list[socket.socket] = []
+    denied_udp = [proxy_udp, denied_general_udp]
     try:
-        for port in (proxy_port, denied_general_port):
-            listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            denied_udp.append(listener)
-            listener.bind(("127.0.0.1", port))
-            listener.settimeout(0.25)
         control_command = workload_boot_command(
             executable,
             backend,
@@ -1400,7 +1646,7 @@ def run_host_loopback_policy(
             raise TimeoutError("host-loopback proxy endpoint was not reached")
         if proxy_errors:
             raise RuntimeError("host-loopback proxy server failed") from proxy_errors[0]
-        denied_general.settimeout(0.25)
+        denied_general.settimeout(NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS)
         try:
             unexpected, _ = denied_general.accept()
         except TimeoutError:
@@ -1423,7 +1669,7 @@ def run_host_loopback_policy(
         denied_general.close()
         proxy.close()
         if proxy_server.ident is not None:
-            proxy_server.join(timeout=1)
+            proxy_server.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
 
     allowed_general = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     allowed_general.bind(("0.0.0.0", 0))
@@ -1506,7 +1752,7 @@ def run_host_loopback_policy(
             ]
     finally:
         allowed_general.close()
-        allow_server.join(timeout=1)
+        allow_server.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
 
     run_host_loopback_rejections(
         executable,
@@ -1779,6 +2025,142 @@ def run_smp_snapshot(
                 )
 
 
+def _restore_vp_bindings(output: bytes) -> list[int]:
+    """Return the VP indices bound by one profiled OpenVMM process."""
+    bound: list[int] = []
+    thread_bind_records = 0
+    for line in _output_lines(output):
+        record = parse_snapshot_profile_line(line)
+        if record is None or record["operation"] != "startup":
+            continue
+        phase = cast(str, record["phase"])
+        if phase == "vp_thread_bind":
+            thread_bind_records += 1
+        elif phase == "vp_bind_bsp":
+            bound.append(0)
+        elif phase.startswith("vp_bind_ap_"):
+            index = phase.removeprefix("vp_bind_ap_")
+            if not index.isdecimal() or int(index) == 0:
+                raise RuntimeError(f"malformed VP binding profile phase {phase!r}")
+            bound.append(int(index))
+    if thread_bind_records != 1:
+        raise RuntimeError(
+            "expected exactly one startup.vp_thread_bind profile record, "
+            f"found {thread_bind_records}"
+        )
+    return sorted(bound)
+
+
+def _restore_label(target: int | None) -> str:
+    return "untargeted restore" if target is None else f"restore target {target}"
+
+
+def _check_restore_vp_bindings(
+    output: bytes,
+    backend: str,
+    *,
+    target: int | None,
+    capacity: int,
+) -> None:
+    # Only MSHV instantiates the VP prefix of an explicit restore target.
+    # Untargeted MSHV restores and every KVM or WHP restore bind the capacity.
+    expected = target if backend == "mshv" and target is not None else capacity
+    bound = _restore_vp_bindings(output)
+    if bound != list(range(expected)):
+        raise RuntimeError(
+            f"{_restore_label(target)} bound VPs {bound} on {backend}; "
+            f"expected exactly VPs 0..{expected - 1} of capacity {capacity}"
+        )
+
+
+def _tsc_control_verdict(text: str) -> str:
+    """Summarize the fresh-boot TSC control result printed by the guest."""
+    for line in text.splitlines():
+        line = line.removesuffix("\r")
+        if line.startswith(TSC_CONTROL_RESULT_PREFIX):
+            fields = line.removeprefix(TSC_CONTROL_RESULT_PREFIX)
+            state, _, activations = fields.partition(" activations=")
+            if state == "stable" and activations.isdecimal():
+                return (
+                    "fresh-boot TSC control: no TSC instability across "
+                    f"{activations} CPU activations without snapshot restore"
+                )
+            if state == "unstable" and activations.isdecimal():
+                return (
+                    "fresh-boot TSC control: Linux also found TSC instability "
+                    f"without snapshot restore after {activations} CPU activations"
+                )
+            break
+    return "fresh-boot TSC control did not report a result"
+
+
+def _host_invariant_tsc_note(cpuinfo: Path = HOST_CPUINFO) -> str:
+    """Report whether a Linux host CPU exposes an invariant TSC.
+
+    Guests on a host without one intermittently see cross-vCPU TSC warps
+    whether or not they were restored (#211).
+    """
+    try:
+        text = cpuinfo.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        name, _, flags = line.partition(":")
+        if name.strip() == "flags":
+            if "nonstop_tsc" in flags.split():
+                return "host CPU exposes an invariant TSC (nonstop_tsc)\n"
+            return (
+                "host CPU does not expose an invariant TSC (nonstop_tsc); guests "
+                "on this host intermittently see cross-vCPU TSC warps\n"
+            )
+    return ""
+
+
+def run_fresh_boot_tsc_control(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    log_path: Path,
+) -> str:
+    """Check whether a never-restored guest reproduces a restore TSC failure.
+
+    The guest boots every processor with Linux's cross-CPU TSC warp check
+    forced, then repeatedly reactivates each AP against CPU 0. The result only
+    classifies the failure that triggered it.
+    """
+    command = workload_boot_command(
+        executable,
+        backend,
+        kernel,
+        initrd,
+        memory_mib,
+        "quiet loglevel=0 clearcpuid=tsc_adjust",
+        processors=TSC_CONTROL_PROCESSORS,
+    )
+    script = _render_script(
+        "tsc-sync-control.sh.in",
+        PROCESSORS=str(TSC_CONTROL_PROCESSORS),
+        ROUNDS=str(TSC_CONTROL_ROUNDS),
+    )
+    try:
+        result = run_guest_script(
+            command,
+            script,
+            TSC_CONTROL_COMPLETION_MARKER,
+            timeout=timeout,
+            log_path=log_path,
+        )
+    except Exception as error:
+        # The control only annotates the restore failure that triggered it.
+        summary = str(error).splitlines()[0] if str(error) else type(error).__name__
+        return f"fresh-boot TSC control did not complete: {summary}"
+    return _tsc_control_verdict(result["text"])
+
+
 def run_restore_processors(
     executable: Path,
     kernel: Path,
@@ -1792,11 +2174,17 @@ def run_restore_processors(
     check_tsc_sync: bool = False,
 ) -> None:
     capacity = 8
-    cmdline = "quiet loglevel=0 maxcpus=1"
+    boot_online = 1
+    cmdline = f"quiet loglevel=0 maxcpus={boot_online}"
     script = _read_script("restore-processors.sh")
     if check_tsc_sync:
         cmdline += " clearcpuid=tsc_adjust"
         script = _read_script("restore-tsc-sync.sh") + script
+    # The VP-binding lifecycle records identify the VPs that each restore
+    # instantiates without changing restore behavior.
+    environment = _restore_environment()
+    environment["OPENVMM_LOG"] = RESTORE_TSC_LOG_FILTER
+    environment[SNAPSHOT_PROFILE_ENV] = "1"
     with tempfile.TemporaryDirectory(prefix="nvx-restore-processors-") as temporary:
         snapshot_path = Path(temporary) / "snapshot"
         boot_command = workload_boot_command(
@@ -1813,31 +2201,61 @@ def run_restore_processors(
             snapshot_path,
             backend=backend,
             timeout=timeout,
-            processors=1,
+            processors=boot_online,
             post_restore_script=script,
             log_path=output_dir / "restore-processors-capture.log",
         )
         fingerprint = _snapshot_fingerprint(snapshot_path)
-        for target in dict.fromkeys(processor_counts):
-            marker = f"NVX-RESTORE-PROCESSORS-OK count={target}".encode()
-            measure_once(
-                snapshot_restore_command(
-                    executable,
-                    backend,
-                    snapshot_path,
-                    processors=capacity,
-                    restore_processors=target,
-                ),
-                environment=_restore_environment(),
-                timeout=timeout,
-                marker=marker,
-                marker_must_be_line=True,
-                guest_exit_prequeued=True,
-                log_path=output_dir / f"restore-processors-{target}.log",
+        # An untargeted restore keeps the captured boot-online prefix.
+        targets: list[int | None] = [*dict.fromkeys(processor_counts), None]
+        for target in targets:
+            name = "untargeted" if target is None else str(target)
+            online = boot_online if target is None else target
+            marker = f"NVX-RESTORE-PROCESSORS-OK count={online}".encode()
+            log_path = output_dir / f"restore-processors-{name}.log"
+            try:
+                measure_once(
+                    snapshot_restore_command(
+                        executable,
+                        backend,
+                        snapshot_path,
+                        processors=capacity,
+                        restore_processors=target,
+                    ),
+                    environment=environment,
+                    timeout=timeout,
+                    marker=marker,
+                    marker_must_be_line=True,
+                    guest_exit_prequeued=True,
+                    log_path=log_path,
+                    failure_marker=RESTORE_PROCESSORS_FAILURE_MARKER,
+                )
+            except GuestFailureReported as error:
+                verdict = ""
+                if error.line == RESTORE_UNSTABLE_TSC_FAILURE:
+                    verdict = run_fresh_boot_tsc_control(
+                        executable,
+                        kernel,
+                        initrd,
+                        backend,
+                        memory_mib=memory_mib,
+                        timeout=timeout,
+                        log_path=output_dir / "restore-processors-tsc-control.log",
+                    )
+                    verdict += "\n" + _host_invariant_tsc_note()
+                raise RuntimeError(
+                    f"{_restore_label(target)}: guest reported {error.line}\n"
+                    f"{verdict}--- OpenVMM output ---\n{error.output_tail}"
+                ) from error
+            _check_restore_vp_bindings(
+                log_path.read_bytes(),
+                backend,
+                target=target,
+                capacity=capacity,
             )
             if _snapshot_fingerprint(snapshot_path) != fingerprint:
                 raise RuntimeError(
-                    f"restore target {target} modified snapshot artifacts"
+                    f"{_restore_label(target)} modified snapshot artifacts"
                 )
 
 
@@ -1938,7 +2356,7 @@ def run_snapshot_core(
     ) as process:
         process.wait_for(BOOT_MARKER, timeout)
         process.send_line("nvx-snapshot; echo NVX-SNAPSHOT-NO-DESTINATION-OK")
-        process.wait_for(no_destination_marker, timeout)
+        process.wait_for_line(no_destination_marker, timeout)
         process.send_line("nvx-exit 0")
         result = process.wait(timeout)
     if result.returncode != 0:
@@ -2492,7 +2910,7 @@ def run_network_snapshot(
     finally:
         tcp_listener.close()
         udp_socket.close()
-        server.join(timeout=1)
+        server.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
     if server.is_alive():
         raise RuntimeError("network test server did not stop")
     if server_errors:
@@ -2948,7 +3366,10 @@ def run_scratch_snapshot(
         for restore_index, value in enumerate((17, 34)):
             scratch = root / f"fresh-scratch-{restore_index}.raw"
             _write_pattern(scratch, 1024 * 1024, value)
-            marker = f"NVX-SCRATCH-FRESH-VALUE-{value}".encode()
+            expected_value = str(value).encode()
+            marker = (
+                SCRATCH_FRESH_VALUE_PREFIX + expected_value + SCRATCH_FRESH_VALUE_SUFFIX
+            )
             with OpenvmmProcess(
                 fresh_restore_command(scratch),
                 output_dir / f"scratch-fresh-restore-{restore_index}.log",
@@ -2956,9 +3377,14 @@ def run_scratch_snapshot(
                 process.wait_for(marker, timeout)
                 restored = process.wait(timeout)
             restored_lines = _output_lines(restored.output)
+            restored_value = _single_framed_marker_value(
+                restored.output,
+                SCRATCH_FRESH_VALUE_PREFIX,
+                SCRATCH_FRESH_VALUE_SUFFIX,
+            )
             if restored.returncode != 0 or (
                 restored_lines.count(SCRATCH_FRESH_POST_MARKER) != 1
-                or restored_lines.count(marker) != 1
+                or restored_value != expected_value
             ):
                 raise RuntimeError(
                     f"fresh scratch restore {restore_index} used the wrong backing"
@@ -2984,13 +3410,14 @@ def run_scratch_snapshot(
         )
 
 
-def _snapshot_tier_script(tier: str) -> str:
-    platform = tier == "platform"
-    workload_start = tier == "workload-start"
-    instance_checkpoint = tier == "instance-checkpoint"
-    if not (platform or workload_start or instance_checkpoint):
+def _snapshot_tier_kinds(tier: str) -> tuple[bool, bool, bool]:
+    if tier not in ("platform", "workload-start", "instance-checkpoint"):
         raise ValueError(f"unsupported snapshot tier {tier!r}")
+    return tier == "platform", tier == "workload-start", tier == "instance-checkpoint"
 
+
+def _snapshot_tier_script(tier: str) -> str:
+    platform, workload_start, instance_checkpoint = _snapshot_tier_kinds(tier)
     prefix = f"NVX-TIER-{tier.upper()}"
     workload_marker = f"{prefix}-WORKLOAD-RAN"
     paired_setup = ""
@@ -3117,11 +3544,7 @@ def _run_snapshot_tier(
     timeout: float,
     output_dir: Path,
 ) -> None:
-    platform = tier == "platform"
-    workload_start = tier == "workload-start"
-    instance_checkpoint = tier == "instance-checkpoint"
-    if not (platform or workload_start or instance_checkpoint):
-        raise ValueError(f"unsupported snapshot tier {tier!r}")
+    platform, workload_start, instance_checkpoint = _snapshot_tier_kinds(tier)
 
     prefix = f"NVX-TIER-{tier.upper()}"
     capture_marker = f"{prefix}-CAPTURE".encode()
@@ -3355,16 +3778,69 @@ def run_snapshot_tiers(
 
 def run(args: argparse.Namespace) -> int:
     validate_openvmm_test_backend(args.backend)
+    descriptor = guest_descriptor(args.guest)
+    if args.memory_mib is None:
+        args.memory_mib = descriptor.default_memory_mib
     executable = require_file(openvmm_binary_path(), "OpenVMM release binary")
-    kernel = require_file(artifact_path("vmlinux"), "microVM PVH kernel")
+    kernel = require_file(
+        artifact_path(KernelBuildConstants.BINARY_NAME), "microVM Linux direct kernel"
+    )
     initrd = require_file(
-        artifact_path("initramfs.cpio.gz"),
-        "microVM Alpine initramfs",
+        artifact_path(descriptor.initramfs_name),
+        f"microVM {descriptor.distribution} initramfs",
     )
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    scenarios = tuple(dict.fromkeys(args.scenario or MICROVM_TEST_SCENARIOS))
+    if args.scenario is None:
+        scenarios = tuple(
+            scenario
+            for scenario in MICROVM_TEST_SCENARIOS
+            if descriptor.name != "ubuntu"
+            or scenario not in UBUNTU_UNSUPPORTED_SCENARIOS
+        )
+    else:
+        scenarios = tuple(dict.fromkeys(args.scenario))
+        unsupported: set[str] = set()
+        if descriptor.name == "ubuntu":
+            for scenario in UBUNTU_UNSUPPORTED_SCENARIOS:
+                if scenario in scenarios:
+                    unsupported.add(scenario)
+        if unsupported:
+            raise ScriptError(
+                "Ubuntu guest does not support correctness scenario(s): "
+                + ", ".join(sorted(unsupported))
+            )
 
+    if "guest-boot" in scenarios:
+        print(
+            f"Running {descriptor.distribution} initramfs boot correctness "
+            f"on OpenVMM/{args.backend}"
+        )
+        run_guest_boot(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            descriptor,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            log_path=output_dir / f"{descriptor.name}-guest-boot.log",
+        )
+    if "guest-identity" in scenarios:
+        print(
+            f"Running {descriptor.distribution} identity correctness "
+            f"on OpenVMM/{args.backend}"
+        )
+        run_guest_identity(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            descriptor,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            log_path=output_dir / f"{descriptor.name}-guest-identity.log",
+        )
     if "console-exit" in scenarios:
         for processors in dict.fromkeys(args.processors):
             print(

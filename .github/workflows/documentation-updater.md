@@ -22,7 +22,7 @@ engine:
     - --context
     - long_context
 model: gpt-5.6-sol-fast
-max-turns: 20
+max-turns: 100
 timeout-minutes: 60
 concurrency: documentation-updater
 sandbox:
@@ -58,14 +58,21 @@ steps:
       set -euo pipefail
       mkdir -p /tmp/gh-aw/agent
       cat > /tmp/gh-aw/agent/validate_design_docs.py <<'PY'
+      import argparse
       import json
       import re
       import subprocess
       from pathlib import Path
 
+      parser = argparse.ArgumentParser()
+      parser.add_argument("--allow-unmaterialized-openvmm", action="store_true")
+      args = parser.parse_args()
+
       root = Path.cwd().resolve()
       index = root / "doc" / "design.md"
       design_dir = root / "doc" / "design"
+      openvmm_dir = (root / "openvmm").resolve()
+      openvmm_materialized = (openvmm_dir / ".git").exists()
       errors: list[str] = []
 
       if not index.is_file():
@@ -111,7 +118,12 @@ steps:
               except ValueError:
                   errors.append(f"{relative}: link escapes repository: {target}")
                   continue
-              if not resolved.exists():
+              missing_unmaterialized_openvmm = (
+                  args.allow_unmaterialized_openvmm
+                  and not openvmm_materialized
+                  and (resolved == openvmm_dir or openvmm_dir in resolved.parents)
+              )
+              if not resolved.exists() and not missing_unmaterialized_openvmm:
                   errors.append(f"{relative}: broken relative link: {target}")
               if document == index and resolved.parent == design_dir:
                   indexed_chapters.add(resolved)
@@ -149,7 +161,7 @@ steps:
           f"OpenVMM gitlink {openvmm_sha}"
       )
       PY
-      python3 /tmp/gh-aw/agent/validate_design_docs.py
+      python3 /tmp/gh-aw/agent/validate_design_docs.py --allow-unmaterialized-openvmm
       gh pr list \
         --repo "$REPO" \
         --state all \
@@ -334,6 +346,10 @@ Before requesting the safe output:
 
 The pull request body must state the pinned OpenVMM SHA, the mismatches
 corrected, the exact evidence paths inspected, and the validation results.
+
+Reserve one model invocation after the final commit for `create-pull-request`.
+Once the commit succeeds, call that safe output immediately without additional
+searches or rereading passing validation logs.
 
 ## Boundaries
 

@@ -14,6 +14,7 @@ from types import TracebackType
 from typing import NamedTuple
 
 from .benchmark import InteractiveProcess, terminate
+from .common import remaining_timeout
 
 
 def _line_marker_end(
@@ -163,7 +164,7 @@ class OpenvmmProcess:
             if chunk is None:
                 break
             self._output.extend(chunk)
-        remaining = max(0.0, deadline - time.monotonic())
+        remaining = remaining_timeout(deadline)
         try:
             returncode = self.process.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
@@ -224,7 +225,11 @@ class TcpConsole:
         while True:
             try:
                 connection = socket.create_connection(address, timeout=0.25)
-                connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                try:
+                    connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except BaseException:
+                    connection.close()
+                    raise
                 return cls(connection)
             except OSError as error:
                 if time.monotonic() >= deadline:

@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+from .common import bytes_to_mib, positive_int
+
 LEGACY_CSV_FIELDS = ["commit", "metric", "unit", "direction", "p50"]
 CSV_FIELDS = [
     "platform",
@@ -43,8 +45,6 @@ SHARED_METRICS = frozenset(
         "virtfs_live_write",
         "virtfs_live_read",
         "virtfs_live_roundtrip",
-        "shell_snapshot_cold_64_mib",
-        "shell_snapshot_restore_64_mib",
         "shell_snapshot_cold_128_mib",
         "shell_snapshot_restore_128_mib",
         "shell_snapshot_cold_256_mib",
@@ -68,7 +68,6 @@ LIFECYCLE_METRICS = frozenset(
         "openvmm_snapshot_restore_peak_rss",
     }
 )
-BYTES_PER_MIB = 1024 * 1024
 LIFECYCLE_MEMORY_MIB = 128
 LIFECYCLE_BOOT_MARKER = "ALPINE-MICROVM-BOOT-OK"
 LIFECYCLE_RESTORE_MARKER = "OPENVMM-SNAPSHOT-RESTORE-OK"
@@ -80,7 +79,7 @@ LIFECYCLE_SNAPSHOT_MAX_CLUSTER_GAP = 1.25
 UNSTABLE_LIFECYCLE_EXIT_CODE = 75
 NUMBER = r"[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?"
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-SHELL_SNAPSHOT_MEMORIES_MIB = (64, 128, 256, 512)
+SHELL_SNAPSHOT_MEMORIES_MIB = (128, 256, 512)
 BENCHMARK_METADATA_FILENAME = "benchmark-metadata.json"
 DEVICE_IO_RESULT_PREFIX = "NVX_DEVICE_IO_RESULT="
 DEVICE_IO_OPERATIONS = {
@@ -804,12 +803,16 @@ def read_workload_dimensions(
     input_dir: Path, expected_platform: str
 ) -> tuple[BenchmarkDimensions, dict[str, object] | None]:
     metadata_path = input_dir / BENCHMARK_METADATA_FILENAME
-    if not metadata_path.exists():
-        return BenchmarkDimensions(expected_platform, 1, 1), None
     try:
         document = _json_object(
             json.loads(metadata_path.read_text(encoding="utf-8")), str(metadata_path)
         )
+    except FileNotFoundError:
+        return BenchmarkDimensions(expected_platform, 1, 1), None
+    except OSError as error:
+        raise PerformanceError(
+            f"cannot read benchmark metadata {metadata_path}: {error}"
+        ) from error
     except (UnicodeError, json.JSONDecodeError) as error:
         raise PerformanceError(
             f"invalid benchmark metadata JSON {metadata_path}: {error}"
@@ -1158,7 +1161,7 @@ def read_lifecycle_data(platform: str, input_path: Path) -> LifecycleData:
         metric: (
             unit,
             "lower",
-            value / BYTES_PER_MIB if unit == "MiB" else value,
+            bytes_to_mib(value) if unit == "MiB" else value,
         )
         for metric, section, field, unit in metric_fields
         for value in [_openvmm_value(document, section, backend, field, input_path)]
@@ -1275,8 +1278,8 @@ def append_openvmm_diagnostics(
             document, section, backend, "peak_rss_max_bytes", source
         )
         lines.append(
-            f"| {label} | {p50 / BYTES_PER_MIB:.2f} MiB | "
-            f"{maximum / BYTES_PER_MIB:.2f} MiB |"
+            f"| {label} | {bytes_to_mib(p50):.2f} MiB | "
+            f"{bytes_to_mib(maximum):.2f} MiB |"
         )
     lines.extend(
         [
@@ -1506,7 +1509,7 @@ def collect_results(
                 workload_controls = {
                     "payload_mib": 64,
                     "virtfs_memory_mib": 512,
-                    "shell_memories_mib": [64, 128, 256, 512],
+                    "shell_memories_mib": [128, 256, 512],
                     "network_memory_mib": 256,
                     "network": "10.0.0.2/24",
                 }
@@ -1613,13 +1616,7 @@ def collect_results(
 def _validate_current_results(path: Path, results: Sequence[Result]) -> None:
     seen: set[tuple[str, int, int, str, str]] = set()
     for result in results:
-        key = (
-            result.platform,
-            result.microvm_abi_version,
-            result.processors,
-            result.commit,
-            result.metric,
-        )
+        key = _result_identity(result)
         if key in seen:
             raise PerformanceError(
                 f"duplicate platform/ABI/processors/commit/metric row in {path}: "
@@ -1629,19 +1626,25 @@ def _validate_current_results(path: Path, results: Sequence[Result]) -> None:
         seen.add(key)
 
 
+def _result_identity(
+    result: Result, fallback_platform: str = ""
+) -> tuple[str, int, int, str, str]:
+    return (
+        result.platform or fallback_platform,
+        result.microvm_abi_version,
+        result.processors,
+        result.commit,
+        result.metric,
+    )
+
+
 def _validate_result_files(
     files: Sequence[Path], loaded: dict[Path, list[Result]]
 ) -> None:
     seen: dict[tuple[str, int, int, str, str], Path] = {}
     for path in files:
         for result in loaded[path]:
-            key = (
-                result.platform or path.stem,
-                result.microvm_abi_version,
-                result.processors,
-                result.commit,
-                result.metric,
-            )
+            key = _result_identity(result, path.stem)
             previous = seen.get(key)
             if previous is not None:
                 raise PerformanceError(
@@ -1731,27 +1734,11 @@ def persist_results(
                     f"{expected} -> {actual}"
                 )
 
-        existing_keys = {
-            (
-                result.platform,
-                result.microvm_abi_version,
-                result.processors,
-                result.commit,
-                result.metric,
-            )
-            for result in existing
-        }
+        existing_keys = {_result_identity(result) for result in existing}
         new_results = [
             result
             for result in current
-            if (
-                result.platform,
-                result.microvm_abi_version,
-                result.processors,
-                result.commit,
-                result.metric,
-            )
-            not in existing_keys
+            if _result_identity(result) not in existing_keys
         ]
         if not new_results:
             print(f"No new performance rows to persist for {source_path.name}")
@@ -1949,13 +1936,6 @@ def gate_results(
     return 1 if regressions else 0
 
 
-def _positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be greater than zero")
-    return parsed
-
-
 def _non_negative_float(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed < 0:
@@ -2012,10 +1992,10 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             "history file restart baseline warmup"
         ),
     )
-    gate.add_argument("--window", type=_positive_int, default=10)
+    gate.add_argument("--window", type=positive_int, default=10)
     gate.add_argument(
         "--minimum-history",
-        type=_positive_int,
+        type=positive_int,
         default=10,
         help="base-branch points required before gating a metric (default: 10)",
     )

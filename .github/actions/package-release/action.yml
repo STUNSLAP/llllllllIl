@@ -9,6 +9,13 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Rematerialize canonical kernel inputs
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        python scripts\nvx.py materialize-kernel-provenance-inputs
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
     - name: Package Linux release
       if: runner.os != 'Windows'
       shell: bash

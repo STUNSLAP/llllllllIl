@@ -39,22 +39,44 @@ Both scripts pin and verify the Actions runner package. Linux runner labels are
 `linux`, the selected backend, and `virtual-machine`. Windows labels are
 `windows`, `whp`, and `virtual-machine`. Runner names remain unique identities
 but are not registered as labels.
+On Linux, omit `--runner-name` to prepare host dependencies without reconciling
+an existing runner's service or cache directory. Pass its name in a subsequent
+invocation to update the service; `--check-only` still validates runner state.
 Rustup bootstrap binaries are versioned and SHA-256 verified before execution;
 Linux provisioning also installs `zstd` for native Actions cache archives.
+Both runner setup scripts install a pinned, SHA-256-verified `sccache` binary.
+Runner services use a persistent `_work/_sccache` directory with a 10-GiB
+limit, disable Cargo incremental compilation, and expose `sccache` through
+`RUSTC_WRAPPER`. CI uses clean Cargo target directories and reports per-job
+cache statistics instead of restoring compiled `target/` trees.
 Supply a fresh registration token again when migrating an existing runner or
 changing its name, backend, or labels; provisioning replaces the registration
 and records the expected label set in a protected local marker.
 Runner services receive an explicit tool PATH. On Windows, the Rust toolchain
 is read-only to the service account while Cargo registry and Git caches use the
 runner's per-job temporary directory.
+Windows runner provisioning also enables the full Hyper-V feature so the
+licensed in-box PCAT and SVGA firmware required by OpenVMM VMM tests is
+available under `System32`.
 On both platforms, runner and toolchain executables are administrator-owned and
 read-only to jobs, automatic runner updates are disabled, and writable runner
 state is confined to `_work`.
+Windows runner provisioning also creates a `nvx-benchmark-scratch` directory on
+the largest non-system NTFS volume, or at `-BenchmarkScratchDirectory`, and
+publishes it as the machine-level `NVX_BENCHMARK_SCRATCH` variable. Network
+Service receives Modify access to that directory tree, as for `_work/_sccache`.
+CI places benchmark snapshots and guest RAM backing files there so their
+flushes avoid the burst-limited system disk. Check mode requires the directory
+when a data volume exists.
 Persistent runners do not have Docker access. Guest artifacts are built with
 Docker on a GitHub-hosted runner instead.
 Linux provisioning runs through the SSH administrator, but the listener and
 workflow jobs run as the dedicated `nvx-runner` account, which has neither sudo
 nor Docker access.
+Linux provisioning and check mode stop unless the host CPU exposes an invariant
+TSC (`nonstop_tsc` in `/proc/cpuinfo`). Guests on an Azure VM without one hit
+cross-vCPU TSC warps during CPU activation, so redeploy such a VM instead of
+registering it.
 Persistent runners execute pushes and same-repository pull requests only. Fork
 pull requests remain on GitHub-hosted jobs until a maintainer stages the change
 on a trusted repository branch.
@@ -113,7 +135,8 @@ separate `build-guest` invocation without provisioning or rebuilding the host.
 Run the complete bootstrap from an elevated Windows PowerShell session. It uses
 WinGet to install missing tools, installs stable Rust 1.95 or newer and
 cargo-nextest 0.9.133, enables Windows Hypervisor Platform, and builds OpenVMM.
-It never reboots automatically.
+Runner-only provisioning additionally enables Hyper-V for its in-box PCAT and
+SVGA firmware. The script never reboots automatically.
 
 Pass a guest bundle produced on Linux to complete the build validation:
 

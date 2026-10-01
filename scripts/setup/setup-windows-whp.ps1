@@ -27,6 +27,9 @@ param(
     [string]$RunnerDirectory = "$env:SystemDrive\actions-runner",
 
     [Parameter()]
+    [string]$BenchmarkScratchDirectory,
+
+    [Parameter()]
     [switch]$RunnerTokenStdin
 )
 
@@ -45,17 +48,26 @@ $MinimumRustVersion = [version]"1.95.0"
 $RustupVersion = "1.29.1"
 $RustupSha256 = "6f4bef66261261fcb43131be8720bab817d403a09edec7455c371974b90bdb7e"
 $CargoNextestVersion = "0.9.133"
+$SccacheVersion = "0.18.0"
+$SccacheSha256 = "1a63c1be2beab3f04d27e4cc145443e092e02d3dd83a51030989829d7023091b"
 $RunnerVersion = "2.337.0"
 $RunnerSha256 = "1150692afa94e71f872017e254ea55b6eece1eece3fe7e3a6d4c93d0a1b85cfc"
 $ToolRoot = Join-Path $env:ProgramData "nvx"
 $TrustedCargoHome = Join-Path $ToolRoot "cargo"
 $CargoHome = Join-Path $RunnerDirectory "_work\_temp\cargo-home"
+$SccacheDirectory = Join-Path $RunnerDirectory "_work\_sccache"
+$BenchmarkScratchVariable = "NVX_BENCHMARK_SCRATCH"
+$BenchmarkScratchName = "nvx-benchmark-scratch"
 $RustupHome = Join-Path $ToolRoot "rustup"
 $RequiredGuestArtifacts = @(
     "vmlinux",
     "vmlinux.config",
     "initramfs.cpio.gz",
-    "initramfs.cpio.gz.packages.json"
+    "initramfs.cpio.gz.packages.json",
+    "initramfs-ubuntu.cpio.gz",
+    "initramfs-ubuntu.cpio.gz.packages.json",
+    "ubuntu-distro.erofs",
+    "ubuntu-distro.erofs.manifest.json"
 )
 
 function Assert-LastExitCode {
@@ -290,7 +302,8 @@ function Assert-ActionsRunnerWritablePaths {
             $workDirectory,
             (Join-Path $RunnerDirectory "_work\_temp"),
             (Join-Path $RunnerDirectory "_work\_diag"),
-            $CargoHome
+            $CargoHome,
+            $SccacheDirectory
         )) {
         $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
         if ($null -eq $item) {
@@ -445,7 +458,12 @@ function Protect-ActionsRunner {
     Assert-ActionsRunnerWritablePaths
     New-Item `
         -ItemType Directory `
-        -Path $workDirectory, $temporaryDirectory, $diagnosticsTarget, $CargoHome `
+        -Path `
+        $workDirectory, `
+        $temporaryDirectory, `
+        $diagnosticsTarget, `
+        $CargoHome, `
+        $SccacheDirectory `
         -Force |
     Out-Null
 
@@ -483,7 +501,8 @@ function Protect-ActionsRunner {
             $workDirectory,
             $temporaryDirectory,
             $diagnosticsTarget,
-            $CargoHome
+            $CargoHome,
+            $SccacheDirectory
         )) {
         Set-ServiceDirectoryAcl `
             -Path $path `
@@ -702,7 +721,10 @@ function Install-Toolchain {
         "toolchain", "install", $RustToolchain, "--profile", "minimal"
     )
     Invoke-Native $rustupPath @(
-        "target", "add", "x86_64-unknown-none", "--toolchain", $RustToolchain
+        "target", "add",
+        "x86_64-unknown-none",
+        "x86_64-unknown-uefi",
+        "--toolchain", $RustToolchain
     )
 
     $cargo = Join-Path $TrustedCargoHome "bin\cargo.exe"
@@ -721,11 +743,177 @@ function Install-Toolchain {
         )
     }
 
+    $sccache = Join-Path $TrustedCargoHome "bin\sccache.exe"
+    $installSccache = -not (Test-Path -LiteralPath $sccache -PathType Leaf)
+    if (-not $installSccache) {
+        $installedSccacheVersion = & $sccache --version
+        Assert-LastExitCode "sccache --version"
+        $installSccache = ($installedSccacheVersion -join "`n") -notmatch `
+            "sccache $([regex]::Escape($SccacheVersion))"
+    }
+    if ($installSccache) {
+        $archive = Join-Path $ToolRoot `
+            "sccache-v$SccacheVersion-x86_64-pc-windows-msvc-$([guid]::NewGuid().ToString('N')).tar.gz"
+        $extractDirectory = Join-Path $ToolRoot `
+            "sccache-v$SccacheVersion-$([guid]::NewGuid().ToString('N'))"
+        try {
+            Invoke-WebRequest `
+                -UseBasicParsing `
+                -Uri "https://github.com/mozilla/sccache/releases/download/v$SccacheVersion/sccache-v$SccacheVersion-x86_64-pc-windows-msvc.tar.gz" `
+                -OutFile $archive
+            $actualHash = (Get-FileHash `
+                    -LiteralPath $archive `
+                    -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $SccacheSha256) {
+                throw "sccache archive checksum mismatch: $actualHash"
+            }
+            New-Item `
+                -ItemType Directory `
+                -Path $extractDirectory `
+                -Force |
+            Out-Null
+            Invoke-Native (Get-RequiredCommand "tar.exe") @(
+                "-xzf", $archive, "-C", $extractDirectory
+            )
+            $extracted = Join-Path `
+                $extractDirectory `
+                "sccache-v$SccacheVersion-x86_64-pc-windows-msvc\sccache.exe"
+            if (-not (Test-Path -LiteralPath $extracted -PathType Leaf)) {
+                throw "sccache executable was not found after extraction"
+            }
+            Copy-Item -LiteralPath $extracted -Destination $sccache -Force
+        }
+        finally {
+            Remove-Item `
+                -LiteralPath $archive, $extractDirectory `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+    }
+
     Set-ServiceDirectoryAcl `
         -Path $ToolRoot `
         -ServiceRights "ReadAndExecute" `
         -AllowInternalLinks
     $env:CARGO_HOME = $CargoHome
+}
+
+function Configure-SccacheEnvironment {
+    New-Item -ItemType Directory -Path $SccacheDirectory -Force |
+    Out-Null
+    Set-ServiceDirectoryAcl `
+        -Path $SccacheDirectory `
+        -ServiceRights "Modify" `
+        -SkipChildren
+    foreach ($entry in @{
+            CARGO_INCREMENTAL   = "0"
+            RUSTC_WRAPPER       = "sccache"
+            SCCACHE_CACHE_SIZE  = "10G"
+            SCCACHE_DIR         = $SccacheDirectory
+        }.GetEnumerator()) {
+        [Environment]::SetEnvironmentVariable(
+            $entry.Key,
+            $entry.Value,
+            "Machine"
+        )
+        [Environment]::SetEnvironmentVariable(
+            $entry.Key,
+            $entry.Value,
+            "Process"
+        )
+    }
+}
+
+function Test-SystemVolumePath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Path)).TrimEnd("\")
+    return [StringComparer]::OrdinalIgnoreCase.Equals(
+        $root,
+        $env:SystemDrive.TrimEnd("\")
+    )
+}
+
+function Get-BenchmarkScratchDirectory {
+    if (-not [string]::IsNullOrWhiteSpace($BenchmarkScratchDirectory)) {
+        return [IO.Path]::GetFullPath($BenchmarkScratchDirectory)
+    }
+    $configured = [Environment]::GetEnvironmentVariable(
+        $BenchmarkScratchVariable,
+        "Machine"
+    )
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        return $configured
+    }
+    # Snapshot capture flushes guest RAM through benchmark scratch. Prefer the
+    # largest data volume so that I/O avoids the system disk's build traffic
+    # and burst throttling.
+    $volume = @(Get-Volume | Where-Object {
+            $_.DriveType -eq "Fixed" -and
+            $_.FileSystem -eq "NTFS" -and
+            "$($_.DriveLetter)" -match "^[A-Za-z]$" -and
+            -not (Test-SystemVolumePath "$($_.DriveLetter):\")
+        } | Sort-Object `
+            -Property @{ Expression = "Size"; Descending = $true }, DriveLetter) |
+    Select-Object -First 1
+    if ($null -eq $volume) {
+        return $null
+    }
+    return "$($volume.DriveLetter):\$BenchmarkScratchName"
+}
+
+function Configure-BenchmarkScratch {
+    $directory = Get-BenchmarkScratchDirectory
+    if ($null -eq $directory) {
+        Write-Output "No data volume found; benchmarks use the system temporary directory."
+        return
+    }
+    if (Test-SystemVolumePath $directory) {
+        throw "benchmark scratch must not use the system volume: $directory"
+    }
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    Set-ServiceDirectoryAcl `
+        -Path $directory `
+        -ServiceRights "Modify" `
+        -SkipChildren
+    foreach ($target in @("Machine", "Process")) {
+        [Environment]::SetEnvironmentVariable(
+            $BenchmarkScratchVariable,
+            $directory,
+            $target
+        )
+    }
+}
+
+function Assert-BenchmarkScratch {
+    $configured = [Environment]::GetEnvironmentVariable(
+        $BenchmarkScratchVariable,
+        "Machine"
+    )
+    if ([string]::IsNullOrWhiteSpace($configured)) {
+        if ($null -ne (Get-BenchmarkScratchDirectory)) {
+            throw "machine $BenchmarkScratchVariable is not configured"
+        }
+        return
+    }
+    if (-not [string]::IsNullOrWhiteSpace($BenchmarkScratchDirectory) -and
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            $configured,
+            [IO.Path]::GetFullPath($BenchmarkScratchDirectory)
+        )) {
+        throw "machine $BenchmarkScratchVariable is $configured, expected $BenchmarkScratchDirectory"
+    }
+    if (Test-SystemVolumePath $configured) {
+        throw "benchmark scratch must not use the system volume: $configured"
+    }
+    $item = Get-Item -LiteralPath $configured -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item -or -not $item.PSIsContainer) {
+        throw "benchmark scratch directory was not found: $configured"
+    }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "benchmark scratch directory must not be a reparse point: $configured"
+    }
+    Assert-ServiceDirectoryAcl -Path $configured -Writable
 }
 
 function Get-RelativePackageFiles {
@@ -1175,18 +1363,43 @@ function Build-Nvx {
 }
 
 function Enable-Whp {
-    $feature = Get-WindowsOptionalFeature `
-        -Online `
-        -FeatureName HypervisorPlatform
-    if ($feature.State -eq "Enabled") {
-        return $false
+    $features = @("HypervisorPlatform")
+    if ($RunnerOnly) {
+        $features += "Microsoft-Hyper-V"
     }
-    $result = Enable-WindowsOptionalFeature `
-        -Online `
-        -FeatureName HypervisorPlatform `
-        -All `
-        -NoRestart
-    return [bool]$result.RestartNeeded
+    $restartNeeded = $false
+    foreach ($featureName in $features) {
+        $feature = Get-WindowsOptionalFeature `
+            -Online `
+            -FeatureName $featureName
+        if ($feature.State -eq "Enabled") {
+            continue
+        }
+        $result = Enable-WindowsOptionalFeature `
+            -Online `
+            -FeatureName $featureName `
+            -All `
+            -NoRestart
+        $restartNeeded = [bool]$result.RestartNeeded -or $restartNeeded
+    }
+    return $restartNeeded
+}
+
+function Assert-PcatFirmware {
+    $system32 = Join-Path $env:SystemRoot "System32"
+    $pcatFirmware = @(
+        (Join-Path $system32 "vmfirmwarepcat.dll"),
+        (Join-Path $system32 "vmfirmware.dll")
+    )
+    if (@($pcatFirmware | Where-Object {
+                Test-Path -LiteralPath $_ -PathType Leaf
+            }).Count -eq 0) {
+        throw "Hyper-V PCAT firmware was not found under $system32"
+    }
+    $svgaFirmware = Join-Path $system32 "VmEmulatedDevices.dll"
+    if (-not (Test-Path -LiteralPath $svgaFirmware -PathType Leaf)) {
+        throw "Hyper-V SVGA firmware was not found: $svgaFirmware"
+    }
 }
 
 function Assert-Environment {
@@ -1211,7 +1424,13 @@ function Assert-Environment {
     }
     Assert-TrustedToolchainAcl
     $python = Get-PythonCommand
-    foreach ($command in @("git.exe", "rustup.exe", "cargo.exe", "cargo-nextest.exe")) {
+    foreach ($command in @(
+            "git.exe",
+            "rustup.exe",
+            "cargo.exe",
+            "cargo-nextest.exe",
+            "sccache.exe"
+        )) {
         [void](Get-RequiredCommand $command)
     }
 
@@ -1229,11 +1448,37 @@ function Assert-Environment {
             "cargo-nextest $([regex]::Escape($CargoNextestVersion))") {
         throw "cargo-nextest $CargoNextestVersion is not installed"
     }
+    $installedSccacheVersion = & (Get-RequiredCommand "sccache.exe") --version
+    Assert-LastExitCode "sccache --version"
+    if (($installedSccacheVersion -join "`n") -notmatch `
+            "sccache $([regex]::Escape($SccacheVersion))") {
+        throw "sccache $SccacheVersion is not installed"
+    }
+    if ($RunnerOnly) {
+        $expectedEnvironment = @{
+            CARGO_INCREMENTAL  = "0"
+            RUSTC_WRAPPER      = "sccache"
+            SCCACHE_CACHE_SIZE = "10G"
+            SCCACHE_DIR        = $SccacheDirectory
+        }
+        foreach ($entry in $expectedEnvironment.GetEnumerator()) {
+            if ([Environment]::GetEnvironmentVariable(
+                    $entry.Key,
+                    "Machine"
+                ) -ne $entry.Value) {
+                throw "machine $($entry.Key) is not configured"
+            }
+        }
+        Assert-ServiceDirectoryAcl -Path $SccacheDirectory -Writable
+        Assert-BenchmarkScratch
+    }
     $installedTargets = & (Get-RequiredCommand "rustup.exe") `
         target list --installed --toolchain $RustToolchain
     Assert-LastExitCode "rustup target list"
-    if ("x86_64-unknown-none" -notin @($installedTargets)) {
-        throw "Rust target x86_64-unknown-none is not installed"
+    foreach ($target in @("x86_64-unknown-none", "x86_64-unknown-uefi")) {
+        if ($target -notin @($installedTargets)) {
+            throw "Rust target $target is not installed"
+        }
     }
     if (-not (Test-VisualStudioBuildTools)) {
         throw "Visual Studio 2022 C++ tools and Windows SDK 26100 were not found"
@@ -1244,6 +1489,15 @@ function Assert-Environment {
         -FeatureName HypervisorPlatform
     if ($feature.State -ne "Enabled") {
         throw "Windows Hypervisor Platform is not enabled"
+    }
+    if ($RunnerOnly) {
+        $feature = Get-WindowsOptionalFeature `
+            -Online `
+            -FeatureName Microsoft-Hyper-V
+        if ($feature.State -ne "Enabled") {
+            throw "Hyper-V is not enabled"
+        }
+        Assert-PcatFirmware
     }
 
     if ($SkipWorkspace) {
@@ -1298,6 +1552,10 @@ if ($CheckOnly) {
 
 Assert-Administrator
 Install-Toolchain
+if ($RunnerOnly) {
+    Configure-SccacheEnvironment
+    Configure-BenchmarkScratch
+}
 $restartNeeded = Enable-Whp
 
 if ($restartNeeded) {

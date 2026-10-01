@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
 import re
 import shutil
 import stat
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,23 +19,56 @@ from http.client import HTTPMessage
 from pathlib import Path, PurePosixPath
 from typing import IO
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILD_DIR = REPO_ROOT / "build"
-SOURCE_DIR = BUILD_DIR / "sources"
-OPENVMM_DIR = REPO_ROOT / "openvmm"
+from .build_constants import (
+    BuildConstants,
+    OpenVMMBuildConstants,
+)
 
 
 class ScriptError(RuntimeError):
     """Raised for an actionable command-line workflow failure."""
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def remaining_timeout(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+
+def bytes_to_mib(value: int | float) -> float:
+    return value / (1024 * 1024)
+
+
 def artifact_path(name: str) -> Path:
-    return BUILD_DIR / name
+    return BuildConstants.BUILD_DIR / name
+
+
+def cache_root() -> Path:
+    configured = os.environ.get(BuildConstants.CACHE_ENVIRONMENT_VARIABLE)
+    return (
+        Path(configured).expanduser().resolve()
+        if configured
+        else (BuildConstants.REPO_ROOT / BuildConstants.CACHE_DIRECTORY_NAME).resolve()
+    )
 
 
 def openvmm_binary_path() -> Path:
-    suffix = ".exe" if os.name == "nt" else ""
-    return OPENVMM_DIR / "target" / "release" / f"openvmm{suffix}"
+    executable = (
+        OpenVMMBuildConstants.WINDOWS_BINARY_NAME
+        if os.name == "nt"
+        else OpenVMMBuildConstants.BINARY_NAME
+    )
+    return (
+        OpenVMMBuildConstants.DIRECTORY
+        / OpenVMMBuildConstants.TARGET_DIRECTORY_NAME
+        / OpenVMMBuildConstants.BUILD_PROFILE
+        / executable
+    )
 
 
 @dataclass(frozen=True)
@@ -84,6 +119,37 @@ def run_capture(
     return CommandResult(command, result.returncode, result.stdout, result.stderr)
 
 
+def git_output(*arguments: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(BuildConstants.REPO_ROOT), *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        timeout=30.0,
+    )
+    return completed.stdout.strip()
+
+
+def openvmm_git_state(directory: Path) -> tuple[str, bool]:
+    head = run_capture(["git", "-C", directory, "rev-parse", "HEAD"])
+    require_success(head, "OpenVMM revision query")
+    gitlink = run_capture(
+        ["git", "-C", BuildConstants.REPO_ROOT, "rev-parse", ":openvmm"]
+    )
+    require_success(gitlink, "OpenVMM gitlink query")
+    status = run_capture(["git", "-C", directory, "status", "--porcelain"])
+    require_success(status, "OpenVMM status query")
+    revision = head.stdout.decode("ascii").strip()
+    expected_revision = gitlink.stdout.decode("ascii").strip()
+    if revision != expected_revision:
+        raise ScriptError(
+            f"OpenVMM submodule is at {revision}, expected {expected_revision}"
+        )
+    return revision, not status.stdout.strip()
+
+
 def require_file(path: Path, description: str) -> Path:
     if not path.is_file():
         raise ScriptError(f"{description} not found: {path}")
@@ -127,7 +193,12 @@ def verify_sha256_sums(directory: Path) -> VerifiedChecksumInventory:
         raise ScriptError(f"source checksums must be a regular file: {checksum_file}")
     checksum_bytes = checksum_file.read_bytes()
     checksum_sha256 = hashlib.sha256(checksum_bytes).hexdigest()
-    checksum_text = checksum_bytes.decode("ascii")
+    try:
+        checksum_text = checksum_bytes.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ScriptError(
+            f"source checksums must contain only ASCII text: {checksum_file}"
+        ) from error
 
     packaged_files: set[str] = set()
     for path in directory.rglob("*"):
@@ -244,6 +315,8 @@ def download(
     headers: Mapping[str, str] | None = None,
     opener: urllib.request.OpenerDirector | None = None,
 ) -> None:
+    if attempts < 1:
+        raise ScriptError("download attempts must be positive")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f"{destination.name}.part")
     for attempt in range(1, attempts + 1):
@@ -284,6 +357,20 @@ def download(
             if attempt == attempts:
                 raise ScriptError(f"failed to download {url}: {error}") from error
             print(f">> download failed ({attempt}/{attempts}); retrying: {error}")
+
+
+def download_verified(url: str, destination: Path, expected_sha256: str) -> None:
+    if destination.is_file():
+        actual_sha256 = sha256_file(destination)
+        if actual_sha256 == expected_sha256:
+            return
+        print(
+            f">> discarding {destination.name}: SHA-256 is {actual_sha256}, "
+            f"expected {expected_sha256}"
+        )
+        destination.unlink()
+    print(f">> downloading {destination.name}")
+    download(url, destination, expected_sha256=expected_sha256)
 
 
 def format_size(size: int) -> str:

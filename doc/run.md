@@ -18,7 +18,15 @@ The CLI chooses WHP on Windows and KVM on Linux:
 python3 scripts/nvx.py run
 ```
 
-A successful boot prints `ALPINE-MICROVM-BOOT-OK` and opens a root shell.
+A successful Alpine boot prints both `ALPINE-MICROVM-BOOT-OK` and
+`NVX-GUEST-BOOT-OK: alpine`. Boot Ubuntu userland with the same NVX kernel:
+
+```bash
+python3 scripts/nvx.py run --guest ubuntu
+```
+
+Ubuntu defaults to 256 MiB and prints `NVX-GUEST-BOOT-OK: ubuntu`. It is
+Ubuntu userland with the NVX kernel, not a stock Ubuntu kernel or systemd VM.
 Exit cleanly from the guest with:
 
 ```sh
@@ -45,7 +53,7 @@ Select an explicit processor count after building the matching specialized guest
 python3 scripts/nvx.py run --machine microvm --processors 8
 ```
 
-The microVM uses fixed device topology, reserves a PVH status page, and uses
+The microVM uses fixed device topology, reserves a shared interrupt-status page, and uses
 shared-status edge-triggered virtio interrupts with 1, 2, 4, or 8 vCPUs.
 
 ## Run OpenVMM directly
@@ -83,6 +91,11 @@ For Linux/MSHV, use the `linux-mshv` archive and replace `kvm` with `mshv`.
 If the artifacts are already installed in the repository layout, use
 `openvmm/target/release/openvmm[.exe]`, `build/vmlinux`, and
 `build/initramfs.cpio.gz` instead of the paths above.
+
+For Ubuntu userland, use 256 MiB initially and select
+`guest/initramfs-ubuntu.cpio.gz` or
+`build/initramfs-ubuntu.cpio.gz` as the initrd. The kernel path remains
+unchanged.
 
 Direct OpenVMM launches accept generic directional network defaults:
 
@@ -165,6 +178,8 @@ translations and additions:
 
 | `nvx.py run` | Direct OpenVMM option |
 | --- | --- |
+| `--guest alpine` | `--initrd .../initramfs.cpio.gz` on a fresh boot |
+| `--guest ubuntu` | `--initrd .../initramfs-ubuntu.cpio.gz` and a 256 MiB default on a fresh boot |
 | `--hypervisor auto` | `--hypervisor kvm` on Linux or `--hypervisor whp` on Windows |
 | `--memory-mib N` | `--memory NM` |
 | `--memory-capacity-mib N` | `--memory-capacity NM` on a fresh boot |
@@ -173,7 +188,8 @@ translations and additions:
 
 Always include `--single-process`. When restoring, omit `--memory`, `--kernel`,
 and `--initrd`, and add `--restore-entropy`; the wrapper adds this option
-automatically. For example:
+automatically. Do not pass `--guest ubuntu` during restore; the captured RAM
+and machine contract already identify the restored guest. For example:
 
 ```bash
 ./bin/openvmm \
@@ -192,9 +208,9 @@ automatically. For example:
 
 `microvm` is now the only selector and launches the contract previously named
 `microvm-v2`. The `microvm-v2` spelling, the former one-vCPU ABI-1 behavior,
-ABI-1 device-I/O control, TTRPC numeric value 1, and ABI/PVH-layout-1 snapshot
-restore are removed. Snapshot metadata and performance series continue to use
-numeric ABI value 2 so existing ABI-2 artifacts are not reinterpreted as ABI 1.
+ABI-1 device-I/O control, TTRPC numeric value 1, ABI-1 snapshot restore, and
+boot-layout-1 snapshot restore are removed. Snapshot metadata and performance
+series continue to use numeric ABI value 2 and boot-layout value 2.
 Use NVX commit `cb52bcd454b454cb241096c33ed42a1dcdc65347` with OpenVMM commit
 `1b70365613517a10718e00284a62bdffbd80e41c`, or an earlier compatible pair, to
 run retired ABI-1 guests or snapshots.
@@ -273,20 +289,38 @@ The `sandbox` command launches the microVM with one to three compressed
 EROFS lower layers and one preformatted ext4 scratch image:
 
 ```bash
-python3 scripts/nvx.py sandbox \
-  --layer distro,/var/lib/nvx/distro.erofs,11111111-1111-1111-1111-111111111111 \
-  --layer runtime,/var/lib/nvx/runtime.erofs,22222222-2222-2222-2222-222222222222 \
-  --scratch /var/lib/nvx/scratch.ext4 \
-  --entrypoint /bin/workload \
-  --workload-user 65534:65534 \
-  --arg=--serve
+python3 scripts/nvx.py build-distro-layer \
+  --guest ubuntu \
+  --output build/ubuntu-distro.erofs
 ```
+
+Read the deterministic UUID from
+`build/ubuntu-distro.erofs.manifest.json`, create scratch independently with
+`mkfs.ext4`, then launch the Ubuntu workload through the existing Alpine
+control initramfs:
+
+```bash
+python3 scripts/nvx.py sandbox \
+  --layer distro,build/ubuntu-distro.erofs,11111111-1111-1111-1111-111111111111 \
+  --scratch /var/lib/nvx/scratch.ext4 \
+  --entrypoint /bin/sh \
+  --workload-user 65534:65534 \
+  --memory-mib 256
+```
+
+CI uses `/sbin/nvx-sandbox-smoke` as the entrypoint to verify Ubuntu identity,
+the fixed non-root account, and a scratch-backed `/tmp` write before clean
+guest exit. With `--arg TARGET --arg ro|rw`, it also checks a live share at
+`TARGET` as described below.
 
 The layer UUID is the EROFS superblock UUID, not a content digest. The command
 validates the files before launch, orders roles independently of option order,
 attaches layers read-only, and reserves the writable slot for scratch.
-Conversion and scratch formatting stay off the start path; prepare those
-artifacts on Linux with `mkfs.erofs` and `mkfs.ext4`.
+Conversion and scratch formatting stay off the start path. The Ubuntu
+converter verifies immutable inputs, applies the deny-by-default metadata
+policy, creates `/nonexistent` for UID/GID 65534, and invokes `mkfs.erofs`.
+Systemd entrypoints are explicitly unsupported and do not relax the non-root,
+drop-all-capabilities sandbox policy.
 
 This is the cold-filesystem bootstrap described in
 [the sandbox design](design/sandbox-filesystem-and-agent-architecture.md#implemented-filesystem-bootstrap), not the final
@@ -302,6 +336,45 @@ root; otherwise the workload is never started.
 The outer agent retains the initramfs root; the capability-stripped child
 enters only the assembled root with `chroot`, because Linux cannot
 `pivot_root` away from an initramfs `rootfs`.
+
+### Live host-directory share
+
+`sandbox run` and `sandbox provision` accept one
+`--mount GUEST_TARGET,HOST_PATH[,ro|rw]` (default `ro`) plus repeatable
+`--mount-deny HOST_PATH` rules. OpenVMM exports the host directory through its
+microVM virtio-fs device and enforces the access mode and denied paths on the
+host side, so edits are visible in both directions without staging or
+copy-back:
+
+```bash
+python3 scripts/nvx.py sandbox \
+  --layer distro,build/ubuntu-distro.erofs,11111111-1111-1111-1111-111111111111 \
+  --scratch /var/lib/nvx/scratch.ext4 \
+  --mount /workspace,/srv/checkout,rw \
+  --mount-deny .git/credentials \
+  --entrypoint /bin/sh
+```
+
+A relative `--mount-deny` path is resolved inside the exported host directory.
+After it assembles the container overlay and verifies the workload identity,
+the guest agent creates the target inside the container root and mounts the
+share there with `nosuid,nodev` before the workload enters its private mount
+namespace. A one-shot workload exit, a managed `stop`, and any failure after
+the share is mounted unmount it before the overlay is unmounted or the VM
+powers off. The target must be an absolute, canonical path; `/`, `/etc`, and
+the `/proc`, `/sys`, `/dev`, and `/.nvx-agent` trees are reserved for the
+container runtime.
+The guest refuses a target whose path crosses a symbolic link in a container
+layer, and any validation or mount failure aborts the sandbox with status 125
+instead of starting the workload without its share.
+
+Guest file permissions use the ownership and mode bits that OpenVMM reports
+for the exported files, so grant the selected workload identity access to the
+host directory. One share per microVM and the existing OpenVMM file-identity
+and symbolic-link policies apply. A managed sandbox stores the absolute host
+path in its configuration and reattaches the share on every `start`.
+
+### Managed lifecycle
 
 For a state-aware sandbox, provision configuration without starting a VM,
 start it once, run multiple workloads in the same warm guest, stop it while
@@ -331,7 +404,10 @@ Lifecycle transitions fail closed: `start` rejects an already-running or stale
 runtime record, `exec` and `stop` require a live OpenVMM process, and
 `deprovision` refuses to remove a running sandbox or unknown files. Managed
 workload arguments use the bounded control protocol rather than the kernel
-command line and may contain whitespace. The legacy operation-less `sandbox`
+command line and may contain whitespace. The workload sees one machine ID for
+the life of the VM. On `stop`, the guest agent unmounts the live share, overlay,
+layers, and scratch in dependency order before the VM powers off, as it does
+when a one-shot workload exits. The legacy operation-less `sandbox`
 form is `sandbox run`; it remains one-shot and rejects `--state-dir` or any
 request to retain VM state.
 

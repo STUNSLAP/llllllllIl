@@ -10,10 +10,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import nvx  # noqa: E402
-from nvx_tools import performance  # noqa: E402
+from nvx_tools import benchmark, performance  # noqa: E402
 
 COLD_START_LOG = """
     base                     :    101.0 ms  (min 100, max 102, n=5)
@@ -93,12 +94,6 @@ NETWORK_LOG = """
 """
 
 SHELL_SNAPSHOT_LOG = """
-== 64 MiB ==
-    cold boot           : median   510.0 ms   (min 500.0, max 1,510.0, n=5)
-             fast path   505.0 ms (n=4)  |  slow path  1510.0 ms (n=1, +~1005 ms TSC PIT-calib)
-    snapshot restore    : median     5.0 ms   (min 4.8, max 5.2, n=5)
-    speedup             : 101x (fast-path cold) .. 102x (median cold) faster via snapshot
-
 == 128 MiB ==
     cold boot           : median   520.0 ms   (min 510.0, max 530.0, n=5)
     snapshot restore    : median     5.5 ms   (min 5.3, max 5.7, n=5)
@@ -201,6 +196,26 @@ def lifecycle_document(
 
 
 class PerformanceTests(unittest.TestCase):
+    def test_ci_one_vcpu_metric_count_matches_collectors(self):
+        expected = len(
+            performance.SHARED_METRICS | performance.LIFECYCLE_METRICS
+        ) + len(performance.DEVICE_IO_METRIC_NAMES)
+        action = (
+            Path(__file__).parents[1]
+            / ".github"
+            / "actions"
+            / "run-benchmark"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(expected, 34)
+        self.assertIn("-ne 35 ]]", action)
+        self.assertIn("Count -ne 34", action)
+        self.assertEqual(
+            action.count("Expected 34 microVM one-vCPU metrics"),
+            2,
+        )
+
     def test_collect_cli_accepts_lifecycle_input(self):
         args = nvx.parse_args(
             [
@@ -268,6 +283,60 @@ class PerformanceTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(results[0].p50, 200.5)
+
+    def test_collects_restore_rss_after_remeasured_attempt(self):
+        mib = 1024 * 1024
+        attempts = [
+            (20.0, None, 5.0, 25.0),
+            *(
+                (19.0 + index / 10, (30 + index % 3) * mib, 5.0, 25.0)
+                for index in range(10)
+            ),
+        ]
+        with (
+            patch.object(benchmark, "measure_once", side_effect=attempts),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            restore = benchmark.benchmark(
+                ["openvmm"],
+                warmups=0,
+                runs=10,
+                timeout=1,
+                marker=benchmark.RESTORE_MARKER,
+                marker_must_be_line=True,
+                guest_exit_prequeued=True,
+            )
+        self.assertEqual(restore["peak_rss_remeasured_count"], 1)
+
+        document = lifecycle_document("mshv")
+        cast(dict[str, object], document["snapshot_restore"])["mshv"] = restore
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "acceptance.json"
+            source.write_text(json.dumps(document), encoding="utf-8")
+
+            result_path = performance.collect_openvmm_results(
+                "linux-mshv-virtual-machine", "abc123", source, root / "results"
+            )
+            rss = next(
+                result
+                for result in performance.read_results(result_path)
+                if result.metric == "openvmm_snapshot_restore_peak_rss"
+            )
+            self.assertEqual(rss.p50, 31.0)
+
+            samples = restore["peak_rss_samples_bytes"]
+            samples[7] = 0
+            restore["peak_rss_p50_bytes"] = int(statistics.median(samples))
+            restore["peak_rss_min_bytes"] = 0
+            source.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(
+                performance.PerformanceError,
+                r"snapshot_restore\.mshv\.peak_rss_min_bytes must be positive",
+            ):
+                performance.collect_openvmm_results(
+                    "linux-mshv-virtual-machine", "abc123", source, root / "rejected"
+                )
 
     def test_collects_openvmm_json_and_appends_diagnostics(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -443,6 +512,30 @@ class PerformanceTests(unittest.TestCase):
             1240.7679,
             1231.9344,
         ]
+        consecutive_stalls = [
+            778.5982,
+            770.1922,
+            1238.3559,
+            1250.9203,
+            1238.6946,
+            1260.9938,
+            1232.4539,
+            1251.3472,
+            727.1835,
+            755.3567,
+        ]
+        split_regimes = [
+            757.897,
+            739.761,
+            750.972,
+            740.019,
+            738.420,
+            977.413,
+            1255.833,
+            1271.877,
+            1266.763,
+            1232.285,
+        ]
         uniformly_slow = [1200.0 + index for index in range(10)]
         fast_outliers = [
             3.975,
@@ -476,6 +569,8 @@ class PerformanceTests(unittest.TestCase):
                 minority_fast_path,
                 r"split 2/8.*59\.8% gap.*idle host",
             ),
+            ("consecutive-stalls", consecutive_stalls, r"60\.4% above p25.*idle host"),
+            ("split-regimes", split_regimes, r"split 5/5.*29\.0% gap.*idle host"),
             ("uniform-slowdown", uniformly_slow, None),
             ("two-fast-outliers", fast_outliers, None),
             ("single-slow-outlier", single_slow_outlier, None),
@@ -746,15 +841,18 @@ class PerformanceTests(unittest.TestCase):
             )
             results = performance.read_results(result_path)
 
-            self.assertEqual(len(results), 31)
+            self.assertEqual(len(results), 29)
             by_metric = {result.metric: result for result in results}
             self.assertEqual(by_metric["cold_start_base"].p50, 101.0)
             self.assertEqual(by_metric["cold_start_cryptomgr_notests"].p50, 109.0)
             self.assertEqual(by_metric["virtfs_live_read"].p50, 1200.0)
             self.assertEqual(by_metric["virtfs_live_read"].direction, "higher")
             self.assertEqual(by_metric["network_snapshot_restore"].p50, 40.0)
-            self.assertEqual(by_metric["shell_snapshot_cold_64_mib"].p50, 510.0)
-            self.assertEqual(by_metric["shell_snapshot_cold_64_mib"].direction, "lower")
+            self.assertEqual(by_metric["shell_snapshot_cold_128_mib"].p50, 520.0)
+            self.assertEqual(
+                by_metric["shell_snapshot_cold_128_mib"].direction,
+                "lower",
+            )
             self.assertEqual(by_metric["shell_snapshot_restore_512_mib"].p50, 7.0)
             self.assertEqual(by_metric["openvmm_snapshot_generation"].p50, 31.0)
             self.assertEqual(
@@ -763,7 +861,7 @@ class PerformanceTests(unittest.TestCase):
             )
             markdown = (root / "summary.md").read_text(encoding="utf-8")
             self.assertIn("## Linux / KVM benchmark results", markdown)
-            self.assertEqual(markdown.count("\n| `"), 31)
+            self.assertEqual(markdown.count("\n| `"), 29)
             self.assertIn(
                 "| `virtfs_live_read` | 1200.00 MB/s | Higher is better |", markdown
             )
@@ -796,7 +894,7 @@ class PerformanceTests(unittest.TestCase):
             )
             results = performance.read_results(result_path)
 
-            self.assertEqual(len(results), 23)
+            self.assertEqual(len(results), 21)
             self.assertIn(
                 "network_snapshot_restore",
                 {result.metric for result in results},
@@ -816,7 +914,7 @@ class PerformanceTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 performance.PerformanceError,
-                r"exactly 23 metrics \(missing: network_snapshot_cold",
+                r"exactly 21 metrics \(missing: network_snapshot_cold",
             ):
                 performance.collect_results(
                     "linux-kvm",
@@ -1548,6 +1646,16 @@ class PerformanceTests(unittest.TestCase):
                 )
             )
 
+    def test_rejects_unreadable_benchmark_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            logs = Path(temporary)
+            (logs / performance.BENCHMARK_METADATA_FILENAME).mkdir()
+
+            with self.assertRaisesRegex(
+                performance.PerformanceError, "cannot read benchmark metadata"
+            ):
+                performance.read_workload_dimensions(logs, "linux-kvm-virtual-machine")
+
     def test_rejects_microvm_v3_dimensions(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1753,7 +1861,7 @@ class PerformanceTests(unittest.TestCase):
                 "virtfs_measured_runs": 10,
                 "payload_mib": 64,
                 "virtfs_memory_mib": 512,
-                "shell_memories_mib": [64, 128, 256, 512],
+                "shell_memories_mib": [128, 256, 512],
                 "network_memory_mib": 256,
             }
             (logs / performance.BENCHMARK_METADATA_FILENAME).write_text(

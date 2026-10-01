@@ -2,6 +2,7 @@
 # pyright: reportPrivateUsage=false
 
 import argparse
+import json
 import queue
 import shutil
 import socket
@@ -11,15 +12,19 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import nvx  # noqa: E402
 from nvx_tools import (  # noqa: E402
     benchmark,
+    common,
     control_session,
     microvm_tests,
     openvmm_process,
+)
+from nvx_tools.build_constants import (  # noqa: E402
+    BuildConstants,
 )
 
 
@@ -33,13 +38,54 @@ def _posix_shell() -> str | None:
     return shell
 
 
+def _vp_binding_profile(vp_indices: list[int]) -> bytes:
+    fields = "duration_ns=1 process_elapsed_ns=2 pid=3"
+    phases = [
+        "vp_bind_bsp" if index == 0 else f"vp_bind_ap_{index}" for index in vp_indices
+    ]
+    lines = [
+        f"OPENVMM_SNAPSHOT_PROFILE_V1 operation=startup phase={phase} "
+        f"exclusive=0 {fields}"
+        for phase in phases
+    ]
+    lines.append(
+        "OPENVMM_SNAPSHOT_PROFILE_V1 operation=startup phase=vp_thread_bind "
+        f"exclusive=1 {fields}"
+    )
+    return "".join(f"{line}\r\n" for line in lines).encode()
+
+
+def _restore_target(command: list[str]) -> int | None:
+    if "--restore-processors" not in command:
+        return None
+    return int(command[command.index("--restore-processors") + 1])
+
+
+def _restore_processors_measure(
+    backend: str,
+    *,
+    mshv_prefix: bool = True,
+) -> MagicMock:
+    def measure(command: list[str], **kwargs: object) -> None:
+        target = _restore_target(command)
+        vp_count = 8
+        if mshv_prefix and backend == "mshv" and target is not None:
+            vp_count = target
+        log_path = cast(Path, kwargs["log_path"])
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_bytes(_vp_binding_profile(list(range(vp_count))))
+
+    return MagicMock(side_effect=measure)
+
+
 class MicrovmTestParserTests(unittest.TestCase):
     def test_parser_defaults_to_all_correctness_scenarios(self):
         args = nvx.parse_args(["test-microvm", "--backend", "mshv"])
 
         self.assertIsNone(args.scenario)
         self.assertEqual(args.processors, [1, 2, 4, 8])
-        self.assertEqual(args.memory_mib, 128)
+        self.assertEqual(args.guest, "alpine")
+        self.assertIsNone(args.memory_mib)
         self.assertEqual(args.timeout, 60.0)
         self.assertIs(args.handler, microvm_tests.run)
 
@@ -62,6 +108,54 @@ class MicrovmTestParserTests(unittest.TestCase):
         self.assertEqual(args.scenario, ["smp"])
         self.assertEqual(args.processors, [2, 8])
         self.assertEqual(args.output_dir, Path("results"))
+
+    def test_parser_accepts_ubuntu_guest_profile(self):
+        args = nvx.parse_args(
+            [
+                "test-microvm",
+                "--backend",
+                "whp",
+                "--guest",
+                "ubuntu",
+                "--scenario",
+                "guest-boot",
+            ]
+        )
+
+        self.assertEqual(args.guest, "ubuntu")
+        self.assertIsNone(args.memory_mib)
+
+
+class GuestIdentityScriptTests(unittest.TestCase):
+    def test_guest_identity_checks_fail_before_success_markers(self):
+        descriptor = microvm_tests.guest_descriptor("ubuntu")
+        with (
+            patch.object(
+                microvm_tests,
+                "workload_boot_command",
+                return_value=["openvmm"],
+            ),
+            patch.object(microvm_tests, "run_guest_script") as run_guest_script,
+        ):
+            for runner in (
+                microvm_tests.run_guest_boot,
+                microvm_tests.run_guest_identity,
+            ):
+                with self.subTest(runner=runner.__name__):
+                    runner(
+                        Path("openvmm"),
+                        Path("kernel"),
+                        Path("initrd"),
+                        "whp",
+                        descriptor,
+                        memory_mib=256,
+                        timeout=60,
+                        log_path=Path("guest.log"),
+                    )
+                    self.assertTrue(
+                        run_guest_script.call_args.args[1].startswith("set -e\n")
+                    )
+                    run_guest_script.reset_mock()
 
 
 class ControlSessionTests(unittest.TestCase):
@@ -89,6 +183,39 @@ class ControlSessionTests(unittest.TestCase):
 
 
 class MicrovmTests(unittest.TestCase):
+    def test_host_loopback_listener_pair_retries_protocol_port_conflict(self):
+        first_udp = MagicMock()
+        first_udp.getsockname.return_value = ("127.0.0.1", 50000)
+        first_tcp = MagicMock()
+        first_tcp.bind.side_effect = PermissionError("TCP port is excluded")
+        second_udp = MagicMock()
+        second_udp.getsockname.return_value = ("127.0.0.1", 50001)
+        second_tcp = MagicMock()
+
+        with patch.object(
+            microvm_tests.socket,
+            "socket",
+            side_effect=[first_udp, first_tcp, second_udp, second_tcp],
+        ) as create_socket:
+            tcp_listener, udp_listener = microvm_tests._bind_tcp_udp_listener_pair(
+                5.0, microvm_tests.NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS
+            )
+
+        self.assertIs(tcp_listener, second_tcp)
+        self.assertIs(udp_listener, second_udp)
+        self.assertEqual(create_socket.call_count, 4)
+        first_udp.bind.assert_called_once_with(("127.0.0.1", 0))
+        first_tcp.bind.assert_called_once_with(("0.0.0.0", 50000))
+        first_tcp.close.assert_called_once_with()
+        first_udp.close.assert_called_once_with()
+        second_udp.bind.assert_called_once_with(("127.0.0.1", 0))
+        second_tcp.bind.assert_called_once_with(("0.0.0.0", 50001))
+        second_tcp.listen.assert_called_once_with(1)
+        second_tcp.settimeout.assert_called_once_with(5.0)
+        second_udp.settimeout.assert_called_once_with(
+            microvm_tests.NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS
+        )
+
     def test_host_loopback_rejections_cover_generic_allow_and_explicit_denial(self):
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(microvm_tests, "OpenvmmProcess") as process:
@@ -410,6 +537,149 @@ class MicrovmTests(unittest.TestCase):
             "printf 'sensitive-output-value\\n'; /sbin/nvx-exit 37"
         )
 
+    def test_structured_outcome_rejects_boolean_schema_version(self):
+        report = self._outcome_report(
+            "whp",
+            outcome={
+                "operation": "run",
+                "category": "guest-exit",
+                "status_code": 0,
+            },
+            policy={
+                "status": "applied",
+                "status_code": 0,
+                "mode": "rules",
+                "allow_rule_count": 0,
+                "deny_rule_count": 0,
+                "host_loopback": "deny",
+            },
+        )
+        report["schema_version"] = True
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "outcome.json"
+            path.write_text(json.dumps(report), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "unsupported version"):
+                microvm_tests._read_outcome_report(path)
+
+    def test_structured_outcome_preserves_invalid_primary_report(self):
+        report = self._outcome_report(
+            "whp",
+            outcome={
+                "operation": "run",
+                "category": "guest-exit",
+                "status_code": 37,
+            },
+            policy={
+                "status": "applied",
+                "status_code": 0,
+                "mode": "rules",
+                "allow_rule_count": 2,
+                "deny_rule_count": 1,
+                "host_loopback": "deny",
+            },
+        )
+        teardown = cast(dict[str, object], report["teardown"])
+        teardown[next(iter(teardown))] = False
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            with (
+                patch.object(microvm_tests, "OpenvmmProcess") as process,
+                patch.object(
+                    microvm_tests,
+                    "_read_outcome_report",
+                    return_value=report,
+                ),
+            ):
+                active = process.return_value.__enter__.return_value
+                active.wait.return_value = openvmm_process.OpenvmmProcessResult(
+                    37, b"sensitive-output-value\n"
+                )
+                with self.assertRaisesRegex(RuntimeError, "incomplete teardown"):
+                    microvm_tests.run_structured_outcome(
+                        Path("openvmm"),
+                        Path("kernel"),
+                        Path("initrd"),
+                        "whp",
+                        memory_mib=128,
+                        timeout=40,
+                        output_dir=output,
+                    )
+            preserved = json.loads(
+                (output / "structured-outcome.json").read_text(encoding="utf-8")
+            )
+        self.assertEqual(preserved, report)
+
+    def test_structured_outcome_preserves_invalid_rejection_report(self):
+        applied = self._outcome_report(
+            "whp",
+            outcome={
+                "operation": "run",
+                "category": "guest-exit",
+                "status_code": 37,
+            },
+            policy={
+                "status": "applied",
+                "status_code": 0,
+                "mode": "rules",
+                "allow_rule_count": 2,
+                "deny_rule_count": 1,
+                "host_loopback": "deny",
+            },
+        )
+        rejected = self._outcome_report(
+            "whp",
+            outcome={
+                "operation": "run",
+                "category": "vmm-failure",
+                "status_code": 1,
+            },
+            policy={
+                "status": "failed",
+                "status_code": 1,
+                "mode": "rules",
+                "allow_rule_count": 1,
+                "deny_rule_count": 0,
+                "host_loopback": "allow",
+            },
+        )
+        teardown = cast(dict[str, object], rejected["teardown"])
+        teardown[next(iter(teardown))] = False
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            with (
+                patch.object(microvm_tests, "OpenvmmProcess") as process,
+                patch.object(
+                    microvm_tests,
+                    "_read_outcome_report",
+                    side_effect=(applied, rejected),
+                ),
+            ):
+                active = process.return_value.__enter__.return_value
+                active.wait.side_effect = (
+                    openvmm_process.OpenvmmProcessResult(
+                        37, b"sensitive-output-value\n"
+                    ),
+                    openvmm_process.OpenvmmProcessResult(
+                        2, b"--network-egress is required\n"
+                    ),
+                )
+                with self.assertRaisesRegex(RuntimeError, "leaked host resources"):
+                    microvm_tests.run_structured_outcome(
+                        Path("openvmm"),
+                        Path("kernel"),
+                        Path("initrd"),
+                        "whp",
+                        memory_mib=128,
+                        timeout=40,
+                        output_dir=output,
+                    )
+            preserved = json.loads(
+                (output / "structured-outcome-rejected.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        self.assertEqual(preserved, rejected)
+
     def test_console_exit_preserves_full_output_and_guest_status(self):
         expected = (
             b"x" * microvm_tests.CONSOLE_EXIT_PAYLOAD_BYTES
@@ -544,9 +814,9 @@ class MicrovmTests(unittest.TestCase):
         interaction.assert_not_called()
 
     def test_snapshot_restore_uses_batched_port_io_and_zero_expansion_path(self):
-        snapshot = (Path(__file__).parents[1] / "alpine" / "nvx-snapshot").read_text(
-            encoding="utf-8"
-        )
+        snapshot = (
+            Path(__file__).parents[1] / "guest" / "common" / "nvx-snapshot"
+        ).read_text(encoding="utf-8")
 
         self.assertIn(
             '/sbin/nvx-port-io read-restore-packet 233 234 "$restore_packet"',
@@ -569,6 +839,12 @@ class MicrovmTests(unittest.TestCase):
         self.assertNotIn("dd of=/dev/port", snapshot)
         self.assertIn('[ "$range_count" -eq 0 ]', snapshot)
         self.assertIn("RESTORE_MEMORY_EXPANSION_AVAILABLE=16", snapshot)
+        self.assertIn('console_status "NVX-SNAPSHOT-ERROR: $*"', snapshot)
+        for stage in ("packet", "entropy", "identity", "runtime-hook", "acknowledge"):
+            self.assertIn(
+                f'console_status "NVX-POST-RESTORE-STAGE: {stage}"',
+                snapshot,
+            )
         self.assertIn(
             '"NVX-MEMORY-ONLINE-OK: added_bytes=0 '
             'memtotal_kib=$memtotal_kib elapsed_us=0"',
@@ -579,6 +855,60 @@ class MicrovmTests(unittest.TestCase):
         )
         packet_restore = snapshot.index("    post_restore\n")
         self.assertLess(zero_expansion_fast_path, packet_restore)
+
+    def test_snapshot_console_diagnostics_are_nonfatal_and_ordered(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        snapshot = (
+            Path(__file__).parents[1] / "guest" / "common" / "nvx-snapshot"
+        ).read_text(encoding="utf-8")
+
+        markers = [
+            'console_status "NVX-POST-RESTORE-STAGE: packet"',
+            'console_status "NVX-POST-RESTORE-STAGE: entropy"',
+            'console_status "NVX-POST-RESTORE-STAGE: identity"',
+            'console_status "NVX-POST-RESTORE-STAGE: runtime-hook"',
+            'console_status "NVX-POST-RESTORE-STAGE: acknowledge"',
+        ]
+        positions = [snapshot.index(marker) for marker in markers]
+        self.assertEqual(positions, sorted(positions))
+
+        functions_start = snapshot.index("console_status() {")
+        functions_end = snapshot.index("\n}\n\ncleanup()", functions_start) + 3
+        functions = snapshot[functions_start:functions_end]
+        functions = functions.replace(">/dev/console", '>"$console_target"')
+        functions = functions.replace("/sbin/nvx-exit", "nvx_exit")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            console_target = root / "console-directory"
+            console_target.mkdir()
+            exit_record = root / "exit-record"
+            result = subprocess.run(
+                [shell, "-s", "--", str(console_target), str(exit_record)],
+                input=(
+                    "set -eu\n"
+                    "console_target=$1\n"
+                    "exit_record=$2\n"
+                    "post_restore_pending=false\n"
+                    'nvx_exit() { printf "%s\\n" "$1" >"$exit_record"; }\n'
+                    f"{functions}\n"
+                    'console_status "unavailable console is non-fatal"\n'
+                    'fail_closed "synthetic restore failure"\n'
+                ),
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(exit_record.read_text(encoding="ascii"), "1\n")
+            self.assertEqual(
+                result.stderr,
+                "nvx-snapshot: synthetic restore failure; terminating the VM\n",
+            )
 
     def test_console_log_persists_buffered_and_completed_output(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -634,6 +964,30 @@ class MicrovmTests(unittest.TestCase):
                 self.assertEqual(result.output, b"BEGIN-END\n")
                 self.assertEqual(log_path.read_bytes(), result.output)
                 self.assertEqual(queues.return_value.get.call_count, 4)
+
+    def test_process_wait_clamps_elapsed_process_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(openvmm_process, "InteractiveProcess") as interaction,
+                patch.object(openvmm_process.threading, "Thread"),
+                patch.object(openvmm_process.queue, "Queue") as queues,
+                patch.object(
+                    openvmm_process.time,
+                    "monotonic",
+                    side_effect=[0.0, 0.25, 2.0],
+                ),
+            ):
+                interaction.return_value.process.poll.return_value = 0
+                interaction.return_value.process.wait.return_value = 0
+                queues.return_value.get.return_value = None
+                queues.return_value.get_nowait.side_effect = queue.Empty
+                with openvmm_process.OpenvmmProcess(
+                    ["openvmm"], Path(temporary) / "output.log"
+                ) as process:
+                    process.wait(1.0)
+                interaction.return_value.process.wait.assert_called_once_with(
+                    timeout=0.0
+                )
 
     def test_process_wait_for_accepts_marker_after_process_exit(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -750,6 +1104,21 @@ class MicrovmTests(unittest.TestCase):
         self.assertEqual(console.output, output)
         console.close()
         peer.close()
+
+    def test_tcp_console_connect_closes_failed_connection(self):
+        failed = MagicMock()
+        failed.setsockopt.side_effect = OSError("configuration failed")
+        connected = MagicMock()
+        with patch.object(
+            openvmm_process.socket,
+            "create_connection",
+            side_effect=(failed, connected),
+        ):
+            console = openvmm_process.TcpConsole.connect(("127.0.0.1", 1), 1.0)
+
+        failed.close.assert_called_once_with()
+        console.close()
+        connected.close.assert_called_once_with()
 
     def test_snapshot_core_script_selects_backend_clocksource(self):
         kvm = microvm_tests._snapshot_core_script("kvm")
@@ -879,7 +1248,7 @@ class MicrovmTests(unittest.TestCase):
                 if expected_returncode:
                     self.assertIn("NVX-SNAPSHOT-CORE-FAIL code=46", result.stdout)
 
-    def test_snapshot_core_waits_for_no_destination_marker_before_exit(self):
+    def test_snapshot_core_waits_for_no_destination_marker_line_before_exit(self):
         events: list[tuple[str, bytes | str | None]] = []
         marker = b"NVX-SNAPSHOT-NO-DESTINATION-OK"
 
@@ -900,6 +1269,9 @@ class MicrovmTests(unittest.TestCase):
 
             def wait_for(self, expected: bytes, _timeout: float) -> None:
                 events.append(("wait_for", expected))
+
+            def wait_for_line(self, expected: bytes, _timeout: float) -> None:
+                events.append(("wait_for_line", expected))
 
             def send_line(self, line: str) -> None:
                 events.append(("send_line", line))
@@ -935,7 +1307,7 @@ class MicrovmTests(unittest.TestCase):
             [
                 ("wait_for", microvm_tests.BOOT_MARKER),
                 ("send_line", "nvx-snapshot; echo NVX-SNAPSHOT-NO-DESTINATION-OK"),
-                ("wait_for", marker),
+                ("wait_for_line", marker),
                 ("send_line", "nvx-exit 0"),
                 ("wait", None),
             ],
@@ -948,11 +1320,31 @@ class MicrovmTests(unittest.TestCase):
             b"12",
         )
         self.assertEqual(
+            microvm_tests._single_framed_marker_value(
+                b"FRAME-17-END[kernel output]\n",
+                b"FRAME-",
+                b"-END",
+            ),
+            b"17",
+        )
+        self.assertEqual(
             microvm_tests._parse_marker_pair(output, b"PAIR-"),
             (4, 5),
         )
         with self.assertRaisesRegex(RuntimeError, "exactly one"):
             microvm_tests._single_marker_value(b"X-1\nX-2\n", b"X-")
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
+            microvm_tests._single_framed_marker_value(
+                b"FRAME-17-ENDFRAME-34-END",
+                b"FRAME-",
+                b"-END",
+            )
+        with self.assertRaisesRegex(RuntimeError, "malformed"):
+            microvm_tests._single_framed_marker_value(
+                b"FRAME-17",
+                b"FRAME-",
+                b"-END",
+            )
         with self.assertRaisesRegex(RuntimeError, "malformed"):
             microvm_tests._parse_marker_pair(b"PAIR-4\n", b"PAIR-")
 
@@ -1046,6 +1438,21 @@ class MicrovmTests(unittest.TestCase):
         self.assertIn("/sbin/nvx-snapshot\n", checkpoint)
         self.assertIn("captured-workload-id", checkpoint)
         self.assertNotIn("@CAPTURE_ACTION@", checkpoint)
+
+    def test_snapshot_tier_entry_points_reject_unsupported_tiers(self):
+        with self.assertRaisesRegex(ValueError, "unsupported snapshot tier 'invalid'"):
+            microvm_tests._snapshot_tier_script("invalid")
+        with self.assertRaisesRegex(ValueError, "unsupported snapshot tier 'invalid'"):
+            microvm_tests._run_snapshot_tier(
+                "invalid",
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=60,
+                output_dir=Path("logs"),
+            )
 
     def test_snapshot_tier_runner_dispatches_all_tiers(self):
         with patch.object(microvm_tests, "_run_snapshot_tier") as run_tier:
@@ -1371,6 +1778,7 @@ class MicrovmTests(unittest.TestCase):
     def test_restore_processors_uses_capacity_eight_and_each_target(self):
         with tempfile.TemporaryDirectory() as temporary:
             output_dir = Path(temporary) / "logs"
+            measure_once = _restore_processors_measure("mshv")
             with (
                 patch.object(
                     microvm_tests,
@@ -1378,7 +1786,7 @@ class MicrovmTests(unittest.TestCase):
                     return_value=["openvmm", "boot"],
                 ) as workload_boot_command,
                 patch.object(microvm_tests, "capture_snapshot") as capture_snapshot,
-                patch.object(microvm_tests, "measure_once") as measure_once,
+                patch.object(microvm_tests, "measure_once", measure_once),
                 patch.object(
                     microvm_tests,
                     "_snapshot_fingerprint",
@@ -1395,18 +1803,29 @@ class MicrovmTests(unittest.TestCase):
                     timeout=60,
                     output_dir=output_dir,
                 )
+            logs = sorted(path.name for path in output_dir.iterdir())
 
         self.assertEqual(workload_boot_command.call_args.kwargs["processors"], 8)
         self.assertEqual(
             workload_boot_command.call_args.args[5], "quiet loglevel=0 maxcpus=1"
         )
         self.assertEqual(capture_snapshot.call_args.kwargs["processors"], 1)
-        self.assertEqual(measure_once.call_count, 4)
+        self.assertEqual(measure_once.call_count, 5)
         self.assertTrue(
             all(
                 entry.kwargs["guest_exit_prequeued"]
                 for entry in measure_once.call_args_list
             )
+        )
+        self.assertTrue(
+            all(
+                entry.kwargs["environment"][benchmark.SNAPSHOT_PROFILE_ENV] == "1"
+                for entry in measure_once.call_args_list
+            )
+        )
+        self.assertEqual(
+            [_restore_target(entry.args[0]) for entry in measure_once.call_args_list],
+            [1, 2, 4, 8, None],
         )
         self.assertEqual(
             [entry.kwargs["marker"] for entry in measure_once.call_args_list],
@@ -1415,16 +1834,139 @@ class MicrovmTests(unittest.TestCase):
                 b"NVX-RESTORE-PROCESSORS-OK count=2",
                 b"NVX-RESTORE-PROCESSORS-OK count=4",
                 b"NVX-RESTORE-PROCESSORS-OK count=8",
+                b"NVX-RESTORE-PROCESSORS-OK count=1",
             ],
         )
+        self.assertEqual(
+            logs,
+            [
+                "restore-processors-1.log",
+                "restore-processors-2.log",
+                "restore-processors-4.log",
+                "restore-processors-8.log",
+                "restore-processors-untargeted.log",
+            ],
+        )
+
+    def test_restore_processors_rejects_full_capacity_mshv_prefix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(microvm_tests, "capture_snapshot"),
+                patch.object(
+                    microvm_tests,
+                    "measure_once",
+                    _restore_processors_measure("mshv", mshv_prefix=False),
+                ),
+                patch.object(
+                    microvm_tests,
+                    "_snapshot_fingerprint",
+                    return_value=("manifest", "state", "memory"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"restore target 2 bound VPs \[0, 1, 2, 3, 4, 5, 6, 7\] on mshv; "
+                    r"expected exactly VPs 0\.\.1 of capacity 8",
+                ):
+                    microvm_tests.run_restore_processors(
+                        Path("openvmm"),
+                        Path("vmlinux"),
+                        Path("initrd"),
+                        "mshv",
+                        [2],
+                        memory_mib=128,
+                        timeout=60,
+                        output_dir=Path(temporary),
+                    )
+
+    def test_restore_processors_requires_full_capacity_off_mshv(self):
+        for backend in ("kvm", "whp"):
+            with self.subTest(backend=backend):
+                with tempfile.TemporaryDirectory() as temporary:
+
+                    def measure(command: list[str], **kwargs: object) -> None:
+                        log_path = cast(Path, kwargs["log_path"])
+                        log_path.write_bytes(_vp_binding_profile([0, 1]))
+
+                    with (
+                        patch.object(microvm_tests, "capture_snapshot"),
+                        patch.object(
+                            microvm_tests, "measure_once", side_effect=measure
+                        ),
+                        patch.object(
+                            microvm_tests,
+                            "_snapshot_fingerprint",
+                            return_value=("manifest", "state", "memory"),
+                        ),
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            rf"restore target 2 bound VPs \[0, 1\] on {backend}; "
+                            r"expected exactly VPs 0\.\.7 of capacity 8",
+                        ):
+                            microvm_tests.run_restore_processors(
+                                Path("openvmm"),
+                                Path("vmlinux"),
+                                Path("initrd"),
+                                backend,
+                                [2],
+                                memory_mib=128,
+                                timeout=60,
+                                output_dir=Path(temporary),
+                            )
+
+    def test_restore_vp_bindings_require_one_complete_record_set(self):
+        profile = _vp_binding_profile([0, 1])
+        self.assertEqual(microvm_tests._restore_vp_bindings(profile), [0, 1])
+        self.assertEqual(
+            microvm_tests._restore_vp_bindings(b"guest output\n" + profile),
+            [0, 1],
+        )
+        self.assertEqual(
+            microvm_tests._restore_vp_bindings(
+                profile.replace(
+                    b"operation=startup phase=vp_thread_bind",
+                    b"phase=vp_thread_bind operation=startup",
+                )
+            ),
+            [0, 1],
+        )
+        self.assertEqual(
+            microvm_tests._restore_vp_bindings(
+                profile + profile.replace(b"operation=startup", b"operation=restore")
+            ),
+            [0, 1],
+        )
+        microvm_tests._check_restore_vp_bindings(profile, "mshv", target=2, capacity=8)
+        with self.assertRaisesRegex(RuntimeError, r"bound VPs \[0, 1, 1\]"):
+            microvm_tests._check_restore_vp_bindings(
+                _vp_binding_profile([0, 1, 1]), "mshv", target=2, capacity=8
+            )
+        with self.assertRaisesRegex(RuntimeError, r"untargeted restore bound VPs"):
+            microvm_tests._check_restore_vp_bindings(
+                profile, "mshv", target=None, capacity=8
+            )
+        with self.assertRaisesRegex(RuntimeError, r"found 0"):
+            microvm_tests._restore_vp_bindings(b"")
+        with self.assertRaisesRegex(RuntimeError, r"found 2"):
+            microvm_tests._restore_vp_bindings(profile + profile)
+        with self.assertRaisesRegex(RuntimeError, r"malformed VP binding"):
+            microvm_tests._restore_vp_bindings(
+                profile.replace(b"vp_bind_ap_1", b"vp_bind_ap_x")
+            )
+        with self.assertRaises(ValueError):
+            microvm_tests._restore_vp_bindings(
+                profile.replace(b"exclusive=0", b"exclusive=2")
+            )
 
     def test_restore_tsc_sync_forces_linux_warp_check_and_keeps_failure_guard(self):
         for backend in ("kvm", "mshv", "whp"):
             with self.subTest(backend=backend):
+                measure = _restore_processors_measure(backend)
                 with tempfile.TemporaryDirectory() as temporary:
                     with (
                         patch.object(microvm_tests, "capture_snapshot") as capture,
-                        patch.object(microvm_tests, "measure_once") as measure,
+                        patch.object(microvm_tests, "measure_once", measure),
                         patch.object(
                             microvm_tests,
                             "_snapshot_fingerprint",
@@ -1455,13 +1997,10 @@ class MicrovmTests(unittest.TestCase):
                     script.endswith(microvm_tests._read_script("restore-processors.sh"))
                 )
                 self.assertEqual(capture.call_args.kwargs["processors"], 1)
-                self.assertEqual(measure.call_count, 4)
+                self.assertEqual(measure.call_count, 5)
                 self.assertEqual(
-                    [
-                        call.args[0][call.args[0].index("--restore-processors") + 1]
-                        for call in measure.call_args_list
-                    ],
-                    ["1", "2", "4", "8"],
+                    [_restore_target(call.args[0]) for call in measure.call_args_list],
+                    [1, 2, 4, 8, None],
                 )
 
     def test_restore_tsc_sync_rejects_an_ineffective_cpu_feature_mask(self):
@@ -1543,6 +2082,372 @@ class MicrovmTests(unittest.TestCase):
                         "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc", result.stdout
                     )
 
+    def test_restore_processors_fail_fast_and_record_restored_tsc_logs(self):
+        for check_tsc_sync in (False, True):
+            with self.subTest(check_tsc_sync=check_tsc_sync):
+                measure = _restore_processors_measure("mshv")
+                with tempfile.TemporaryDirectory() as temporary:
+                    with (
+                        patch.object(microvm_tests, "capture_snapshot"),
+                        patch.object(microvm_tests, "measure_once", measure),
+                        patch.object(
+                            microvm_tests,
+                            "_snapshot_fingerprint",
+                            return_value=("manifest", "state", "memory"),
+                        ),
+                    ):
+                        microvm_tests.run_restore_processors(
+                            Path("openvmm"),
+                            Path("vmlinux"),
+                            Path("initrd"),
+                            "mshv",
+                            [2, 8],
+                            memory_mib=128,
+                            timeout=60,
+                            output_dir=Path(temporary),
+                            check_tsc_sync=check_tsc_sync,
+                        )
+
+                self.assertEqual(measure.call_count, 3)
+                for entry in measure.call_args_list:
+                    self.assertEqual(
+                        entry.kwargs["failure_marker"],
+                        b"NVX-RESTORE-PROCESSORS-FAIL",
+                    )
+                    environment = entry.kwargs["environment"]
+                    self.assertEqual(
+                        environment["OPENVMM_LOG"],
+                        "off,vmm_core::partition_unit::vp_set::tsc=debug,"
+                        "virt_mshv::x86_64::tsc=info",
+                    )
+                    self.assertEqual(environment[benchmark.SNAPSHOT_PROFILE_ENV], "1")
+
+    def test_restore_processors_classifies_unstable_tsc_with_fresh_boot_control(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            passing = _restore_processors_measure("mshv")
+
+            def measure(command: list[str], **kwargs: object) -> None:
+                if _restore_target(command) == 4:
+                    raise benchmark.GuestFailureReported(
+                        "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc",
+                        "Measured 45 cycles TSC warp between CPUs\r\n",
+                    )
+                passing(command, **kwargs)
+
+            with (
+                patch.object(microvm_tests, "capture_snapshot"),
+                patch.object(
+                    microvm_tests, "measure_once", side_effect=measure
+                ) as measure_once,
+                patch.object(
+                    microvm_tests,
+                    "_snapshot_fingerprint",
+                    return_value=("manifest", "state", "memory"),
+                ),
+                patch.object(
+                    microvm_tests,
+                    "run_fresh_boot_tsc_control",
+                    return_value="fresh-boot TSC control: verdict",
+                ) as control,
+                patch.object(
+                    microvm_tests,
+                    "_host_invariant_tsc_note",
+                    return_value="host clock: note\n",
+                ),
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    microvm_tests.run_restore_processors(
+                        Path("openvmm"),
+                        Path("vmlinux"),
+                        Path("initrd"),
+                        "mshv",
+                        [1, 2, 4, 8],
+                        memory_mib=192,
+                        timeout=30,
+                        output_dir=output_dir,
+                        check_tsc_sync=True,
+                    )
+
+        self.assertEqual(
+            str(raised.exception),
+            "restore target 4: guest reported "
+            "NVX-RESTORE-PROCESSORS-FAIL unstable-tsc\n"
+            "fresh-boot TSC control: verdict\n"
+            "host clock: note\n"
+            "--- OpenVMM output ---\n"
+            "Measured 45 cycles TSC warp between CPUs\r\n",
+        )
+        self.assertIsInstance(
+            raised.exception.__cause__, benchmark.GuestFailureReported
+        )
+        self.assertEqual(measure_once.call_count, 3)
+        control.assert_called_once_with(
+            Path("openvmm"),
+            Path("vmlinux"),
+            Path("initrd"),
+            "mshv",
+            memory_mib=192,
+            timeout=30,
+            log_path=output_dir / "restore-processors-tsc-control.log",
+        )
+
+    def test_host_invariant_tsc_note_reads_the_cpu_flags(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cpuinfo = Path(temporary) / "cpuinfo"
+            cases = (
+                (
+                    "processor\t: 0\nflags\t\t: fpu tsc constant_tsc nonstop_tsc\n",
+                    "host CPU exposes an invariant TSC (nonstop_tsc)\n",
+                ),
+                (
+                    "processor\t: 0\nflags\t\t: fpu tsc constant_tsc tsc_known_freq\n",
+                    "host CPU does not expose an invariant TSC (nonstop_tsc); "
+                    "guests on this host intermittently see cross-vCPU TSC warps\n",
+                ),
+                ("processor\t: 0\n", ""),
+            )
+            for text, expected in cases:
+                with self.subTest(text=text):
+                    cpuinfo.write_text(text, encoding="utf-8")
+                    self.assertEqual(
+                        microvm_tests._host_invariant_tsc_note(cpuinfo), expected
+                    )
+            self.assertEqual(
+                microvm_tests._host_invariant_tsc_note(Path(temporary) / "missing"),
+                "",
+            )
+
+    def test_restore_processors_reports_other_guest_failures_without_control(self):
+        failure = benchmark.GuestFailureReported(
+            "NVX-RESTORE-PROCESSORS-FAIL expected=0-3 actual=0-2", "tail"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(microvm_tests, "capture_snapshot"),
+                patch.object(microvm_tests, "measure_once", side_effect=failure),
+                patch.object(
+                    microvm_tests,
+                    "_snapshot_fingerprint",
+                    return_value=("manifest", "state", "memory"),
+                ),
+                patch.object(microvm_tests, "run_fresh_boot_tsc_control") as control,
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    microvm_tests.run_restore_processors(
+                        Path("openvmm"),
+                        Path("vmlinux"),
+                        Path("initrd"),
+                        "kvm",
+                        [4],
+                        memory_mib=128,
+                        timeout=60,
+                        output_dir=Path(temporary),
+                    )
+
+        self.assertEqual(
+            str(raised.exception),
+            "restore target 4: guest reported "
+            "NVX-RESTORE-PROCESSORS-FAIL expected=0-3 actual=0-2\n"
+            "--- OpenVMM output ---\ntail",
+        )
+        self.assertIs(raised.exception.__cause__, failure)
+        control.assert_not_called()
+
+    def test_fresh_boot_tsc_control_forces_the_warp_check_on_every_processor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "control.log"
+            result: benchmark.GuestCommandResult = {
+                "text": (
+                    '> echo "NVX-TSC-CONTROL-RESULT unstable activations=0"\r\n'
+                    "NVX-TSC-CONTROL-RESULT stable activations=147\r\n"
+                ),
+                "wall_ms": 1.0,
+                "peak_rss_bytes": 1,
+            }
+            with (
+                patch.object(
+                    microvm_tests,
+                    "workload_boot_command",
+                    return_value=["openvmm", "boot"],
+                ) as workload_boot_command,
+                patch.object(
+                    microvm_tests, "run_guest_script", return_value=result
+                ) as run_guest_script,
+            ):
+                verdict = microvm_tests.run_fresh_boot_tsc_control(
+                    Path("openvmm"),
+                    Path("vmlinux"),
+                    Path("initrd"),
+                    "kvm",
+                    memory_mib=128,
+                    timeout=45,
+                    log_path=log_path,
+                )
+
+        self.assertEqual(
+            verdict,
+            "fresh-boot TSC control: no TSC instability across 147 CPU "
+            "activations without snapshot restore",
+        )
+        self.assertEqual(
+            workload_boot_command.call_args.args,
+            (
+                Path("openvmm"),
+                "kvm",
+                Path("vmlinux"),
+                Path("initrd"),
+                128,
+                "quiet loglevel=0 clearcpuid=tsc_adjust",
+            ),
+        )
+        self.assertEqual(workload_boot_command.call_args.kwargs, {"processors": 8})
+        command, script, marker = run_guest_script.call_args.args
+        self.assertEqual(command, ["openvmm", "boot"])
+        self.assertEqual(
+            script,
+            microvm_tests._render_script(
+                "tsc-sync-control.sh.in", PROCESSORS="8", ROUNDS="20"
+            ),
+        )
+        self.assertNotIn("@", script)
+        self.assertEqual(marker, b"NVX-TSC-CONTROL-DONE")
+        self.assertEqual(
+            run_guest_script.call_args.kwargs, {"timeout": 45, "log_path": log_path}
+        )
+
+    def test_fresh_boot_tsc_control_reports_its_own_failure(self):
+        with patch.object(
+            microvm_tests,
+            "run_guest_script",
+            side_effect=TimeoutError("guest workload did not finish within 45s\ntail"),
+        ):
+            verdict = microvm_tests.run_fresh_boot_tsc_control(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "mshv",
+                memory_mib=128,
+                timeout=45,
+                log_path=Path("control.log"),
+            )
+
+        self.assertEqual(
+            verdict,
+            "fresh-boot TSC control did not complete: "
+            "guest workload did not finish within 45s",
+        )
+
+    def test_tsc_control_verdict_accepts_only_guest_result_lines(self):
+        for text, expected in (
+            (
+                "NVX-TSC-CONTROL-RESULT unstable activations=12\r\n",
+                "fresh-boot TSC control: Linux also found TSC instability without "
+                "snapshot restore after 12 CPU activations",
+            ),
+            (
+                '> echo "NVX-TSC-CONTROL-RESULT stable activations=$activations"\n',
+                "fresh-boot TSC control did not report a result",
+            ),
+            (
+                "NVX-TSC-CONTROL-RESULT stable activations=many\n",
+                "fresh-boot TSC control did not report a result",
+            ),
+            ("", "fresh-boot TSC control did not report a result"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(microvm_tests._tsc_control_verdict(text), expected)
+
+    def test_tsc_sync_control_script_reactivates_aps_until_tsc_instability(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        for flags, online, unstable, expected_status, expected_output in (
+            ("tsc rdtscp", 4, False, 0, "NVX-TSC-CONTROL-RESULT stable activations=9"),
+            (
+                "tsc rdtscp",
+                4,
+                True,
+                0,
+                "NVX-TSC-CONTROL-RESULT unstable activations=3",
+            ),
+            ("tsc tsc_adjust", 4, False, 61, "NVX-TSC-CONTROL-FAIL code=61"),
+            ("tsc rdtscp", 2, False, 60, "NVX-TSC-CONTROL-FAIL code=60"),
+        ):
+            with self.subTest(flags=flags, online=online, unstable=unstable):
+                with tempfile.TemporaryDirectory() as temporary:
+                    cpu_root = Path(temporary)
+                    for cpu in range(1, 4):
+                        (cpu_root / f"cpu{cpu}").mkdir()
+                    kernel_log = (
+                        "Measured 45 cycles TSC warp between CPUs"
+                        if unstable
+                        else "clocksource: Switched to clocksource tsc"
+                    )
+                    script = (
+                        microvm_tests._render_script(
+                            "tsc-sync-control.sh.in", PROCESSORS="4", ROUNDS="2"
+                        )
+                        .replace("/sys/devices/system/cpu", cpu_root.as_posix())
+                        .replace("nvx-exit", "nvx_exit")
+                    )
+                    result = subprocess.run(
+                        [shell, "-s"],
+                        input=(
+                            f"getconf() {{ printf '{online}\\n'; }}\n"
+                            f"cat() {{ printf 'flags : {flags}\\n'; }}\n"
+                            f"dmesg() {{ printf '%s\\n' '{kernel_log}'; }}\n"
+                            'nvx_exit() { exit "$1"; }\n' + script
+                        ),
+                        text=True,
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    reactivated = all(
+                        (cpu_root / f"cpu{cpu}" / "online").is_file()
+                        and (cpu_root / f"cpu{cpu}" / "online").read_text() == "1\n"
+                        for cpu in range(1, 4)
+                    )
+
+                self.assertEqual(
+                    result.returncode, expected_status, result.stdout + result.stderr
+                )
+                self.assertIn(expected_output, result.stdout)
+                self.assertEqual(
+                    "NVX-TSC-CONTROL-DONE" in result.stdout, expected_status == 0
+                )
+                self.assertEqual(reactivated, expected_output.endswith("=9"))
+                if unstable:
+                    self.assertIn(kernel_log, result.stdout)
+
+    def test_tsc_sync_control_script_fails_when_dmesg_fails(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        script = microvm_tests._render_script(
+            "tsc-sync-control.sh.in", PROCESSORS="4", ROUNDS="2"
+        ).replace("nvx-exit", "nvx_exit")
+
+        result = subprocess.run(
+            [shell, "-s"],
+            input=(
+                "getconf() { printf '4\\n'; }\n"
+                "cat() { printf 'flags : tsc rdtscp\\n'; }\n"
+                "dmesg() { return 71; }\n"
+                'nvx_exit() { exit "$1"; }\n' + script
+            ),
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 71, result.stdout + result.stderr)
+        self.assertIn("NVX-TSC-CONTROL-FAIL code=71", result.stdout)
+        self.assertNotIn("NVX-TSC-CONTROL-RESULT", result.stdout)
+        self.assertNotIn("NVX-TSC-CONTROL-DONE", result.stdout)
+
     def test_restore_memory_reuses_one_base_snapshot_for_all_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1623,6 +2528,7 @@ class MicrovmTests(unittest.TestCase):
             output_dir = Path(temporary) / "logs"
             args = argparse.Namespace(
                 backend="whp",
+                guest="alpine",
                 scenario=["smp", "smp", "smp-lapic", "smp-lapic"],
                 processors=[2, 2, 8],
                 memory_mib=128,
@@ -1658,6 +2564,118 @@ class MicrovmTests(unittest.TestCase):
             [entry.kwargs["force_lapic_timer"] for entry in run_smp.call_args_list],
             [False, False, True, True],
         )
+
+    def test_runner_uses_ubuntu_artifact_and_default_memory(self):
+        requested: list[Path] = []
+
+        def require(path: Path, _description: str) -> Path:
+            requested.append(path)
+            return path
+
+        with tempfile.TemporaryDirectory() as temporary:
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "whp",
+                    "--guest",
+                    "ubuntu",
+                    "--scenario",
+                    "guest-boot",
+                    "--output-dir",
+                    temporary,
+                ]
+            )
+            with (
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(microvm_tests, "require_file", side_effect=require),
+                patch.object(microvm_tests, "run_guest_boot") as run_guest_boot,
+            ):
+                self.assertEqual(microvm_tests.run(args), 0)
+
+        self.assertIn(
+            BuildConstants.BUILD_DIR / "initramfs-ubuntu.cpio.gz",
+            requested,
+        )
+        self.assertEqual(run_guest_boot.call_args.kwargs["memory_mib"], 256)
+
+    def test_runner_omits_console_snapshot_from_ubuntu_defaults(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with tempfile.TemporaryDirectory() as temporary:
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "whp",
+                    "--guest",
+                    "ubuntu",
+                    "--output-dir",
+                    temporary,
+                ]
+            )
+            with (
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(
+                    microvm_tests,
+                    "MICROVM_TEST_SCENARIOS",
+                    ("console-snapshot", "guest-boot"),
+                ),
+                patch.object(
+                    microvm_tests,
+                    "require_file",
+                    side_effect=require,
+                ),
+                patch.object(microvm_tests, "run_guest_boot") as guest_boot,
+                patch.object(
+                    microvm_tests,
+                    "run_console_snapshot",
+                ) as console_snapshot,
+            ):
+                self.assertEqual(microvm_tests.run(args), 0)
+
+        guest_boot.assert_called_once()
+        console_snapshot.assert_not_called()
+
+    def test_runner_rejects_ubuntu_unsupported_scenarios(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        for scenario in (
+            "console-snapshot",
+            "sandbox-blocks",
+            "scratch-snapshot",
+            "snapshot-tiers",
+        ):
+            with self.subTest(scenario=scenario):
+                args = nvx.parse_args(
+                    [
+                        "test-microvm",
+                        "--backend",
+                        "whp",
+                        "--guest",
+                        "ubuntu",
+                        "--scenario",
+                        scenario,
+                    ]
+                )
+                with (
+                    patch.object(
+                        microvm_tests,
+                        "validate_openvmm_test_backend",
+                    ),
+                    patch.object(
+                        microvm_tests,
+                        "require_file",
+                        side_effect=require,
+                    ),
+                    self.assertRaisesRegex(
+                        common.ScriptError,
+                        "Ubuntu guest does not support",
+                    ),
+                ):
+                    microvm_tests.run(args)
 
     def test_runner_keeps_restore_tsc_logs_separate_from_processor_restore(self):
         def require(path: Path, _description: str) -> Path:
@@ -1703,6 +2721,7 @@ class MicrovmTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             args = argparse.Namespace(
                 backend="kvm",
+                guest="alpine",
                 scenario=["console-exit", "console-exit"],
                 processors=[1, 2, 2, 4, 8],
                 memory_mib=128,

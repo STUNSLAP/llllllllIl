@@ -4,44 +4,68 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 from nvx_tools import sandbox_lifecycle
+from nvx_tools.adversarial import configure_parser as configure_adversarial_parser
 from nvx_tools.benchmark import configure_parser as configure_benchmark_parser
 from nvx_tools.build import (
-    AlpineBuildConfig,
-    DockerBuildConfig,
-    KernelBuildConfig,
-    build_docker_artifacts,
+    build_all,
+    build_distro_layer,
+    build_guest,
     build_initramfs,
     build_kernel,
+    build_openvmm,
+    materialize_kernel_provenance_inputs,
     record_openvmm_provenance,
+    verify_guest_determinism,
+)
+from nvx_tools.build_config import (
+    BuildConfig,
+    DistroLayerBuildConfig,
+    DockerBuildConfig,
+    KernelBuildConfig,
+    OpenVmmBuildConfig,
+)
+from nvx_tools.build_constants import (
+    AlpineBuildConstants,
+    BuildConstants,
+    InitramfsBuildConstants,
+    KernelBuildConstants,
+    UbuntuBuildConstants,
 )
 from nvx_tools.ci import (
     OPENVMM_TEST_BACKENDS,
+    REQUIRED_CI_RESULT_ENVIRONMENTS,
+    required_ci_failures,
     run_openvmm_tests,
+    run_openvmm_unit_tests,
     setup_cross_os_cache,
 )
 from nvx_tools.collect_alpine_sources import (
     configure_parser as configure_alpine_sources_parser,
 )
+from nvx_tools.collect_ubuntu_sources import (
+    configure_parser as configure_ubuntu_sources_parser,
+)
 from nvx_tools.common import (
-    BUILD_DIR,
-    OPENVMM_DIR,
-    REPO_ROOT,
     ScriptError,
     artifact_path,
     openvmm_binary_path,
     require_file,
+    sha256_file,
 )
 from nvx_tools.create_linux_source_archive import (
     configure_parser as configure_linux_source_archive_parser,
 )
+from nvx_tools.guests import GUEST_NAMES, guest_descriptor
 from nvx_tools.microvm_tests import configure_parser as configure_microvm_test_parser
 from nvx_tools.performance import configure_parser as configure_performance_parser
 from nvx_tools.release import (
@@ -51,88 +75,168 @@ from nvx_tools.release import (
     package_release,
     verify_source_tree,
 )
-from nvx_tools.sandbox import SandboxLaunch, SandboxLayer, parse_workload_identity
+from nvx_tools.sandbox import (
+    SandboxLaunch,
+    SandboxLayer,
+    SandboxMount,
+    parse_workload_identity,
+)
 
 DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
 HYPERVISORS = ("auto", "whp", "kvm", "mshv")
 NETWORK_PROFILES = ("portable",)
+SYSTEMD_ENTRYPOINTS = frozenset(("/usr/lib/systemd/systemd", "/lib/systemd/systemd"))
 
 
-def _run(args: list[str | os.PathLike[str]], *, cwd: Path = REPO_ROOT) -> None:
+def _run(
+    args: list[str | os.PathLike[str]], *, cwd: Path = BuildConstants.REPO_ROOT
+) -> None:
     command = [os.fspath(arg) for arg in args]
     print(f">> {shlex.join(command)}")
     subprocess.run(command, cwd=cwd, check=True)
+
+
+def _validate_sandbox_systemd_policy(launch: SandboxLaunch) -> None:
+    if launch.entrypoint in SYSTEMD_ENTRYPOINTS:
+        raise ScriptError(
+            "systemd entrypoints are unsupported by the sandbox security profile"
+        )
+    distro = next(
+        (layer for layer in launch.layers if layer.role == "distro"),
+        None,
+    )
+    if distro is None:
+        return
+    manifest = distro.path.with_name(
+        f"{distro.path.name}{BuildConstants.DISTRO_MANIFEST_SUFFIX}"
+    )
+    if not manifest.exists():
+        return
+    try:
+        document: object = json.loads(manifest.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise ScriptError(f"invalid sandbox distro manifest: {error}") from error
+    if not isinstance(document, dict):
+        raise ScriptError("invalid sandbox distro manifest: expected a JSON object")
+    manifest_document = cast(dict[str, object], document)
+    if (
+        manifest_document.get("format") != 1
+        or manifest_document.get("artifact") != distro.path.name
+        or manifest_document.get("artifact_sha256") != sha256_file(distro.path)
+    ):
+        raise ScriptError("sandbox distro manifest does not match its artifact")
+    raw_packages = manifest_document.get("packages")
+    if not isinstance(raw_packages, list):
+        raise ScriptError("sandbox distro manifest has invalid package metadata")
+    packages: list[dict[str, object]] = []
+    for raw_package in cast(list[object], raw_packages):
+        if not isinstance(raw_package, dict):
+            raise ScriptError("sandbox distro manifest has invalid package metadata")
+        package = cast(dict[str, object], raw_package)
+        if not isinstance(package.get("name"), str):
+            raise ScriptError("sandbox distro manifest has invalid package metadata")
+        packages.append(package)
+    if any(package["name"] == "systemd" for package in packages):
+        raise ScriptError(
+            "systemd images are unsupported by the sandbox security profile"
+        )
 
 
 def command_init(_: argparse.Namespace) -> None:
     _run(["git", "submodule", "update", "--init", "--recursive"])
 
 
-def _native_kernel() -> None:
-    build_kernel(
-        KernelBuildConfig(
-            work=BUILD_DIR / "linux",
-            output=artifact_path("vmlinux"),
-        )
+def _openvmm_build_config(args: argparse.Namespace) -> OpenVmmBuildConfig:
+    return OpenVmmBuildConfig(
+        skip_restore=getattr(args, "skip_restore", False),
+        backend=getattr(args, "backend", None),
     )
 
 
-def _native_initramfs() -> None:
-    build_initramfs(
-        AlpineBuildConfig(
-            work=BUILD_DIR / "initramfs-work",
-            output=artifact_path("initramfs.cpio.gz"),
-        )
+def _build_config(args: argparse.Namespace) -> BuildConfig:
+    return BuildConfig(
+        guest=getattr(args, "guest", InitramfsBuildConstants.DEFAULT_GUEST),
+        native_guest=getattr(args, "native", False),
+        openvmm=_openvmm_build_config(args),
     )
 
 
 def command_build_guest(args: argparse.Namespace) -> None:
-    if args.native:
-        _native_kernel()
-        _native_initramfs()
-        return
-
-    config = DockerBuildConfig(destination=BUILD_DIR)
-    build_docker_artifacts(config)
+    build_guest(_build_config(args))
 
 
 def command_build_kernel(_: argparse.Namespace) -> None:
-    _native_kernel()
+    build_kernel(KernelBuildConfig())
 
 
-def command_build_initramfs(_: argparse.Namespace) -> None:
-    _native_initramfs()
+def command_build_initramfs(args: argparse.Namespace) -> None:
+    build_initramfs(BuildConfig.initramfs_config(args.guest))
+
+
+def command_build_distro_layer(args: argparse.Namespace) -> None:
+    build_distro_layer(
+        DistroLayerBuildConfig(
+            guest=args.guest,
+            work=(
+                BuildConstants.BUILD_DIR
+                / InitramfsBuildConstants.DISTRO_WORK_DIRECTORY_TEMPLATE.format(
+                    guest=args.guest
+                )
+            ),
+            output=args.output,
+            replace=args.replace,
+        )
+    )
+
+
+def command_verify_guest_determinism(args: argparse.Namespace) -> None:
+    verify_guest_determinism(args.work_dir, args.guest)
 
 
 def command_build_openvmm(args: argparse.Namespace) -> None:
-    require_file(OPENVMM_DIR / "Cargo.toml", "initialized OpenVMM submodule")
-    if not args.skip_restore:
-        _run(
-            ["cargo", "xflowey", "restore-packages", "--no-compat-igvm"],
-            cwd=OPENVMM_DIR,
-        )
-    _run(
-        ["cargo", "build", "--release", "-p", "openvmm", "--bin", "openvmm"],
-        cwd=OPENVMM_DIR,
-    )
-    record_openvmm_provenance(openvmm_binary_path())
+    build_openvmm(_openvmm_build_config(args))
 
 
 def command_record_openvmm_provenance(_: argparse.Namespace) -> None:
-    record_openvmm_provenance(openvmm_binary_path())
+    record_openvmm_provenance(OpenVmmBuildConfig())
+
+
+def command_materialize_kernel_provenance_inputs(_: argparse.Namespace) -> None:
+    materialize_kernel_provenance_inputs()
 
 
 def command_setup_cross_os_cache(_: argparse.Namespace) -> None:
     setup_cross_os_cache()
 
 
+def command_check_required_ci(args: argparse.Namespace) -> None:
+    results = {
+        job: os.environ.get(environment, "")
+        for job, environment in REQUIRED_CI_RESULT_ENVIRONMENTS.items()
+    }
+    failures = required_ci_failures(
+        args.event_name,
+        same_repository=args.same_repository == "true",
+        run_tests=args.run_tests == "true",
+        run_workloads=args.run_workloads == "true",
+        results=results,
+    )
+    if failures:
+        for failure in failures:
+            print(f"::error::{failure}")
+        raise ScriptError(f"{len(failures)} required CI job result(s) did not match")
+
+
 def command_test_openvmm(args: argparse.Namespace) -> None:
     run_openvmm_tests(args.backend)
 
 
+def command_test_openvmm_unit(_: argparse.Namespace) -> None:
+    run_openvmm_unit_tests()
+
+
 def command_build(args: argparse.Namespace) -> None:
-    command_build_guest(args)
-    command_build_openvmm(args)
+    build_all(_build_config(args))
 
 
 def _hypervisor(selected: str) -> str:
@@ -164,6 +268,25 @@ def _format_command(command: list[str]) -> str:
     return subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
 
 
+def _extend_network_arguments(command: list[str], args: argparse.Namespace) -> None:
+    if args.net is not None:
+        command.extend(["--net", args.net, "--network-profile", args.network_profile])
+    if args.network_egress is not None:
+        command.extend(["--network-egress", args.network_egress])
+    if args.network_ingress is not None:
+        command.extend(["--network-ingress", args.network_ingress])
+    for rule in args.network_egress_allow:
+        command.extend(["--network-egress-allow", rule])
+    for rule in args.network_egress_deny:
+        command.extend(["--network-egress-deny", rule])
+    if args.host_loopback is not None:
+        command.extend(["--host-loopback", args.host_loopback])
+    if args.network_proxy is not None:
+        command.extend(["--network-proxy", args.network_proxy])
+    for forward in args.host_loopback_forward:
+        command.extend(["--host-loopback-forward", forward])
+
+
 def command_run(args: argparse.Namespace) -> None:
     if (args.net is None) != (args.network_profile is None):
         raise ScriptError("--net and --network-profile must be specified together")
@@ -175,10 +298,15 @@ def command_run(args: argparse.Namespace) -> None:
         raise ScriptError("--restore-memory-mib requires --restore-snapshot")
     if args.memory_capacity_mib is not None and args.restore_snapshot is not None:
         raise ScriptError("--memory-capacity-mib is only valid for a fresh boot")
-    if (
-        args.memory_capacity_mib is not None
-        and args.memory_capacity_mib < args.memory_mib
-    ):
+    descriptor = guest_descriptor(args.guest)
+    if args.restore_snapshot is not None and descriptor.name != "alpine":
+        raise ScriptError(
+            "--guest is not accepted for restore; the snapshot already fixes the guest"
+        )
+    memory_mib = (
+        descriptor.default_memory_mib if args.memory_mib is None else args.memory_mib
+    )
+    if args.memory_capacity_mib is not None and args.memory_capacity_mib < memory_mib:
         raise ScriptError("--memory-capacity-mib cannot be below --memory-mib")
     if args.restore_processors is not None:
         if args.restore_processors > args.processors:
@@ -207,15 +335,17 @@ def command_run(args: argparse.Namespace) -> None:
         if args.restore_ready_path is not None:
             command.extend(["--restore-ready-path", str(args.restore_ready_path)])
     else:
-        kernel = require_file(artifact_path("vmlinux"), "PVH kernel")
+        kernel = require_file(
+            artifact_path(KernelBuildConstants.BINARY_NAME), "Linux direct kernel"
+        )
         initrd = require_file(
-            artifact_path("initramfs.cpio.gz"),
-            "initramfs",
+            artifact_path(descriptor.initramfs_name),
+            f"{descriptor.distribution} initramfs",
         )
         command.extend(
             [
                 "--memory",
-                f"{args.memory_mib}M",
+                f"{memory_mib}M",
                 "--kernel",
                 str(kernel),
                 "--initrd",
@@ -230,22 +360,7 @@ def command_run(args: argparse.Namespace) -> None:
         command.extend(["--mount", args.mount])
     for denied_path in args.mount_deny:
         command.extend(["--mount-deny", str(denied_path)])
-    if args.net is not None:
-        command.extend(["--net", args.net, "--network-profile", args.network_profile])
-    if args.network_egress is not None:
-        command.extend(["--network-egress", args.network_egress])
-    if args.network_ingress is not None:
-        command.extend(["--network-ingress", args.network_ingress])
-    for rule in args.network_egress_allow:
-        command.extend(["--network-egress-allow", rule])
-    for rule in args.network_egress_deny:
-        command.extend(["--network-egress-deny", rule])
-    if args.host_loopback is not None:
-        command.extend(["--host-loopback", args.host_loopback])
-    if args.network_proxy is not None:
-        command.extend(["--network-proxy", args.network_proxy])
-    for forward in args.host_loopback_forward:
-        command.extend(["--host-loopback-forward", forward])
+    _extend_network_arguments(command, args)
     if args.outcome_report is not None:
         command.extend(["--microvm-report", str(args.outcome_report)])
     if args.cmdline:
@@ -257,10 +372,20 @@ def command_run(args: argparse.Namespace) -> None:
 
 def command_sandbox(args: argparse.Namespace) -> None:
     operation = args.sandbox_operation
+    if operation in ("run", "provision", "exec") and (
+        args.entrypoint in SYSTEMD_ENTRYPOINTS
+    ):
+        raise ScriptError(
+            "systemd entrypoints are unsupported by the sandbox security profile"
+        )
     if args.outcome_report is not None and operation not in ("run", "exec"):
         raise ScriptError(
             "--outcome-report is only valid for one-shot run or managed exec"
         )
+    if args.mount_deny and args.mount is None:
+        raise ScriptError("--mount-deny requires --mount")
+    if args.mount is not None and operation not in ("run", "provision"):
+        raise ScriptError("--mount is only valid for sandbox run or provision")
     if operation in ("run", "provision"):
         if (args.net is None) != (args.network_profile is None):
             raise ScriptError("--net and --network-profile must be specified together")
@@ -275,7 +400,13 @@ def command_sandbox(args: argparse.Namespace) -> None:
             workload_identity=args.workload_user,
             memory_max=args.memory_max,
             pids_max=args.pids_max,
+            mount=(
+                None
+                if args.mount is None
+                else SandboxMount.parse(args.mount, tuple(args.mount_deny))
+            ),
         ).validated()
+        _validate_sandbox_systemd_policy(launch)
     else:
         launch = None
 
@@ -340,9 +471,11 @@ def command_sandbox(args: argparse.Namespace) -> None:
     assert operation == "run"
     assert launch is not None
     executable = require_file(openvmm_binary_path(), "OpenVMM release binary")
-    kernel = require_file(artifact_path("vmlinux"), "PVH kernel")
+    kernel = require_file(
+        artifact_path(KernelBuildConstants.BINARY_NAME), "Linux direct kernel"
+    )
     initrd = require_file(
-        artifact_path("initramfs.cpio.gz"),
+        artifact_path(AlpineBuildConstants.INITRAMFS_NAME),
         "initramfs",
     )
     command = [
@@ -362,22 +495,7 @@ def command_sandbox(args: argparse.Namespace) -> None:
         "--cmdline",
         launch.kernel_command_line(args.cmdline),
     ]
-    if args.net is not None:
-        command.extend(["--net", args.net, "--network-profile", args.network_profile])
-    if args.network_egress is not None:
-        command.extend(["--network-egress", args.network_egress])
-    if args.network_ingress is not None:
-        command.extend(["--network-ingress", args.network_ingress])
-    for rule in args.network_egress_allow:
-        command.extend(["--network-egress-allow", rule])
-    for rule in args.network_egress_deny:
-        command.extend(["--network-egress-deny", rule])
-    if args.host_loopback is not None:
-        command.extend(["--host-loopback", args.host_loopback])
-    if args.network_proxy is not None:
-        command.extend(["--network-proxy", args.network_proxy])
-    for forward in args.host_loopback_forward:
-        command.extend(["--host-loopback-forward", forward])
+    _extend_network_arguments(command, args)
     if args.outcome_report is not None:
         command.extend(["--microvm-report", str(args.outcome_report)])
     print(f">> {_format_command(command)}")
@@ -386,7 +504,7 @@ def command_sandbox(args: argparse.Namespace) -> None:
 
 
 def command_collect_sources(_: argparse.Namespace) -> None:
-    collect_release_sources()
+    collect_release_sources(DockerBuildConfig())
 
 
 def command_package(args: argparse.Namespace) -> None:
@@ -406,11 +524,37 @@ def command_verify(_: argparse.Namespace) -> None:
     verify_source_tree()
 
 
-def _add_guest_options(parser: argparse.ArgumentParser) -> None:
+def _add_guest_options(
+    parser: argparse.ArgumentParser,
+    *,
+    allow_all: bool,
+) -> None:
+    choices = (*GUEST_NAMES, "all") if allow_all else GUEST_NAMES
+    parser.add_argument(
+        "--guest",
+        choices=choices,
+        default=InitramfsBuildConstants.DEFAULT_GUEST,
+        help=(
+            "guest userland to build "
+            f"(default: {InitramfsBuildConstants.DEFAULT_GUEST})"
+        ),
+    )
     parser.add_argument(
         "--native",
         action="store_true",
         help="build directly on Linux instead of using Docker",
+    )
+
+
+def _add_openvmm_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--skip-restore", action="store_true")
+    parser.add_argument(
+        "--backend",
+        choices=OPENVMM_TEST_BACKENDS,
+        help=(
+            "select build target: kvm=GNU, mshv=musl, whp=MSVC "
+            "(default: native target for the host OS)"
+        ),
     )
 
 
@@ -422,7 +566,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     init.set_defaults(handler=command_init)
 
     guest = subparsers.add_parser("build-guest", help="build Linux guest artifacts")
-    _add_guest_options(guest)
+    _add_guest_options(guest, allow_all=True)
     guest.set_defaults(handler=command_build_guest)
 
     kernel = subparsers.add_parser(
@@ -433,12 +577,49 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     initramfs = subparsers.add_parser(
         "build-initramfs",
-        help="build an Alpine initramfs natively on Linux",
+        help="build a selected guest initramfs natively on Linux",
+    )
+    initramfs.add_argument(
+        "--guest",
+        choices=GUEST_NAMES,
+        default=InitramfsBuildConstants.DEFAULT_GUEST,
+        help=(
+            "guest userland to build "
+            f"(default: {InitramfsBuildConstants.DEFAULT_GUEST})"
+        ),
     )
     initramfs.set_defaults(handler=command_build_initramfs)
 
+    distro_layer = subparsers.add_parser(
+        "build-distro-layer",
+        help="build a deterministic EROFS distro layer natively on Linux",
+    )
+    distro_layer.add_argument("--guest", choices=GUEST_NAMES, required=True)
+    distro_layer.add_argument(
+        "--output",
+        type=Path,
+        default=artifact_path(UbuntuBuildConstants.DISTRO_NAME),
+    )
+    distro_layer.add_argument("--replace", action="store_true")
+    distro_layer.set_defaults(handler=command_build_distro_layer)
+
+    determinism = subparsers.add_parser(
+        "verify-guest-determinism",
+        help="build Ubuntu guest artifacts twice and compare them",
+    )
+    determinism.add_argument("--guest", choices=GUEST_NAMES, required=True)
+    determinism.add_argument(
+        "--work-dir",
+        type=Path,
+        default=(
+            BuildConstants.BUILD_DIR
+            / InitramfsBuildConstants.DETERMINISM_DIRECTORY_NAME
+        ),
+    )
+    determinism.set_defaults(handler=command_verify_guest_determinism)
+
     openvmm = subparsers.add_parser("build-openvmm", help="build OpenVMM")
-    openvmm.add_argument("--skip-restore", action="store_true")
+    _add_openvmm_options(openvmm)
     openvmm.set_defaults(handler=command_build_openvmm)
 
     provenance = subparsers.add_parser(
@@ -447,15 +628,45 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     provenance.set_defaults(handler=command_record_openvmm_provenance)
 
+    kernel_provenance = subparsers.add_parser(
+        "materialize-kernel-provenance-inputs",
+        help="write kernel provenance inputs from raw run-head blobs",
+    )
+    kernel_provenance.set_defaults(handler=command_materialize_kernel_provenance_inputs)
+
     cache = subparsers.add_parser(
         "setup-cross-os-cache",
         help="install GNU tar and zstd for GitHub Actions cross-OS caches",
     )
     cache.set_defaults(handler=command_setup_cross_os_cache)
 
+    required_ci = subparsers.add_parser(
+        "check-required-ci",
+        help="validate required GitHub Actions job results",
+    )
+    required_ci.add_argument(
+        "--event-name",
+        choices=("pull_request", "push"),
+        required=True,
+    )
+    required_ci.add_argument(
+        "--same-repository",
+        choices=("false", "true"),
+        required=True,
+    )
+    required_ci.add_argument("--run-tests", required=True)
+    required_ci.add_argument("--run-workloads", required=True)
+    required_ci.set_defaults(handler=command_check_required_ci)
+
+    openvmm_unit_tests = subparsers.add_parser(
+        "test-openvmm-unit",
+        help="run OpenVMM unit and documentation tests",
+    )
+    openvmm_unit_tests.set_defaults(handler=command_test_openvmm_unit)
+
     openvmm_tests = subparsers.add_parser(
         "test-openvmm",
-        help="run OpenVMM microVM integration tests",
+        help="run OpenVMM Petri VMM tests",
     )
     openvmm_tests.add_argument(
         "--backend",
@@ -470,9 +681,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     configure_microvm_test_parser(microvm_tests)
 
+    adversarial_tests = subparsers.add_parser(
+        "test-adversarial",
+        help="run a brokered Copilot-driven adversarial campaign",
+    )
+    configure_adversarial_parser(adversarial_tests)
+
     build = subparsers.add_parser("build", help="build guest artifacts and OpenVMM")
-    _add_guest_options(build)
-    build.add_argument("--skip-restore", action="store_true")
+    _add_guest_options(build, allow_all=True)
+    _add_openvmm_options(build)
     build.set_defaults(handler=command_build)
 
     download = subparsers.add_parser(
@@ -488,13 +705,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     download.set_defaults(handler=command_download)
 
     run = subparsers.add_parser("run", help="run an OpenVMM microVM")
+    run.add_argument("--guest", choices=GUEST_NAMES, default="alpine")
     run.add_argument("--hypervisor", choices=HYPERVISORS, default="auto")
     run.add_argument(
         "--machine",
         choices=("microvm",),
         default="microvm",
     )
-    run.add_argument("--memory-mib", type=int, default=128)
+    run.add_argument(
+        "--memory-mib",
+        type=int,
+        help="guest RAM; defaults to 128 MiB for Alpine and 256 MiB for Ubuntu",
+    )
     run.add_argument("--memory-capacity-mib", type=int)
     run.add_argument("--processors", type=int, choices=(1, 2, 4, 8), default=1)
     run.add_argument("--mount", help="GUEST_TARGET,HOST_PATH,ro|rw")
@@ -579,6 +801,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="guest workload timeout in milliseconds; zero disables it",
     )
     sandbox.add_argument("--hypervisor", choices=HYPERVISORS, default="auto")
+    sandbox.add_argument(
+        "--mount",
+        metavar="GUEST_TARGET,HOST_PATH[,ro|rw]",
+        help="live-share one host directory inside the container rootfs",
+    )
+    sandbox.add_argument(
+        "--mount-deny",
+        action="append",
+        default=[],
+        metavar="HOST_PATH",
+        help="hide one existing path inside the --mount host directory",
+    )
     sandbox.add_argument("--net", metavar="IPV4/PREFIX")
     sandbox.add_argument("--network-profile", choices=NETWORK_PROFILES)
     sandbox.add_argument("--network-egress", choices=("allow", "deny"))
@@ -601,7 +835,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "benchmark",
         help="run the OpenVMM-native benchmark coordinator",
     )
-    configure_benchmark_parser(benchmark, REPO_ROOT)
+    configure_benchmark_parser(benchmark, BuildConstants.REPO_ROOT)
 
     performance = subparsers.add_parser(
         "performance",
@@ -611,7 +845,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     sources = subparsers.add_parser(
         "collect-sources",
-        help="materialize verified Linux and Alpine release-source artifacts",
+        help="materialize verified Linux, Alpine, and Ubuntu release sources",
     )
     sources.set_defaults(handler=command_collect_sources)
 
@@ -620,6 +854,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="collect exact Alpine recipes and upstream sources",
     )
     configure_alpine_sources_parser(alpine_sources)
+
+    ubuntu_sources = subparsers.add_parser(
+        "collect-ubuntu-sources",
+        help="collect exact Ubuntu source packages",
+    )
+    configure_ubuntu_sources_parser(ubuntu_sources)
 
     linux_source_archive = subparsers.add_parser(
         "create-linux-source-archive",

@@ -19,6 +19,13 @@ reads the process high-water mark; Windows reads the cumulative peak working set
 resident guest-memory mappings. CI persists and gates p50 RSS and reports both p50 and maximum RSS
 in its lifecycle diagnostics.
 
+The coordinator samples peak RSS once, at the readiness marker, while OpenVMM is still running.
+A prequeued guest exit can end OpenVMM before that sample. The coordinator then discards and
+repeats the attempt, up to three attempts per measured sample, and reports the number of discarded
+attempts in `peak_rss_remeasured_count`. It never substitutes another reading: a sample taken
+before the marker omits the restore, Linux exit accounting includes the coordinator's pre-exec
+image, and a Windows reading after exit includes teardown.
+
 Use this page for metric names and methodology. Current historical p50 values live in
 `data/`; timings copied into old discussions or commit messages are not baselines. Bare-metal and
 virtual-machine results have separate histories and must not be compared as one regression series.
@@ -148,7 +155,7 @@ python3 scripts/nvx.py benchmark --suite snapshot-profile --backend kvm --warmup
 python scripts\nvx.py benchmark --suite snapshot-profile --backend whp --warmups 1 --runs 5 --output data\runs\windows-whp-baremetal\snapshot-profile.json
 ```
 
-The default matrix profiles 64, 128, 256, 512, and 1024 MiB snapshots with both warm and cold
+The default matrix profiles 128, 256, 512, and 1024 MiB snapshots with both warm and cold
 restore artifacts. Use `--shell-memories` to select sizes and `--cache-state warm`, `cold`, or
 `both` to select cache conditions. The suite enables OpenVMM profiling for these diagnostic runs;
 other paths leave full profiling disabled unless `--snapshot-profile` is explicit.
@@ -183,7 +190,7 @@ reuse one fresh snapshot per scenario; compare results only on the same host und
 load and power conditions.
 
 Run one workload by selecting `cold-start`, `device-io`, `virtfs`, `shell-snapshot`, or `network-snapshot`
-instead of `performance`. Use `--shell-memories 64 128 256 512`,
+instead of `performance`. Use `--shell-memories 128 256 512`,
 `--payload-mib 64`, and
 `--net 10.0.0.2/24 --network-profile portable` to override their defaults. Run
 `python scripts/nvx.py benchmark --help` for the complete option surface.
@@ -312,8 +319,11 @@ CI runs `test-microvm --scenario smp-lapic --processors 1 2 4 8` before acceptan
 This repeats the normal SMP probe with `lapic=notscdeadline`, covering the counting
 LAPIC even on hosts that normally use TSC-deadline timers. The ordinary `smp` scenario
 retains the default timer selection.
-WHP capture waits for Linux to replace the transitional `tsc-early` clocksource with
-its stable selected clocksource before starting this SMP validation.
+MSHV and WHP captures wait for Linux to replace the transitional `tsc-early` clocksource with
+its stable selected clocksource before starting this SMP validation. Until that switch, Linux
+uses a periodic tick that doesn't recover the jiffies skipped by a restore's downtime. The
+clocksource watchdog can then compare `tsc-early` with jiffies across the restore and mark the
+TSC unstable. KVM guests leave `tsc-early` almost immediately after boot.
 The coordinator stages the probe and a capture controller in guest memory. The
 controller runs the first probe, blocks in `read`, and invokes `nvx-snapshot` when the
 host sends the trigger. The controller always emits `NVX-SNAPSHOT-DISPATCHED` immediately before
@@ -408,8 +418,6 @@ that methodology are not comparable with newly collected values.
 
 | Metric | Description |
 | --- | --- |
-| `shell_snapshot_cold_64_mib` | OpenVMM launch to a shell-ready guest with 64 MiB of memory. |
-| `shell_snapshot_restore_64_mib` | Restore process launch through lifecycle-aligned verification of a 64 MiB snapshot. |
 | `shell_snapshot_cold_128_mib` | OpenVMM launch to a shell-ready guest with 128 MiB of memory. |
 | `shell_snapshot_restore_128_mib` | Restore process launch through lifecycle-aligned verification of a 128 MiB snapshot. |
 | `shell_snapshot_cold_256_mib` | OpenVMM launch to a shell-ready guest with 256 MiB of memory. |
@@ -462,11 +470,9 @@ are excluded from raw samples and summaries.
 Capture records isolate guest quiesce, state save, mapped-memory and memory-handle flushes, each
 publication step, publication observation, and source teardown. Restore records isolate artifact
 open and preparation, COW section and mapping/view creation, prototype and final partition work,
-GPA registration, partition-unit creation, VP-thread binding, saved-state restore, state-unit time
-advance, per-VP TSC advance, backend clock advance, restored-VP stopping, input gating, device
-start, generation-ID creation, the cumulative gated guest-repair interval, and guest resume to
-readiness. State and memory SHA stages are intentionally absent from the final capture and restore
-path.
+GPA registration, VP-thread binding, saved-state restore, device start, generation-ID creation,
+the cumulative gated guest-repair interval, and guest resume to readiness. State and memory SHA
+stages are intentionally absent from the final capture and restore path.
 
 `startup.vp_thread_bind` is the exclusive wall interval for all VP threads to bind. Nested
 `startup.vp_bind_bsp` and `startup.vp_bind_ap_<INDEX>` records are non-exclusive per-VP intervals;
@@ -507,12 +513,54 @@ full `5 + 30` contract.
 The current workflow collects 10 measured lifecycle samples after one warmup.
 Windows CI validates the lifecycle result before starting the remaining benchmark
 suites. Snapshot-generation instability is reported with temporary-failure exit
-status 75; CI discards that lifecycle result and remeasures it once on the same
-runner. Other validation failures stop immediately, and a second unstable result
-still fails the job. The stability guard rejects a p50 more than 25% above p25 and
-also rejects an adjacent gap above 25% when at least two samples lie on each side.
+status 75; CI remeasures it once on the same runner. Each attempt is preserved in
+the benchmark artifact as `acceptance-attempt-1.json` or
+`acceptance-attempt-2.json`, including its lifecycle profiles. Only a validated
+attempt is copied to `acceptance.json` for collection; a stale accepted result is
+removed before measuring. Other validation failures stop immediately, and a second
+unstable result still fails the job. The stability guard rejects a p50 more than
+25% above p25 and also rejects an adjacent gap above 25% when at least two samples
+lie on each side.
 Singleton outliers remain tolerated, while pooled Windows runners cannot publish a
 bimodal host-stall series into topology-wide history.
+
+Before updating the run-scoped `benchmark-<platform>-<run-id>` artifact, each platform
+uploads its raw results and lifecycle profiles to the immutable
+`benchmark-diagnostics-<platform>-<run-id>-attempt-<run-attempt>` artifact, including
+after a benchmark failure. Both artifacts are retained for one day. Rerunning a
+workflow cannot overwrite an earlier attempt's diagnostics. Downstream gates still
+use the run-scoped artifact so a failed-jobs-only rerun can reuse successful
+platform results from an earlier workflow attempt. The `acceptance-attempt-N.json`
+files identify the bounded lifecycle remeasurements within one workflow attempt,
+not the workflow's `github.run_attempt`.
+
+When investigating instability, compare each attempt's
+`snapshot_capture.whp.profile.raw_samples` with its `samples_ms`. For example, a
+slow `capture.mapped_memory_flush` with otherwise stable capture phases localizes
+the delay to host-side mapped RAM flushing, not guest boot or snapshot restore.
+Reproduce with the exact executable and guest artifact hashes on the same host
+before attributing the delay to a source change. Keep the stability thresholds and
+bounded remeasurement unchanged when collecting diagnostic evidence.
+
+Snapshot generation is bounded by the write throughput of the benchmark's
+temporary directory, because capture flushes guest RAM through a backing file
+created there. The Windows backing file stays dense so restore keeps the
+captured pages cached; NTFS therefore zero-fills the unwritten range below the
+guest's top-of-RAM pages, and a 128 MiB guest writes about 150 MiB per capture.
+The Windows CI runners' 128 GiB Premium SSD system disk also holds the runner
+work tree, caches, and builds. Under load it alternates between its burst limit
+of about 173 MB/s and its baseline of about 102 MB/s in blocks of tens of
+seconds, which splits one lifecycle series into flush clusters near 0.95 and
+1.6 seconds. Windows CI therefore passes `--scratch-dir` with a per-job
+directory under the `NVX_BENCHMARK_SCRATCH` root that runner provisioning
+creates on the data volume. Acceptance JSON records the directory as
+`controls.scratch_directory`, and workload metadata records it as
+`scratch_directory`. When the root is not provisioned, CI warns and uses the
+system temporary directory. Windows-coordinated KVM workers receive the WSL
+translation of the same directory instead of falling back to WSL's `/tmp`.
+Use `--scratch-dir` for manual runs whose temporary directory shares a volume
+with other I/O-heavy work.
+
 The regression gate compares the target p50 with the median of the latest 10
 p50 values on the pull request's base branch and requires all 10
 matching history points. A metric regresses only when it is more than 50%
