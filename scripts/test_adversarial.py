@@ -8,8 +8,10 @@ import hashlib
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from collections.abc import Mapping, Sequence
@@ -552,6 +554,87 @@ class AdversarialBrokerTests(unittest.TestCase):
 
 
 class AdversarialOracleTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process ownership")
+    def test_contained_guest_runner_preserves_unrelated_concurrent_child(self) -> None:
+        for completion_marker in (b"SYNTHETIC-COMPLETE", b"NEVER-COMPLETE"):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                ready_path = root / "ready"
+                continue_path = root / "continue"
+                owned_pid_path = root / "owned.pid"
+                unrelated: list[subprocess.Popen[bytes]] = []
+
+                def spawn_unrelated(
+                    ready: Path = ready_path,
+                    resume: Path = continue_path,
+                    processes: list[subprocess.Popen[bytes]] = unrelated,
+                ) -> None:
+                    while not ready.exists():
+                        time.sleep(0.01)
+                    processes.append(
+                        subprocess.Popen(
+                            [sys.executable, "-c", "import time; time.sleep(60)"]
+                        )
+                    )
+                    resume.touch()
+
+                spawner = threading.Thread(target=spawn_unrelated)
+                spawner.start()
+                command = [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    (
+                        "import pathlib,subprocess,sys,time\n"
+                        "print('ALPINE-MICROVM-BOOT-OK',flush=True)\n"
+                        "sys.stdin.readline()\n"
+                        "pathlib.Path(sys.argv[1]).touch()\n"
+                        "continue_path=pathlib.Path(sys.argv[2])\n"
+                        "while not continue_path.exists():\n"
+                        "    time.sleep(0.01)\n"
+                        "child=subprocess.Popen([sys.executable,'-c',"
+                        "'import os,time; os.setsid(); time.sleep(60)'])\n"
+                        "pathlib.Path(sys.argv[3]).write_text(str(child.pid))\n"
+                        f"print({completion_marker!r}.decode(),flush=True)\n"
+                        + (
+                            "time.sleep(60)"
+                            if completion_marker == b"NEVER-COMPLETE"
+                            else ""
+                        )
+                    ),
+                    str(ready_path),
+                    str(continue_path),
+                    str(owned_pid_path),
+                ]
+                try:
+                    if completion_marker == b"NEVER-COMPLETE":
+                        with self.assertRaisesRegex(RuntimeError, "did not finish"):
+                            run_guest_script(
+                                command,
+                                "continue\n",
+                                completion_marker,
+                                timeout=5.0,
+                                contain_process_tree=True,
+                            )
+                    else:
+                        run_guest_script(
+                            command,
+                            "continue\n",
+                            completion_marker,
+                            timeout=0.5,
+                            contain_process_tree=True,
+                        )
+                    spawner.join(timeout=5.0)
+                    self.assertFalse(spawner.is_alive())
+                    self.assertEqual(len(unrelated), 1)
+                    self.assertIsNone(unrelated[0].poll())
+                    owned_pid = int(owned_pid_path.read_text(encoding="utf-8"))
+                    self.assertFalse(_process_running(owned_pid))
+                finally:
+                    if unrelated:
+                        unrelated[0].kill()
+                        unrelated[0].wait()
+
     def test_contained_guest_runner_timeout_kills_descendants(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             child_pid_path = Path(temporary) / "child.pid"

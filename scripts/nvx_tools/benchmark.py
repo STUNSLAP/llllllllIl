@@ -1308,6 +1308,11 @@ class InteractiveProcess:
         creationflags = (
             self.containment.creationflags if self.containment is not None else 0
         )
+        process_command = (
+            self.containment.command(command)
+            if self.containment is not None
+            else list(command)
+        )
         if sys.platform.startswith("linux"):
             openpty = cast(
                 Callable[[], tuple[int, int]] | None,
@@ -1318,7 +1323,7 @@ class InteractiveProcess:
             terminal_fd, child_fd = openpty()
             try:
                 self.process = subprocess.Popen(
-                    command,
+                    process_command,
                     stdin=child_fd,
                     stdout=child_fd,
                     stderr=child_fd,
@@ -1336,7 +1341,7 @@ class InteractiveProcess:
         else:
             try:
                 self.process = subprocess.Popen(
-                    command,
+                    process_command,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -2176,7 +2181,10 @@ def run_guest_script(
         }
     except BaseException as error:
         try:
-            terminate(process)
+            if interaction.containment is not None:
+                interaction.containment.close(process)
+            else:
+                terminate(process)
         except BaseException as cleanup_error:
             cleanup_errors.append(cleanup_error)
         if isinstance(error, Exception):
