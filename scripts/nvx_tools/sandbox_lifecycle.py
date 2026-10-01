@@ -35,9 +35,11 @@ LOG_NAME = "openvmm.log"
 CONTROL_SOCKET_NAME = "control.sock"
 OUTCOME_NAME = "outcome.json"
 STATE_FORMAT = 1
+CONFIG_FORMAT = 1
 # Format-1 readers ignore unknown fields, so a configuration with a live share
 # uses a format that older NVX releases reject instead of starting without it.
 MOUNT_CONFIG_FORMAT = 2
+CONFIG_FORMATS = (CONFIG_FORMAT, MOUNT_CONFIG_FORMAT)
 OUTCOME_SCHEMA_VERSION = 1
 
 
@@ -178,7 +180,7 @@ def _serialize_launch(
     cmdline: str,
 ) -> dict[str, Any]:
     return {
-        "format": STATE_FORMAT if launch.mount is None else MOUNT_CONFIG_FORMAT,
+        "format": CONFIG_FORMAT if launch.mount is None else MOUNT_CONFIG_FORMAT,
         "layers": [
             {
                 "role": layer.role,
@@ -371,7 +373,7 @@ def start(state_path: Path, timeout: float) -> None:
     config = _read_json(
         require_file(state_dir / CONFIG_NAME, "sandbox configuration"),
         "sandbox configuration",
-        version=(STATE_FORMAT, MOUNT_CONFIG_FORMAT),
+        version=CONFIG_FORMATS,
     )
     if (state_dir / RUNTIME_NAME).exists():
         raise ScriptError("sandbox is already running or has stale runtime state")

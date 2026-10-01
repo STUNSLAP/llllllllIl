@@ -4997,6 +4997,29 @@ class SandboxTests(unittest.TestCase):
             sandbox.SandboxMount(guest_target="/workspace", host_path=Path("a,b"))
         with self.assertRaisesRegex(common.ScriptError, "parent component"):
             sandbox.SandboxMount.parse("/workspace,link/../share")
+
+    def test_mount_absolute_path_keeps_symbolic_link_components(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "link-target" / "share").mkdir(parents=True)
+            try:
+                (root / "link").symlink_to(
+                    root / "link-target", target_is_directory=True
+                )
+            except OSError as error:
+                self.skipTest(f"symbolic links are unavailable: {error}")
+            previous = Path.cwd()
+            os.chdir(root)
+            try:
+                mount = sandbox.SandboxMount.parse("/workspace,link/share,rw")
+                absolute = mount.absolute()
+                expected = Path.cwd() / "link" / "share"
+            finally:
+                os.chdir(previous)
+
+        self.assertEqual(absolute.host_path, expected)
+        self.assertNotIn("link-target", absolute.host_path.parts)
+        self.assertEqual(absolute.absolute(), absolute)
         with self.assertRaisesRegex(common.ScriptError, "unique"):
             sandbox.SandboxMount.parse("/workspace,host", ("logs", "logs"))
         with self.assertRaisesRegex(common.ScriptError, "nonempty"):
@@ -5230,6 +5253,12 @@ class SandboxTests(unittest.TestCase):
                 (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
             )
             self.assertEqual(config["format"], sandbox_lifecycle.MOUNT_CONFIG_FORMAT)
+            with self.assertRaisesRegex(common.ScriptError, "unsupported format"):
+                sandbox_lifecycle._read_json(
+                    state / sandbox_lifecycle.CONFIG_NAME,
+                    "sandbox configuration",
+                    version=1,
+                )
             self.assertEqual(
                 config["mount"],
                 {
@@ -5267,7 +5296,7 @@ class SandboxTests(unittest.TestCase):
 
     def test_managed_lifecycle_accepts_configuration_without_mount(self):
         config: dict[str, object] = {
-            "format": sandbox_lifecycle.STATE_FORMAT,
+            "format": sandbox_lifecycle.CONFIG_FORMAT,
             "layers": [
                 {
                     "role": "distro",
@@ -5310,7 +5339,7 @@ class SandboxTests(unittest.TestCase):
                 "access": "rw",
                 "denied_paths": [],
             }
-            config["format"] = sandbox_lifecycle.STATE_FORMAT
+            config["format"] = sandbox_lifecycle.CONFIG_FORMAT
             with self.assertRaisesRegex(common.ScriptError, "does not match"):
                 sandbox_lifecycle._deserialize_launch(config)
 
@@ -5353,6 +5382,8 @@ class SandboxTests(unittest.TestCase):
             config = json.loads(
                 (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
             )
+            self.assertEqual(config["format"], sandbox_lifecycle.CONFIG_FORMAT)
+            self.assertIsNone(config["mount"])
             self.assertEqual(config["workload_uid"], 65534)
             self.assertEqual(config["hypervisor"], "whp")
             self.assertFalse((state / sandbox_lifecycle.RUNTIME_NAME).exists())
