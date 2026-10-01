@@ -9,6 +9,7 @@ import queue
 import secrets
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1454,26 +1455,34 @@ def run_l3_l4_egress_policy(
     )
     server.start()
     try:
-        command = workload_boot_command(
-            executable,
-            backend,
-            kernel,
-            initrd,
-            memory_mib,
-            "quiet loglevel=0",
-            network=DIRECTIONAL_NETWORK_CIDR,
-        )
-        command.extend(("--network-egress", "deny"))
-        policy = _bounded_egress_policy(
+        policy_path = output_dir / "l3-l4-requested-policy.json"
+        _bounded_egress_policy(
             DIRECTIONAL_NETWORK_GATEWAY_IPV4,
             (tcp_ports[1], tcp_ports[2], tcp_ports[3]),
             (udp_ports[1], udp_ports[2], udp_ports[3]),
-            policy_file=output_dir / "l3-l4-requested-policy.json",
+            policy_file=policy_path,
         )
-        for rule in policy.allow:
-            command.extend(("--network-egress-allow", rule))
-        for rule in policy.deny:
-            command.extend(("--network-egress-deny", rule))
+        command = [
+            sys.executable,
+            str(Path(__file__).parents[1] / "nvx.py"),
+            "run",
+            "--hypervisor",
+            backend,
+            "--memory-mib",
+            str(memory_mib),
+            "--net",
+            DIRECTIONAL_NETWORK_CIDR,
+            "--network-profile",
+            "portable",
+            "--network-egress",
+            "deny",
+            "--network-ingress",
+            "deny",
+            "--network-egress-policy-file",
+            str(policy_path),
+            "--cmdline",
+            "quiet loglevel=0",
+        ]
 
         run_guest_script(
             command,
@@ -1563,6 +1572,43 @@ def run_l3_l4_egress_policy(
                 raise RuntimeError(
                     f"invalid L3/L4 policy {name} was not rejected before boot"
                 )
+
+        (output_dir / "l3-l4-egress-policy-results.json").write_text(
+            json.dumps(
+                {
+                    "interface": "nvx.py run",
+                    "policy_file": policy_path.name,
+                    "tcp_ports": {
+                        "adjacent_low": tcp_ports[0],
+                        "allowed_start": tcp_ports[1],
+                        "denied_interior": tcp_ports[2],
+                        "allowed_end": tcp_ports[3],
+                        "adjacent_high": tcp_ports[4],
+                    },
+                    "udp_ports": {
+                        "adjacent_low": udp_ports[0],
+                        "allowed_start": udp_ports[1],
+                        "denied_interior": udp_ports[2],
+                        "allowed_end": udp_ports[3],
+                        "adjacent_high": udp_ports[4],
+                    },
+                    "observed": {
+                        "allowed": ["tcp:start", "tcp:end", "udp:start", "udp:end"],
+                        "blocked": [
+                            "tcp:adjacent-low",
+                            "tcp:interior",
+                            "tcp:adjacent-high",
+                            "udp:adjacent-low",
+                            "udp:interior",
+                            "udp:adjacent-high",
+                        ],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     finally:
         for endpoint in (*tcp, *udp):
             endpoint.close()
@@ -4026,7 +4072,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "l3-l4-egress-policy" in scenarios:
-        print(f"Running microVM L3/L4 egress policy on OpenVMM/{args.backend}")
+        print(
+            "Running public nvx.py L3/L4 egress policy acceptance "
+            f"on OpenVMM/{args.backend}"
+        )
         run_l3_l4_egress_policy(
             executable,
             kernel,

@@ -908,6 +908,79 @@ class CliTests(unittest.TestCase):
             self.assertEqual(config["network_egress_deny"], [])
             self.assertNotIn("network_egress_policy_file", config)
 
+    def test_public_cli_provision_persists_policy_after_source_removal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            policy = root / "policy.json"
+            state = root / "state"
+            layer.write_bytes(b"layer")
+            scratch.write_bytes(b"scratch")
+            policy.write_text(
+                json.dumps(
+                    {
+                        "allow": [
+                            {
+                                "cidr": "192.0.2.0/24",
+                                "except": ["192.0.2.128/25"],
+                                "protocol": "tcp",
+                                "port": 8000,
+                                "endPort": 8001,
+                            }
+                        ],
+                        "deny": [
+                            {
+                                "cidr": "192.0.2.0/24",
+                                "protocol": "tcp",
+                                "port": 8001,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(nvx.__file__).resolve()),
+                    "sandbox",
+                    "provision",
+                    "--state-dir",
+                    str(state),
+                    "--layer",
+                    f"distro,{layer},11111111-1111-1111-1111-111111111111",
+                    "--scratch",
+                    str(scratch),
+                    "--network-egress",
+                    "deny",
+                    "--network-egress-policy-file",
+                    str(policy),
+                ],
+                cwd=BuildConstants.REPO_ROOT,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                result.stderr.decode("utf-8", "replace"),
+            )
+            policy.unlink()
+            config = json.loads(
+                (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(
+                config["network_egress_allow"],
+                ["192.0.2.0/25:tcp:8000", "192.0.2.0/25:tcp:8001"],
+            )
+            self.assertEqual(
+                config["network_egress_deny"],
+                ["192.0.2.0/24:tcp:8001"],
+            )
+            self.assertNotIn(str(policy), json.dumps(config))
+
     def test_invalid_policy_has_no_managed_state_side_effect(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import cast
@@ -1700,6 +1701,108 @@ class MicrovmTests(unittest.TestCase):
         self.assertIn("192.0.2.0/24:udp:22002", policy.deny)
         self.assertNotIn("192.0.2.0/24:tcp:21000", policy.allow)
         self.assertNotIn("192.0.2.0/24:tcp:21004", policy.allow)
+
+    def test_l3_l4_egress_acceptance_invokes_public_nvx_policy_file(self):
+        tcp = [MagicMock(spec=socket.socket) for _ in range(5)]
+        udp = [MagicMock(spec=socket.socket) for _ in range(5)]
+        for index, endpoint in enumerate(tcp):
+            endpoint.getsockname.return_value = ("0.0.0.0", 21000 + index)
+        for index, endpoint in enumerate(udp):
+            endpoint.getsockname.return_value = ("0.0.0.0", 22000 + index)
+        for endpoint in (tcp[0], tcp[2], tcp[4]):
+            endpoint.accept.side_effect = TimeoutError
+        for endpoint in (udp[0], udp[2], udp[4]):
+            endpoint.recvfrom.side_effect = TimeoutError
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(
+                microvm_tests,
+                "_bind_egress_ports",
+                return_value=(tcp, udp),
+            ),
+            patch.object(microvm_tests, "run_guest_script") as run_guest_script,
+            patch.object(microvm_tests, "OpenvmmProcess") as openvmm_process,
+            patch.object(threading.Thread, "start"),
+            patch.object(threading.Thread, "join"),
+            patch.object(threading.Thread, "is_alive", return_value=False),
+        ):
+            openvmm_process.return_value.__enter__.return_value.wait.side_effect = (
+                MagicMock(returncode=1, output=b"--network-egress is required"),
+                MagicMock(returncode=1, output=b"invalid egress transport"),
+            )
+            output_dir = Path(temporary)
+            microvm_tests.run_l3_l4_egress_policy(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initramfs"),
+                "whp",
+                memory_mib=128,
+                timeout=1,
+                output_dir=output_dir,
+            )
+
+            command = run_guest_script.call_args.args[0]
+            policy_path = output_dir / "l3-l4-requested-policy.json"
+            self.assertEqual(command[0], sys.executable)
+            self.assertEqual(Path(command[1]).name, "nvx.py")
+            self.assertEqual(command[2], "run")
+            self.assertIn("--network-profile", command)
+            self.assertIn("portable", command)
+            self.assertIn("--network-egress", command)
+            self.assertIn("deny", command)
+            self.assertIn("--network-egress-policy-file", command)
+            self.assertIn(str(policy_path), command)
+            self.assertNotIn("--network-egress-allow", command)
+            self.assertNotIn("--network-egress-deny", command)
+            requested = json.loads(policy_path.read_text(encoding="utf-8"))
+            self.assertEqual(requested["allow"][0]["port"], 21001)
+            self.assertEqual(requested["allow"][0]["endPort"], 21003)
+            self.assertEqual(requested["deny"][1]["port"], 21002)
+            results = json.loads(
+                (output_dir / "l3-l4-egress-policy-results.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(results["interface"], "nvx.py run")
+            self.assertEqual(
+                results["observed"]["blocked"],
+                [
+                    "tcp:adjacent-low",
+                    "tcp:interior",
+                    "tcp:adjacent-high",
+                    "udp:adjacent-low",
+                    "udp:interior",
+                    "udp:adjacent-high",
+                ],
+            )
+
+    def test_runner_dispatches_public_l3_l4_egress_acceptance(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests, "validate_openvmm_test_backend"),
+            patch.object(microvm_tests, "require_file", side_effect=require),
+            patch.object(
+                microvm_tests, "run_l3_l4_egress_policy"
+            ) as run_l3_l4_egress_policy,
+        ):
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "whp",
+                    "--scenario",
+                    "l3-l4-egress-policy",
+                    "--output-dir",
+                    temporary,
+                ]
+            )
+            self.assertEqual(microvm_tests.run(args), 0)
+
+        run_l3_l4_egress_policy.assert_called_once()
 
     def test_sandbox_blocks_use_fixed_roles_and_access(self):
         with (
