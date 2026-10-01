@@ -77,6 +77,23 @@ python3 scripts/nvx.py setup-cross-os-cache
 
 Installs the GNU tar and zstd tools used by GitHub Actions cross-OS caches.
 
+### `check-required-ci`
+
+```text
+python3 scripts/nvx.py check-required-ci
+    --event-name {pull_request,push}
+    --same-repository {false,true}
+    --run-tests VALUE
+    --run-workloads VALUE
+```
+
+Validates the GitHub Actions result values supplied through the
+`QUALITY_RESULT`, `CHANGES_RESULT`, and job-specific `*_RESULT` environment
+variables. CI supplies `true` or `false` for the two workload flags. The
+command expects successful results for jobs enabled by the event, repository,
+and workload flags, and `skipped` for jobs that are not enabled; mismatches
+are reported as errors and cause a nonzero exit.
+
 See [Setup](setup.md) for host prerequisites.
 
 ## Build commands
