@@ -534,6 +534,7 @@ python3 scripts/nvx.py performance gate
     [--minimum-history N]
     [--threshold PERCENT]
     [--absolute-tolerance-ms MILLISECONDS]
+    [--history-reset-dir PATH]
     [--summary PATH]
 ```
 
@@ -542,6 +543,8 @@ Checks target p50 values for regressions against rolling baseline histories.
 `40`, and `--absolute-tolerance-ms` to `5`. The gate uses the median of the
 available window and treats metrics with insufficient history as warmups.
 `--summary` writes a Markdown summary.
+`--history-reset-dir` names tracked candidate histories; metrics removed from
+an existing history file restart baseline warmup.
 
 #### `performance persist`
 
