@@ -436,6 +436,61 @@ class EgressPolicyTests(unittest.TestCase):
                     )
                     self.assertEqual(sum(merged_interval_counts), 1)
 
+    def test_partial_address_only_coverage_keeps_protocol_union_compact(self):
+        address_only_rules = [
+            {"cidr": f"192.0.0.{2 * index + 1}/32"} for index in range(128)
+        ]
+        protocol_rule = {
+            "cidr": "192.0.0.0/16",
+            "protocol": "tcp",
+            "port": 443,
+        }
+
+        for category in ("allow", "deny"):
+            compiled_orders: list[tuple[str, ...]] = []
+            for rules in (
+                [*address_only_rules, protocol_rule],
+                [protocol_rule, *address_only_rules],
+            ):
+                with self.subTest(
+                    category=category,
+                    protocol_first=rules[0] is protocol_rule,
+                ):
+                    compiled = self.compile({category: rules})
+                    compiled_rules: tuple[str, ...] = getattr(compiled, category)
+                    self.assertEqual(len(compiled_rules), 129)
+                    self.assertIn("192.0.0.0/16:tcp:443", compiled_rules)
+                    self.assertEqual(
+                        {
+                            rule
+                            for rule in compiled_rules
+                            if not rule.endswith(":tcp:443")
+                        },
+                        {rule["cidr"] for rule in address_only_rules},
+                    )
+                    compiled_orders.append(compiled_rules)
+            self.assertEqual(*compiled_orders)
+
+    def test_partial_address_only_canonicalization_does_not_bridge_gaps(self):
+        compiled = self.compile(
+            {
+                "allow": [
+                    {"cidr": "192.0.2.1/32"},
+                    {"cidr": "192.0.2.0/32", "protocol": "tcp", "port": 443},
+                    {"cidr": "192.0.2.3/32", "protocol": "tcp", "port": 443},
+                ]
+            }
+        )
+
+        self.assertEqual(
+            compiled.allow,
+            (
+                "192.0.2.0/31:tcp:443",
+                "192.0.2.1/32",
+                "192.0.2.3/32:tcp:443",
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

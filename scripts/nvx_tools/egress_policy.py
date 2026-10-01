@@ -190,6 +190,34 @@ def _intervals_to_networks(
     return tuple(networks)
 
 
+def _protocol_intervals_to_networks(
+    protocol_intervals: _AddressIntervals,
+    address_only: _AddressIntervals,
+    maximum: int,
+    category: str,
+) -> tuple[ipaddress.IPv4Network, ...]:
+    combined = _merge_intervals((*protocol_intervals, *address_only))
+    networks: list[ipaddress.IPv4Network] = []
+    for start, end in combined:
+        summarized = ipaddress.summarize_address_range(
+            ipaddress.IPv4Address(start),
+            ipaddress.IPv4Address(end),
+        )
+        for network in summarized:
+            network_interval = (
+                int(network.network_address),
+                int(network.broadcast_address),
+            )
+            if not _subtract_intervals((network_interval,), address_only):
+                continue
+            if len(networks) >= maximum:
+                raise ScriptError(
+                    f"{category} emits at most {MAX_RULES_PER_ACTION} native rules"
+                )
+            networks.append(network)
+    return tuple(networks)
+
+
 def _lower_protocol_rules(
     rules: list[_Rule],
     protocol: str,
@@ -206,8 +234,8 @@ def _lower_protocol_rules(
             continue
         assert rule.start_port is not None
         assert rule.end_port is not None
-        events.setdefault(rule.start_port, []).append((1, uncovered_addresses))
-        events.setdefault(rule.end_port + 1, []).append((-1, uncovered_addresses))
+        events.setdefault(rule.start_port, []).append((1, rule.addresses))
+        events.setdefault(rule.end_port + 1, []).append((-1, rule.addresses))
 
     active: Counter[_AddressIntervals] = Counter()
     lowered: list[tuple[ipaddress.IPv4Network, str, int]] = []
@@ -219,8 +247,9 @@ def _lower_protocol_rules(
             )
             port_count = port - previous_port
             network_budget = (remaining_budget - len(lowered)) // port_count
-            networks = _intervals_to_networks(
+            networks = _protocol_intervals_to_networks(
                 addresses,
+                address_only,
                 network_budget,
                 category,
             )
