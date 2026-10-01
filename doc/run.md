@@ -359,9 +359,11 @@ A relative `--mount-deny` path is resolved inside the exported host directory.
 After it assembles the container overlay and verifies the workload identity,
 the guest agent creates the target inside the container root and mounts the
 share there with `nosuid,nodev` before the workload enters its private mount
-namespace. It unmounts the share before the overlay during teardown. The
-target must be an absolute, canonical path; `/`, `/etc`, and the `/proc`,
-`/sys`, `/dev`, and `/.nvx-agent` trees are reserved for the container runtime.
+namespace. A one-shot workload exit, a managed `stop`, and any failure after
+the share is mounted unmount it before the overlay is unmounted or the VM
+powers off. The target must be an absolute, canonical path; `/`, `/etc`, and
+the `/proc`, `/sys`, `/dev`, and `/.nvx-agent` trees are reserved for the
+container runtime.
 The guest refuses a target whose path crosses a symbolic link in a container
 layer, and any validation or mount failure aborts the sandbox with status 125
 instead of starting the workload without its share.
@@ -402,7 +404,10 @@ Lifecycle transitions fail closed: `start` rejects an already-running or stale
 runtime record, `exec` and `stop` require a live OpenVMM process, and
 `deprovision` refuses to remove a running sandbox or unknown files. Managed
 workload arguments use the bounded control protocol rather than the kernel
-command line and may contain whitespace. The legacy operation-less `sandbox`
+command line and may contain whitespace. The workload sees one machine ID for
+the life of the VM. On `stop`, the guest agent unmounts the live share, overlay,
+layers, and scratch in dependency order before the VM powers off, as it does
+when a one-shot workload exits. The legacy operation-less `sandbox`
 form is `sandbox run`; it remains one-shot and rejects `--state-dir` or any
 request to retain VM state.
 

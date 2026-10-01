@@ -91,9 +91,12 @@ backend also boots the Ubuntu initramfs and runs
 fresh ext4 scratch copy. The same entrypoint then verifies a live virtio-fs
 share inside the container: a read-write `/workspace` share with a denied
 subdirectory must round-trip guest writes to the host, and a read-only
-`/opt/hostedtoolcache` share must reject writes. Linux/KVM runs the broader
-Ubuntu SMP, managed lifecycle, network snapshot, blockless snapshot, and
-workload-identity set.
+`/opt/hostedtoolcache` share must reject writes. A managed sandbox then repeats
+the read-write check through `provision`, `start`, `exec`, and `stop`, and must
+report a successful outcome with a cleanly unmounted scratch filesystem, which
+shows that `stop` unmounted the share and overlay first. Linux/KVM runs the
+broader Ubuntu SMP, managed lifecycle, network snapshot, blockless snapshot,
+and workload-identity set.
 
 OpenVMM release executables and provenance are built once by the independently
 addressable `build-openvmm-linux-gnu`, `build-openvmm-linux-musl`, and

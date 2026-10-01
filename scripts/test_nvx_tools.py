@@ -11,7 +11,9 @@ import json
 import lzma
 import os
 import queue
+import select
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -4730,7 +4732,7 @@ def _posix_shell() -> str | None:
 
 
 def _shell_function(source: str, name: str) -> str:
-    start = source.index(f"{name}() {{\n")
+    start = source.index(f"\n{name}() {{\n") + 1
     return source[start : source.index("\n}\n", start) + 3]
 
 
@@ -4782,17 +4784,108 @@ class SandboxShareAgentTests(unittest.TestCase):
         log = mount_log.read_text(encoding="utf-8") if mount_log.exists() else ""
         return result, log
 
-    def test_agent_mounts_share_after_identity_checks_and_unmounts_it_first(self):
+    def _run_teardown(
+        self, script: str, *, share: bool, failing: str = ""
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        runtime = self.root / "run"
+        runtime.mkdir(exist_ok=True)
+        for name in ("container.pid", "workload-machine-id"):
+            (runtime / name).write_text("x\n", encoding="utf-8")
+        log = self.root / "teardown.log"
+        log.unlink(missing_ok=True)
+        functions = "".join(
+            _shell_function(self.source, name)
+            for name in ("unmount_live_share", "fatal", "teardown")
+        ).replace("/sbin/nvx-exit", "nvx_exit")
+        result = subprocess.run(
+            [
+                self.shell,
+                "-s",
+                "--",
+                runtime.as_posix(),
+                log.as_posix(),
+                f"{self.rootfs.as_posix()}/workspace" if share else "",
+                failing,
+            ],
+            input=(
+                "set -eu\n"
+                "runtime=$1\nlog=$2\nshare_mountpoint=$3\nfailing=$4\n"
+                "rootfs=$runtime/rootfs\nlayers=$runtime/layers\n"
+                "scratch=$runtime/scratch\n"
+                'umount() { printf "umount %s\\n" "$1" >>"$log"; '
+                '[ "$1" != "$failing" ]; }\n'
+                'mountpoint() { [ "$2" = "$layers/distro" ]; }\n'
+                'nvx_exit() { printf "exit %s\\n" "$1" >>"$log"; exit "$1"; }\n'
+                f"{functions}{script}\n"
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        lines = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+        return result, lines
+
+    def test_agent_mounts_share_after_lifecycle_checks_for_both_lifecycles(self):
         mount_call = self.source.index("\nmount_live_share\n")
         self.assertLess(
             self.source.index('fatal "configured workload home is unavailable"'),
             mount_call,
         )
-        self.assertLess(mount_call, self.source.index('case "$workload_lifecycle"'))
         self.assertLess(
-            self.source.index('umount "$share_mountpoint"'),
-            self.source.index('if ! umount "$rootfs"; then'),
+            self.source.index('fatal "unsupported workload lifecycle'), mount_call
         )
+        machine_id = self.source.index('>"$runtime/workload-machine-id"')
+        managed_agent = self.source.index("\n    /sbin/nvx-managed-agent \\\n")
+        self.assertLess(mount_call, machine_id)
+        self.assertLess(machine_id, managed_agent)
+        self.assertLess(managed_agent, self.source.index("/sbin/nvx-container-launch"))
+        self.assertNotIn("exec /sbin/nvx-managed-agent", self.source)
+        self.assertEqual(self.source.count('\nteardown "$status"\n'), 1)
+        self.assertEqual(self.source.count('\n    teardown "$status"\n'), 1)
+        self.assertLess(managed_agent, self.source.index('\n    teardown "$status"\n'))
+
+    def test_agent_teardown_unmounts_share_before_overlay_layers_and_scratch(self):
+        result, log = self._run_teardown("teardown 7", share=True)
+        runtime = (self.root / "run").as_posix()
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(
+            log,
+            [
+                f"umount {self.rootfs.as_posix()}/workspace",
+                f"umount {runtime}/rootfs",
+                f"umount {runtime}/layers/distro",
+                f"umount {runtime}/scratch",
+                "exit 7",
+            ],
+        )
+        self.assertIn("NVX-SANDBOX-EXIT: status=7", result.stdout)
+        self.assertFalse((self.root / "run" / "workload-machine-id").exists())
+        self.assertFalse((self.root / "run" / "container.pid").exists())
+
+        result, log = self._run_teardown("teardown 0", share=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(log[0], f"umount {runtime}/rootfs")
+
+    def test_agent_teardown_reports_share_unmount_failure(self):
+        share = f"{self.rootfs.as_posix()}/workspace"
+        result, log = self._run_teardown("teardown 0", share=True, failing=share)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("failed to unmount the live share", result.stderr)
+        self.assertEqual(log[0], f"umount {share}")
+        self.assertEqual(log[-1], "exit 1")
+        self.assertIn("NVX-SANDBOX-EXIT: status=1", result.stdout)
+
+    def test_agent_fatal_unmounts_share_before_power_off(self):
+        result, log = self._run_teardown('fatal "synthetic failure"', share=True)
+        self.assertEqual(result.returncode, 125, result.stdout)
+        self.assertIn("NVX-SANDBOX-ERROR: synthetic failure", result.stderr)
+        self.assertEqual(
+            log, [f"umount {self.rootfs.as_posix()}/workspace", "exit 125"]
+        )
+
+        result, log = self._run_teardown('fatal "early failure"', share=False)
+        self.assertEqual(result.returncode, 125, result.stdout)
+        self.assertEqual(log, ["exit 125"])
 
     def test_agent_skips_share_without_bootstrap_tokens(self):
         result, log = self._run("console=hvc0 nvx_sandbox=1")
@@ -4872,6 +4965,110 @@ class SandboxShareAgentTests(unittest.TestCase):
         self.assertIn("crosses a symbolic link", result.stderr)
         self.assertEqual(log, "")
         self.assertFalse((outside / "project").exists())
+
+
+class ManagedAgentStopTests(unittest.TestCase):
+    SOURCE = Path(__file__).parents[1] / "guest" / "common" / "nvx-managed-agent.c"
+    OUTER = struct.Struct("<4sHBB16sQQI")
+    APP = struct.Struct("<4sBBHQiI")
+
+    def setUp(self):
+        if sys.platform != "linux":
+            self.skipTest("the managed agent requires a Linux pseudo-terminal")
+        compiler = shutil.which("cc") or shutil.which("gcc")
+        if compiler is None:
+            self.skipTest("C compiler is unavailable")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.agent = Path(temporary.name) / "nvx-managed-agent"
+        flags = [
+            flag
+            for flag in InitramfsBuildConstants.STATIC_HELPER_CFLAGS
+            if flag != "-static"
+        ]
+        result = subprocess.run(
+            [compiler, *flags, "-o", str(self.agent), str(self.SOURCE)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def _record(
+        self, record_type: int, instance: bytes, sequence: int, payload: bytes = b""
+    ) -> bytes:
+        header = self.OUTER.pack(
+            b"NVXS", 1, record_type, 0, instance, 1, sequence, len(payload)
+        )
+        return header + payload
+
+    def _read_exact(self, fd: int, length: int, deadline: float) -> bytes:
+        data = b""
+        while len(data) < length:
+            remaining = deadline - time.monotonic()
+            self.assertGreater(remaining, 0, "managed agent did not respond")
+            readable, _, _ = select.select([fd], [], [], remaining)
+            if readable:
+                chunk = os.read(fd, length - len(data))
+                self.assertTrue(chunk, "managed agent closed the control tty")
+                data += chunk
+        return data
+
+    def _read_record(self, fd: int, deadline: float) -> tuple[int, int, bytes]:
+        header = self._read_exact(fd, self.OUTER.size, deadline)
+        magic, version, record_type, flags, _, _, sequence, length = self.OUTER.unpack(
+            header
+        )
+        self.assertEqual((magic, version, flags), (b"NVXS", 1, 0))
+        return record_type, sequence, self._read_exact(fd, length, deadline)
+
+    @staticmethod
+    def _reap(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+
+    def test_sandbox_agent_returns_to_init_agent_after_stop(self):
+        if sys.platform != "linux":
+            self.skipTest("the managed agent requires a Linux pseudo-terminal")
+        import pty
+
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        process = subprocess.Popen(
+            [
+                str(self.agent),
+                os.ttyname(slave),
+                "/run/nvx/rootfs",
+                "nvx-sandbox",
+                "65534",
+                "65534",
+                "nobody",
+                "/nonexistent",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(self._reap, process)
+        deadline = time.monotonic() + 10
+        instance = bytes(range(1, 17))
+
+        self.assertEqual(self._read_record(master, deadline)[0], 1)
+        os.write(master, self._record(3, instance, 7))
+        record_type, sequence, credit = self._read_record(master, deadline)
+        self.assertEqual((record_type, sequence, len(credit)), (4, 0, 4))
+        stop = self.APP.pack(b"NVXC", 1, 3, 0, 42, 0, 0)
+        os.write(master, self._record(5, instance, 8, stop))
+        self.assertEqual(self._read_record(master, deadline)[0], 9)
+        record_type, _, payload = self._read_record(master, deadline)
+        self.assertEqual(record_type, 5)
+        _, _, kind, _, request_id, status, length = self.APP.unpack(payload)
+        self.assertEqual((kind, request_id, status, length), (0x85, 42, 0, 0))
+
+        _, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, stderr)
 
 
 class SandboxTests(unittest.TestCase):
