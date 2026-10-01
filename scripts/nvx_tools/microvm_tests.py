@@ -1415,6 +1415,7 @@ def run_l3_l4_egress_policy(
     memory_mib: int,
     timeout: float,
     output_dir: Path,
+    guest: str = "alpine",
 ) -> None:
     tcp, udp = _bind_egress_ports()
     for endpoint in (*tcp, *udp):
@@ -1466,6 +1467,8 @@ def run_l3_l4_egress_policy(
             sys.executable,
             str(Path(__file__).parents[1] / "nvx.py"),
             "run",
+            "--guest",
+            guest,
             "--hypervisor",
             backend,
             "--memory-mib",
@@ -4084,6 +4087,7 @@ def run(args: argparse.Namespace) -> int:
             memory_mib=args.memory_mib,
             timeout=args.timeout,
             output_dir=output_dir,
+            guest=descriptor.name,
         )
     if "host-loopback-policy" in scenarios:
         print(f"Running microVM host-loopback policy on OpenVMM/{args.backend}")
