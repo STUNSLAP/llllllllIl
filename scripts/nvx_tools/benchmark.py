@@ -4979,7 +4979,6 @@ def snapshot_restore_command(
         hypervisor,
         "--restore-snapshot",
         str(snapshot_path),
-        "--restore-entropy",
     ]
     if restore_processors is not None:
         command.extend(("--restore-processors", str(restore_processors)))
