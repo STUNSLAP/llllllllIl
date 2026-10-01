@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -13,8 +14,11 @@ from .common import ScriptError, strict_json_object
 
 MAX_RULES_PER_ACTION = 256
 MAX_POLICY_FILE_SIZE = 1024 * 1024
+_MAX_JSON_INTEGER_DIGITS = 64
 _ROOT_FIELDS = frozenset(("allow", "deny"))
 _RULE_FIELDS = frozenset(("cidr", "except", "protocol", "port", "endPort"))
+_AddressInterval = tuple[int, int]
+_AddressIntervals = tuple[_AddressInterval, ...]
 
 
 @dataclass(frozen=True)
@@ -25,7 +29,7 @@ class CompiledEgressPolicy:
 
 @dataclass(frozen=True)
 class _Rule:
-    networks: tuple[ipaddress.IPv4Network, ...]
+    addresses: _AddressIntervals
     protocol: str | None
     start_port: int | None
     end_port: int | None
@@ -66,32 +70,75 @@ def _port(value: object, description: str) -> int:
     return value
 
 
+def _bounded_json_integer(value: str) -> int:
+    if len(value.removeprefix("-")) > _MAX_JSON_INTEGER_DIGITS:
+        raise ValueError("JSON integer exceeds digit limit")
+    return int(value)
+
+
+def _merge_intervals(intervals: Iterable[_AddressInterval]) -> _AddressIntervals:
+    merged: list[_AddressInterval] = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1] + 1:
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def _subtract_intervals(
+    sources: _AddressIntervals,
+    exclusions: _AddressIntervals,
+) -> _AddressIntervals:
+    remaining: list[_AddressInterval] = []
+    exclusion_index = 0
+    for source_start, source_end in sources:
+        while (
+            exclusion_index < len(exclusions)
+            and exclusions[exclusion_index][1] < source_start
+        ):
+            exclusion_index += 1
+
+        cursor = source_start
+        current_index = exclusion_index
+        while (
+            current_index < len(exclusions)
+            and exclusions[current_index][0] <= source_end
+        ):
+            excluded_start, excluded_end = exclusions[current_index]
+            if cursor < excluded_start:
+                remaining.append((cursor, excluded_start - 1))
+            cursor = max(cursor, excluded_end + 1)
+            if cursor > source_end:
+                break
+            current_index += 1
+        if cursor <= source_end:
+            remaining.append((cursor, source_end))
+    return tuple(remaining)
+
+
 def _subtract_exclusions(
     parent: ipaddress.IPv4Network,
     exclusions: list[object],
     description: str,
-) -> tuple[ipaddress.IPv4Network, ...]:
-    parsed: list[ipaddress.IPv4Network] = []
+) -> _AddressIntervals:
+    parsed: list[_AddressInterval] = []
     for index, value in enumerate(exclusions):
         exclusion = _network(value, f"{description}.except[{index}]")
         if not exclusion.subnet_of(parent):
             raise ScriptError(
                 f"{description}.except[{index}] must be contained in {parent}"
             )
-        parsed.append(exclusion)
+        parsed.append(
+            (int(exclusion.network_address), int(exclusion.broadcast_address))
+        )
 
-    fragments = [parent]
-    for exclusion in ipaddress.collapse_addresses(parsed):
-        next_fragments: list[ipaddress.IPv4Network] = []
-        for fragment in fragments:
-            if exclusion == fragment:
-                continue
-            if exclusion.subnet_of(fragment):
-                next_fragments.extend(fragment.address_exclude(exclusion))
-            else:
-                next_fragments.append(fragment)
-        fragments = next_fragments
-    return tuple(ipaddress.collapse_addresses(fragments))
+    parent_interval = (
+        int(parent.network_address),
+        int(parent.broadcast_address),
+    )
+    return _subtract_intervals((parent_interval,), _merge_intervals(parsed))
 
 
 def _parse_rule(value: object, description: str) -> _Rule:
@@ -103,13 +150,13 @@ def _parse_rule(value: object, description: str) -> _Rule:
         raise ScriptError(f"{description}.cidr is required")
     parent = _network(rule["cidr"], f"{description}.cidr")
     exclusions = _array(rule.get("except", []), f"{description}.except")
-    networks = _subtract_exclusions(parent, exclusions, description)
+    addresses = _subtract_exclusions(parent, exclusions, description)
 
     protocol_value = rule.get("protocol")
     if "protocol" not in rule:
         if "port" in rule or "endPort" in rule:
             raise ScriptError(f"{description}.port requires protocol")
-        return _Rule(networks, None, None, None)
+        return _Rule(addresses, None, None, None)
     if not isinstance(protocol_value, str) or protocol_value not in ("tcp", "udp"):
         raise ScriptError(f"{description}.protocol must be tcp or udp")
     if "port" not in rule:
@@ -118,56 +165,70 @@ def _parse_rule(value: object, description: str) -> _Rule:
     end = _port(rule.get("endPort", start), f"{description}.endPort")
     if end < start:
         raise ScriptError(f"{description}.endPort cannot be below port")
-    return _Rule(networks, protocol_value, start, end)
+    return _Rule(addresses, protocol_value, start, end)
+
+
+def _intervals_to_networks(
+    intervals: _AddressIntervals,
+    maximum: int,
+    category: str,
+) -> tuple[ipaddress.IPv4Network, ...]:
+    networks: list[ipaddress.IPv4Network] = []
+    for start, end in intervals:
+        summarized = ipaddress.summarize_address_range(
+            ipaddress.IPv4Address(start),
+            ipaddress.IPv4Address(end),
+        )
+        for network in summarized:
+            if len(networks) >= maximum:
+                raise ScriptError(
+                    f"{category} emits at most {MAX_RULES_PER_ACTION} native rules"
+                )
+            networks.append(network)
+    return tuple(networks)
 
 
 def _lower_protocol_rules(
     rules: list[_Rule],
     protocol: str,
     category: str,
-    address_only: tuple[ipaddress.IPv4Network, ...],
+    address_only: _AddressIntervals,
     remaining_budget: int,
 ) -> list[tuple[ipaddress.IPv4Network, str, int]]:
-    events: dict[int, list[tuple[int, tuple[ipaddress.IPv4Network, ...]]]] = {}
+    events: dict[int, list[tuple[int, _AddressIntervals]]] = {}
     for rule in rules:
-        if rule.protocol != protocol or not rule.networks:
+        if rule.protocol != protocol or not rule.addresses:
             continue
         assert rule.start_port is not None
         assert rule.end_port is not None
-        events.setdefault(rule.start_port, []).append((1, rule.networks))
-        events.setdefault(rule.end_port + 1, []).append((-1, rule.networks))
+        events.setdefault(rule.start_port, []).append((1, rule.addresses))
+        events.setdefault(rule.end_port + 1, []).append((-1, rule.addresses))
 
-    active: Counter[ipaddress.IPv4Network] = Counter()
+    active: Counter[_AddressIntervals] = Counter()
     lowered: list[tuple[ipaddress.IPv4Network, str, int]] = []
     previous_port: int | None = None
     for port in sorted(events):
         if previous_port is not None and previous_port < port and active:
-            networks = list(ipaddress.collapse_addresses(active))
-            for covering in address_only:
-                uncovered: list[ipaddress.IPv4Network] = []
-                for network in networks:
-                    if network.subnet_of(covering):
-                        continue
-                    if covering.subnet_of(network):
-                        uncovered.extend(network.address_exclude(covering))
-                    else:
-                        uncovered.append(network)
-                networks = uncovered
-            emitted = len(networks) * (port - previous_port)
-            if len(lowered) + emitted > remaining_budget:
-                raise ScriptError(
-                    f"{category} emits at most {MAX_RULES_PER_ACTION} native rules"
-                )
+            addresses = _merge_intervals(
+                interval for intervals in active for interval in intervals
+            )
+            addresses = _subtract_intervals(addresses, address_only)
+            port_count = port - previous_port
+            network_budget = (remaining_budget - len(lowered)) // port_count
+            networks = _intervals_to_networks(
+                addresses,
+                network_budget,
+                category,
+            )
             lowered.extend(
                 (network, protocol, current_port)
                 for current_port in range(previous_port, port)
                 for network in networks
             )
-        for direction, networks in events[port]:
-            for network in networks:
-                active[network] += direction
-                if active[network] == 0:
-                    del active[network]
+        for direction, addresses in events[port]:
+            active[addresses] += direction
+            if active[addresses] == 0:
+                del active[addresses]
         previous_port = port
     return lowered
 
@@ -177,20 +238,19 @@ def _compile_category(value: object, category: str) -> tuple[str, ...]:
     rules = [
         _parse_rule(rule, f"{category}[{index}]") for index, rule in enumerate(values)
     ]
-    address_only = tuple(
-        ipaddress.collapse_addresses(
-            network
-            for rule in rules
-            if rule.protocol is None
-            for network in rule.networks
-        )
+    address_only = _merge_intervals(
+        interval
+        for rule in rules
+        if rule.protocol is None
+        for interval in rule.addresses
     )
-    if len(address_only) > MAX_RULES_PER_ACTION:
-        raise ScriptError(
-            f"{category} emits at most {MAX_RULES_PER_ACTION} native rules"
-        )
+    address_only_networks = _intervals_to_networks(
+        address_only,
+        MAX_RULES_PER_ACTION,
+        category,
+    )
     lowered: list[tuple[ipaddress.IPv4Network, str | None, int | None]] = [
-        (network, None, None) for network in address_only
+        (network, None, None) for network in address_only_networks
     ]
     for protocol in ("tcp", "udp"):
         lowered.extend(
@@ -238,7 +298,11 @@ def compile_policy_file(path: Path) -> CompiledEgressPolicy:
             f"egress policy file exceeds {MAX_POLICY_FILE_SIZE}-byte limit: {path}"
         )
     try:
-        value = json.loads(data.decode("utf-8"), object_pairs_hook=strict_json_object)
+        value = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=strict_json_object,
+            parse_int=_bounded_json_integer,
+        )
     except (UnicodeDecodeError, ValueError) as error:
         raise ScriptError(f"failed to read egress policy file: {path}") from error
     return compile_policy(value)

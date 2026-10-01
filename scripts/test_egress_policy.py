@@ -315,10 +315,10 @@ class EgressPolicyTests(unittest.TestCase):
                 }
             )
 
-    def test_canonicalizes_fragmented_rules_before_enforcing_native_budget(self):
+    def test_delays_fragment_conversion_until_after_covering_union(self):
         exclusions = [
             str(ipaddress.IPv4Address(int(ipaddress.IPv4Address("192.0.0.1")) + 2 * i))
-            for i in range(160)
+            for i in range(4096)
         ]
         fragmented = {
             "cidr": "192.0.0.0/16",
@@ -334,13 +334,21 @@ class EgressPolicyTests(unittest.TestCase):
             "endPort": 81,
         }
 
-        for rules in ([fragmented, covering], [covering, fragmented]):
-            with self.subTest(order=rules):
-                compiled = self.compile({"allow": rules})
-                self.assertEqual(
-                    compiled.allow,
-                    ("192.0.0.0/16:tcp:80", "192.0.0.0/16:tcp:81"),
-                )
+        original_summarize = ipaddress.summarize_address_range
+        with mock.patch.object(
+            ipaddress,
+            "summarize_address_range",
+            wraps=original_summarize,
+        ) as summarize:
+            for rules in ([fragmented, covering], [covering, fragmented]):
+                with self.subTest(order=rules):
+                    compiled = self.compile({"allow": rules})
+                    self.assertEqual(
+                        compiled.allow,
+                        ("192.0.0.0/16:tcp:80", "192.0.0.0/16:tcp:81"),
+                    )
+
+        self.assertEqual(summarize.call_count, 2)
 
     def test_validates_redundant_rules_before_canonicalization(self):
         with self.assertRaisesRegex(ScriptError, "unknown field"):
