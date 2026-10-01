@@ -8,7 +8,9 @@ import os
 import queue
 import secrets
 import socket
+import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1846,18 +1848,95 @@ def run_host_loopback_rejections(
 
 
 IO_REPARSE_TAG_LX_SYMLINK = 0xA000001D
+LX_SYMLINK_VERSION = 2
+
+
+def read_wsl_symlink(path: Path) -> bytes:
+    """Return the target stored in a WSL-style symbolic link on Windows."""
+    if sys.platform != "win32":
+        raise RuntimeError("WSL-style symbolic links exist only on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.DeviceIoControl.restype = wintypes.BOOL
+    kernel32.DeviceIoControl.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    file_read_attributes = 0x80
+    share_all = 0x7
+    open_existing = 3
+    open_reparse_point = 0x00200000
+    backup_semantics = 0x02000000
+    fsctl_get_reparse_point = 0x000900A8
+    handle = kernel32.CreateFileW(
+        str(path),
+        file_read_attributes,
+        share_all,
+        None,
+        open_existing,
+        open_reparse_point | backup_semantics,
+        None,
+    )
+    if handle in (None, wintypes.HANDLE(-1).value):
+        raise RuntimeError(f"cannot open guest symbolic link: {path}")
+    try:
+        buffer = ctypes.create_string_buffer(16 * 1024)
+        returned = wintypes.DWORD()
+        if not kernel32.DeviceIoControl(
+            handle,
+            fsctl_get_reparse_point,
+            None,
+            0,
+            buffer,
+            len(buffer),
+            ctypes.byref(returned),
+            None,
+        ):
+            raise RuntimeError(f"guest symbolic link is not a WSL-style link: {path}")
+    finally:
+        kernel32.CloseHandle(handle)
+    # REPARSE_DATA_BUFFER header: tag, data length, and reserved; the LX
+    # payload is a 32-bit version followed by the UTF-8 target.
+    data = buffer.raw[: returned.value]
+    tag, length = struct.unpack_from("<IH", data)
+    if tag != IO_REPARSE_TAG_LX_SYMLINK or len(data) != 8 + length or length < 4:
+        raise RuntimeError(f"guest symbolic link is not a WSL-style link: {path}")
+    if struct.unpack_from("<I", data, 8)[0] != LX_SYMLINK_VERSION:
+        raise RuntimeError(f"guest symbolic link has an unknown layout: {path}")
+    return data[12:]
 
 
 def assert_guest_symlink(path: Path, target: str) -> None:
     """Check a symbolic link that the guest created on a virtio-fs share.
 
-    Linux hosts store the exact target. Windows hosts store a WSL-style link,
-    which Windows neither reports as a symbolic link nor follows.
+    Linux hosts store the exact target. Windows hosts store a WSL-style link
+    with the exact target, which Windows neither reports as a symbolic link
+    nor follows.
     """
-    if os.name == "nt":
-        reparse_tag = getattr(path.lstat(), "st_reparse_tag", None)
-        if reparse_tag != IO_REPARSE_TAG_LX_SYMLINK:
-            raise RuntimeError(f"guest symbolic link is not a WSL-style link: {path}")
+    if sys.platform == "win32":
+        if read_wsl_symlink(path) != target.encode():
+            raise RuntimeError(
+                f"guest symbolic link {path} does not point to {target!r}"
+            )
         try:
             path.read_bytes()
         except OSError:

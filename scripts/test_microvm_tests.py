@@ -246,9 +246,12 @@ class GuestSymlinkTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "win32", "WSL-style links exist on Windows")
     def test_windows_link_must_be_an_inert_wsl_link(self):
         link = self.root / "link"
-        _create_wsl_symlink(link, "target")
-        microvm_tests.assert_guest_symlink(link, "target")
+        _create_wsl_symlink(link, "../target")
+        self.assertEqual(microvm_tests.read_wsl_symlink(link), b"../target")
+        microvm_tests.assert_guest_symlink(link, "../target")
 
+        with self.assertRaisesRegex(RuntimeError, "does not point to"):
+            microvm_tests.assert_guest_symlink(link, "target")
         with self.assertRaisesRegex(RuntimeError, "not a WSL-style link"):
             microvm_tests.assert_guest_symlink(self.target, "target")
         followable = self.root / "followable"

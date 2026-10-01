@@ -96,9 +96,9 @@ read-write share, the guest also exercises the symbolic-link primitives that
 package managers use: it creates an npm-style relative `.bin` link to an
 executable and runs it through the link, renames, replaces, and removes links,
 and creates absolute, dangling, outside-the-share, and denied-path links. The
-host then checks that every target is preserved exactly (on Windows, that each
-link is a WSL-style reparse point that Windows does not follow) and that no
-link read or modified host data outside the share or in the denied path. A
+host then checks that every target is preserved exactly (on Windows, by
+decoding each WSL-style reparse point, which Windows does not follow) and that
+no link read or modified host data outside the share or in the denied path. A
 managed sandbox then repeats
 the read-write check through `provision`, `start`, `exec`, and `stop`, and must
 report a successful outcome with a cleanly unmounted scratch filesystem, which

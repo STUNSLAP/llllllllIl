@@ -338,17 +338,26 @@ jobs:
           if (-not (Test-Path (Join-Path $share "nvx-guest-directory") -PathType Container)) {
               throw "guest directory did not reach the host"
           }
-          # Guest-created links are WSL-style reparse points that Windows never
-          # follows, so none of them reaches host data outside the policy.
-          foreach ($name in "nvx-tool", "absolute", "outside", "denied") {
-              $link = Join-Path $share "nvx-links\$name"
-              if (-not ([IO.File]::GetAttributes($link) -band [IO.FileAttributes]::ReparsePoint)) {
-                  throw "guest link $name is not a reparse point"
-              }
-              $followed = $true
-              try { $null = [IO.File]::ReadAllBytes($link) } catch { $followed = $false }
-              if ($followed) { throw "the host followed guest link $name" }
-          }
+          # Guest-created links are WSL-style reparse points that keep their
+          # exact targets and that Windows never follows, so none of them
+          # reaches host data outside the policy.
+          @'
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "scripts")
+          from nvx_tools.microvm_tests import assert_guest_symlink
+
+          links = Path(sys.argv[1])
+          for name, target in (
+              ("nvx-tool", "../nvx-tool"),
+              ("absolute", "/nvx/absolute/target"),
+              ("outside", "../../nvx-outside-marker"),
+              ("denied", "../nvx-denied/secret"),
+          ):
+              assert_guest_symlink(links / name, target)
+          '@ | python - (Join-Path $share "nvx-links")
+          if ($LASTEXITCODE -ne 0) { throw "guest links are not inert WSL-style links with exact targets" }
           if ([IO.File]::Exists((Join-Path $share "nvx-links\marker"))) { throw "guest link removal did not reach the host" }
           if ([IO.File]::ReadAllText($outside) -ne "host-outside`n") { throw "a guest link reached host data outside the share" }
           if ([IO.File]::ReadAllText((Join-Path $share "nvx-denied\secret")) -ne "secret`n") { throw "a guest link reached a denied file" }
@@ -442,9 +451,21 @@ jobs:
           if (-not (Test-Path (Join-Path $share "nvx-guest-directory") -PathType Container)) {
               throw "managed guest directory did not reach the host"
           }
-          if (-not ([IO.File]::GetAttributes((Join-Path $share "nvx-links\nvx-tool")) -band [IO.FileAttributes]::ReparsePoint)) {
-              throw "managed guest link is not a reparse point"
-          }
+          @'
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "scripts")
+          from nvx_tools.microvm_tests import assert_guest_symlink
+
+          links = Path(sys.argv[1])
+          for name, target in (
+              ("nvx-tool", "../nvx-tool"),
+              ("outside", "../../nvx-outside-marker"),
+          ):
+              assert_guest_symlink(links / name, target)
+          '@ | python - (Join-Path $share "nvx-links")
+          if ($LASTEXITCODE -ne 0) { throw "managed guest links are not inert WSL-style links with exact targets" }
           if ([IO.File]::ReadAllText($outside) -ne "host-outside`n") { throw "a managed guest link reached host data outside the share" }
           if ([IO.File]::ReadAllText((Join-Path $share "nvx-denied\secret")) -ne "secret`n") { throw "a managed guest link reached a denied file" }
           Invoke-Nvx sandbox deprovision --state-dir $state
