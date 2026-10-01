@@ -555,7 +555,7 @@ class AdversarialBrokerTests(unittest.TestCase):
 
 class AdversarialOracleTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process ownership")
-    def test_contained_guest_runner_preserves_unrelated_concurrent_child(self) -> None:
+    def test_contained_guest_runner_cleans_threaded_detached_child_only(self) -> None:
         for completion_marker in (b"SYNTHETIC-COMPLETE", b"NEVER-COMPLETE"):
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -585,16 +585,22 @@ class AdversarialOracleTests(unittest.TestCase):
                     "-u",
                     "-c",
                     (
-                        "import pathlib,subprocess,sys,time\n"
+                        "import pathlib,subprocess,sys,threading,time\n"
                         "print('ALPINE-MICROVM-BOOT-OK',flush=True)\n"
                         "sys.stdin.readline()\n"
                         "pathlib.Path(sys.argv[1]).touch()\n"
                         "continue_path=pathlib.Path(sys.argv[2])\n"
                         "while not continue_path.exists():\n"
                         "    time.sleep(0.01)\n"
-                        "child=subprocess.Popen([sys.executable,'-c',"
+                        "def spawn_from_thread():\n"
+                        "    child=subprocess.Popen([sys.executable,'-c',"
                         "'import os,time; os.setsid(); time.sleep(60)'])\n"
-                        "pathlib.Path(sys.argv[3]).write_text(str(child.pid))\n"
+                        "    pathlib.Path(sys.argv[3]).write_text(str(child.pid))\n"
+                        "    if sys.argv[4] == 'keep-thread':\n"
+                        "        time.sleep(60)\n"
+                        "threading.Thread(target=spawn_from_thread).start()\n"
+                        "while not pathlib.Path(sys.argv[3]).exists():\n"
+                        "    time.sleep(0.01)\n"
                         f"print({completion_marker!r}.decode(),flush=True)\n"
                         + (
                             "time.sleep(60)"
@@ -605,6 +611,11 @@ class AdversarialOracleTests(unittest.TestCase):
                     str(ready_path),
                     str(continue_path),
                     str(owned_pid_path),
+                    (
+                        "keep-thread"
+                        if completion_marker == b"NEVER-COMPLETE"
+                        else "return-thread"
+                    ),
                 ]
                 try:
                     if completion_marker == b"NEVER-COMPLETE":
@@ -621,7 +632,7 @@ class AdversarialOracleTests(unittest.TestCase):
                             command,
                             "continue\n",
                             completion_marker,
-                            timeout=0.5,
+                            timeout=5.0,
                             contain_process_tree=True,
                         )
                     spawner.join(timeout=5.0)
@@ -631,6 +642,10 @@ class AdversarialOracleTests(unittest.TestCase):
                     owned_pid = int(owned_pid_path.read_text(encoding="utf-8"))
                     self.assertFalse(_process_running(owned_pid))
                 finally:
+                    if owned_pid_path.exists():
+                        owned_pid = int(owned_pid_path.read_text(encoding="utf-8"))
+                        if _process_running(owned_pid):
+                            os.kill(owned_pid, 9)
                     if unrelated:
                         unrelated[0].kill()
                         unrelated[0].wait()

@@ -361,6 +361,31 @@ def _write_stdin(stream: BinaryIO, data: bytes, state: _StdinState) -> None:
         stream.close()
 
 
+def _linux_direct_children(pid: int) -> tuple[int, ...]:
+    task_path = Path(f"/proc/{pid}/task")
+    try:
+        task_ids = tuple(path.name for path in task_path.iterdir())
+    except FileNotFoundError:
+        return ()
+    except OSError as error:
+        raise ScriptError(
+            f"cannot enumerate process {pid} threads: {error}"
+        ) from error
+
+    children: set[int] = set()
+    for task_id in task_ids:
+        children_path = task_path / task_id / "children"
+        try:
+            children.update(int(value) for value in children_path.read_text().split())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            raise ScriptError(
+                f"cannot enumerate process {pid} thread {task_id} children: {error}"
+            ) from error
+    return tuple(sorted(children))
+
+
 def _freeze_linux_process_tree(pid: int) -> list[int]:
     sigstop = cast(int, getattr(signal, "SIGSTOP"))  # noqa: B009
     try:
@@ -369,32 +394,19 @@ def _freeze_linux_process_tree(pid: int) -> list[int]:
         return []
     except PermissionError as error:
         raise ScriptError(f"cannot stop process {pid} for cleanup: {error}") from error
-    children_path = Path(f"/proc/{pid}/task/{pid}/children")
-    try:
-        children = [int(value) for value in children_path.read_text().split()]
-    except FileNotFoundError:
-        children = []
-    except (OSError, ValueError) as error:
-        raise ScriptError(
-            f"cannot enumerate process {pid} children: {error}"
-        ) from error
+
     frozen: list[int] = []
-    for child in children:
-        frozen.extend(_freeze_linux_process_tree(child))
+    seen_children: set[int] = set()
+    while True:
+        children = _linux_direct_children(pid)
+        new_children = tuple(child for child in children if child not in seen_children)
+        if not new_children:
+            break
+        seen_children.update(new_children)
+        for child in new_children:
+            frozen.extend(_freeze_linux_process_tree(child))
     frozen.append(pid)
     return frozen
-
-
-def _linux_direct_children(pid: int) -> tuple[int, ...]:
-    children_path = Path(f"/proc/{pid}/task/{pid}/children")
-    try:
-        return tuple(int(value) for value in children_path.read_text().split())
-    except FileNotFoundError:
-        return ()
-    except (OSError, ValueError) as error:
-        raise ScriptError(
-            f"cannot enumerate process {pid} children: {error}"
-        ) from error
 
 
 def _reap_linux_descendants(pids: Sequence[int]) -> None:
