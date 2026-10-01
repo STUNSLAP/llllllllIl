@@ -18,7 +18,7 @@ import unittest
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from nvx_tools.adversarial import (
     LOCAL_EXECUTOR_STATE_ROOT,
@@ -61,6 +61,7 @@ from nvx_tools.adversarial_oracles import (
     OracleSession,
     _freeze_linux_process_tree,
     _reap_linux_children,
+    _reap_linux_descendants,
     _WindowsJob,
     run_bounded_process,
 )
@@ -599,6 +600,50 @@ class AdversarialOracleTests(unittest.TestCase):
             _reap_linux_children(99)
 
         reap.assert_called_once_with((101,), deadline=105.0)
+
+    def test_linux_descendant_reaping_propagates_deadline_to_each_freeze(self) -> None:
+        with (
+            patch.object(signal, "SIGKILL", 9, create=True),
+            patch.object(os, "WNOHANG", 1, create=True),
+            patch(
+                "nvx_tools.adversarial_oracles._freeze_linux_process_tree",
+                side_effect=([], []),
+            ) as freeze,
+            patch(
+                "nvx_tools.adversarial_oracles.time.monotonic",
+                return_value=100.0,
+            ),
+        ):
+            _reap_linux_descendants((101, 202), deadline=105.0)
+
+        self.assertEqual(
+            freeze.call_args_list,
+            [
+                call(101, deadline=105.0),
+                call(202, deadline=105.0),
+            ],
+        )
+
+    def test_linux_descendant_reaping_checks_deadline_between_roots(self) -> None:
+        with (
+            patch.object(signal, "SIGKILL", 9, create=True),
+            patch.object(os, "WNOHANG", 1, create=True),
+            patch(
+                "nvx_tools.adversarial_oracles._freeze_linux_process_tree",
+                return_value=[],
+            ) as freeze,
+            patch(
+                "nvx_tools.adversarial_oracles.time.monotonic",
+                side_effect=(100.0, 106.0),
+            ),
+            self.assertRaisesRegex(
+                ScriptError,
+                "timed out freezing descendant processes for cleanup",
+            ),
+        ):
+            _reap_linux_descendants((101, 202), deadline=105.0)
+
+        freeze.assert_called_once_with(101, deadline=105.0)
 
     def test_process_tree_enumeration_waits_for_every_thread_to_stop(self) -> None:
         events: list[str] = []

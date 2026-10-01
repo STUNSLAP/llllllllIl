@@ -478,7 +478,9 @@ def _reap_linux_descendants(
     process_tree: list[int] = []
     seen: set[int] = set()
     for pid in pids:
-        for descendant in _freeze_linux_process_tree(pid):
+        if time.monotonic() >= deadline:
+            raise ScriptError("timed out freezing descendant processes for cleanup")
+        for descendant in _freeze_linux_process_tree(pid, deadline=deadline):
             if descendant not in seen:
                 seen.add(descendant)
                 process_tree.append(descendant)
