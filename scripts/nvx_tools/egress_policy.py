@@ -72,7 +72,9 @@ def _port(value: object, description: str) -> int:
 
 def _bounded_json_integer(value: str) -> int:
     if len(value.removeprefix("-")) > _MAX_JSON_INTEGER_DIGITS:
-        raise ValueError("JSON integer exceeds digit limit")
+        raise ScriptError(
+            f"JSON integer exceeds {_MAX_JSON_INTEGER_DIGITS}-digit limit"
+        )
     return int(value)
 
 
@@ -199,10 +201,13 @@ def _lower_protocol_rules(
     for rule in rules:
         if rule.protocol != protocol or not rule.addresses:
             continue
+        uncovered_addresses = _subtract_intervals(rule.addresses, address_only)
+        if not uncovered_addresses:
+            continue
         assert rule.start_port is not None
         assert rule.end_port is not None
-        events.setdefault(rule.start_port, []).append((1, rule.addresses))
-        events.setdefault(rule.end_port + 1, []).append((-1, rule.addresses))
+        events.setdefault(rule.start_port, []).append((1, uncovered_addresses))
+        events.setdefault(rule.end_port + 1, []).append((-1, uncovered_addresses))
 
     active: Counter[_AddressIntervals] = Counter()
     lowered: list[tuple[ipaddress.IPv4Network, str, int]] = []
@@ -212,7 +217,6 @@ def _lower_protocol_rules(
             addresses = _merge_intervals(
                 interval for intervals in active for interval in intervals
             )
-            addresses = _subtract_intervals(addresses, address_only)
             port_count = port - previous_port
             network_budget = (remaining_budget - len(lowered)) // port_count
             networks = _intervals_to_networks(

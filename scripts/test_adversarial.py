@@ -862,6 +862,56 @@ class AdversarialOracleTests(unittest.TestCase):
         self.assertFalse(propagated.timed_out)
         self.assertEqual(propagated.returncode, 7)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process ownership")
+    def test_contained_native_process_preserves_child_signal_status(self) -> None:
+        sigkill = cast(int, getattr(signal, "SIGKILL"))  # noqa: B009
+        cases = (
+            ("sigterm", int(signal.SIGTERM), -int(signal.SIGTERM)),
+            ("sigkill", sigkill, -sigkill),
+            ("exit", 0, 7),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, child_signal, expected_returncode in cases:
+                with self.subTest(name=name):
+                    owned_pid_path = root / f"{name}.owned.pid"
+                    unrelated = subprocess.Popen(
+                        [sys.executable, "-c", "import time; time.sleep(60)"]
+                    )
+                    try:
+                        result = run_bounded_process(
+                            [
+                                sys.executable,
+                                "-c",
+                                (
+                                    "import os,pathlib,signal,subprocess,sys; "
+                                    "child=subprocess.Popen([sys.executable,'-c',"
+                                    "'import os,time; os.setsid(); time.sleep(60)'],"
+                                    "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+                                    "stderr=subprocess.DEVNULL); "
+                                    "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+                                    "signum=int(sys.argv[2]); "
+                                    "os.kill(os.getpid(),signum) if signum else sys.exit(7)"
+                                ),
+                                str(owned_pid_path),
+                                str(child_signal),
+                            ],
+                            cwd=Path.cwd(),
+                            output_dir=root / name,
+                            timeout=5.0,
+                            environment=os.environ,
+                            contained_by_parent=True,
+                        )
+                        owned_pid = int(owned_pid_path.read_text(encoding="utf-8"))
+                        self.assertFalse(result.timed_out)
+                        self.assertEqual(result.returncode, expected_returncode)
+                        self.assertTrue(result.teardown_complete)
+                        self.assertFalse(_process_running(owned_pid))
+                        self.assertIsNone(unrelated.poll())
+                    finally:
+                        unrelated.kill()
+                        unrelated.wait()
+
     def test_failed_windows_job_assignment_does_not_resume_process(self) -> None:
         job = _WindowsJob.__new__(_WindowsJob)
         kernel32 = MagicMock()

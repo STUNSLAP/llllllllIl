@@ -368,9 +368,7 @@ def _linux_direct_children(pid: int) -> tuple[int, ...]:
     except FileNotFoundError:
         return ()
     except OSError as error:
-        raise ScriptError(
-            f"cannot enumerate process {pid} threads: {error}"
-        ) from error
+        raise ScriptError(f"cannot enumerate process {pid} threads: {error}") from error
 
     children: set[int] = set()
     for task_id in task_ids:
@@ -505,6 +503,18 @@ def _reap_linux_descendants(pids: Sequence[int]) -> None:
         time.sleep(0.01)
 
 
+def _redeliver_linux_signal(signum: int) -> None:
+    sigkill = cast(int, getattr(signal, "SIGKILL"))  # noqa: B009
+    if signum != sigkill:
+        signal.signal(signum, signal.SIG_DFL)
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    sig_unblock = getattr(signal, "SIG_UNBLOCK", None)
+    if pthread_sigmask is not None and sig_unblock is not None:
+        pthread_sigmask(sig_unblock, {signum})
+    os.kill(os.getpid(), signum)
+    raise ScriptError(f"failed to redeliver signal {signum} to process supervisor")
+
+
 def supervise_linux_process(command: Sequence[str]) -> int:
     """Run and fully reap one process tree inside a private subreaper."""
     if not command:
@@ -531,6 +541,8 @@ def supervise_linux_process(command: Sequence[str]) -> int:
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, cast(Any, handler))
+    if returncode < 0:
+        _redeliver_linux_signal(-returncode)
     return returncode
 
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pyright: reportPrivateUsage=false
 
 import ipaddress
 import json
@@ -9,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
+import nvx_tools.egress_policy as egress_policy  # noqa: E402
 from nvx_tools.common import ScriptError  # noqa: E402
 from nvx_tools.egress_policy import (
     MAX_POLICY_FILE_SIZE,  # noqa: E402
@@ -212,7 +214,7 @@ class EgressPolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ScriptError, "byte limit"):
                     compile_policy_file(path)
 
-    def test_wraps_oversized_json_integer_rejection(self):
+    def test_reports_oversized_json_integer_rejection(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "policy.json"
             path.write_text(
@@ -220,7 +222,7 @@ class EgressPolicyTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(
-                ScriptError, "failed to read egress policy file"
+                ScriptError, "^JSON integer exceeds 64-digit limit$"
             ):
                 compile_policy_file(path)
 
@@ -385,6 +387,35 @@ class EgressPolicyTests(unittest.TestCase):
             with self.subTest(rules=rules):
                 compiled = self.compile({"allow": rules})
                 self.assertEqual(compiled.allow, ("192.0.2.0/24",))
+
+    def test_address_only_rule_prunes_redundant_port_events_before_sweep(self):
+        covering = {"cidr": "0.0.0.0/0"}
+        protocol_rules = [
+            {
+                "cidr": "192.0.2.1",
+                "protocol": "tcp",
+                "port": start,
+                "endPort": 2001 - start,
+            }
+            for start in range(1, 1001)
+        ]
+        original_convert = egress_policy._intervals_to_networks
+
+        for rules in (
+            [covering, *protocol_rules],
+            [*protocol_rules, covering],
+        ):
+            with (
+                self.subTest(covering_first=rules[0] is covering),
+                mock.patch.object(
+                    egress_policy,
+                    "_intervals_to_networks",
+                    wraps=original_convert,
+                ) as convert,
+            ):
+                compiled = self.compile({"allow": rules})
+                self.assertEqual(compiled.allow, ("0.0.0.0/0",))
+                self.assertEqual(convert.call_count, 2)
 
 
 if __name__ == "__main__":
