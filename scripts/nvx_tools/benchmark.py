@@ -33,6 +33,7 @@ from string import Template
 from typing import TextIO, TypedDict, cast
 
 from . import common
+from .adversarial_oracles import ProcessTreeContainment
 from .build_constants import (
     AlpineBuildConstants,
     BuildConstants,
@@ -1295,8 +1296,18 @@ def parse_virtio_restore_event(line: str) -> dict[str, object] | None:
 
 
 class InteractiveProcess:
-    def __init__(self, command: Sequence[str], environment: dict[str, str]) -> None:
+    def __init__(
+        self,
+        command: Sequence[str],
+        environment: dict[str, str],
+        *,
+        contain_process_tree: bool = False,
+    ) -> None:
         self.terminal_fd: int | None = None
+        self.containment = ProcessTreeContainment() if contain_process_tree else None
+        creationflags = (
+            self.containment.creationflags if self.containment is not None else 0
+        )
         if sys.platform.startswith("linux"):
             openpty = cast(
                 Callable[[], tuple[int, int]] | None,
@@ -1312,21 +1323,38 @@ class InteractiveProcess:
                     stdout=child_fd,
                     stderr=child_fd,
                     env=environment,
+                    creationflags=creationflags,
                 )
             except Exception:
                 os.close(terminal_fd)
+                if self.containment is not None:
+                    self.containment.abort_spawn()
                 raise
             finally:
                 os.close(child_fd)
             self.terminal_fd = terminal_fd
         else:
-            self.process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env=environment,
-            )
+            try:
+                self.process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=environment,
+                    creationflags=creationflags,
+                )
+            except Exception:
+                if self.containment is not None:
+                    self.containment.abort_spawn()
+                raise
+        try:
+            if self.containment is not None:
+                self.containment.attach(self.process)
+        except BaseException:
+            self.process.kill()
+            self.process.wait()
+            self.close()
+            raise
         try:
             record_adversarial_openvmm_pid(self.process.pid, environment)
         except BaseException:
@@ -1366,9 +1394,16 @@ class InteractiveProcess:
             self.process.stdin.flush()
 
     def close(self) -> None:
+        if self.containment is not None:
+            self.containment.close(self.process)
         if self.terminal_fd is not None:
             os.close(self.terminal_fd)
             self.terminal_fd = None
+        else:
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+            if self.process.stdout is not None:
+                self.process.stdout.close()
 
 
 def record_adversarial_openvmm_pid(
@@ -2041,11 +2076,16 @@ def run_guest_script(
     teardown_mode: str = "guest-exit",
     log_path: Path | None = None,
     boot_marker: bytes = BOOT_MARKER,
+    contain_process_tree: bool = False,
 ) -> GuestCommandResult:
     environment = os.environ.copy()
     environment["OPENVMM_LOG"] = "off"
     started_ns = time.perf_counter_ns()
-    interaction = InteractiveProcess(command, environment)
+    interaction = InteractiveProcess(
+        command,
+        environment,
+        contain_process_tree=contain_process_tree,
+    )
     process = interaction.process
     if windows_cpus is not None:
         set_windows_affinity(process.pid, windows_cpus)
@@ -2069,6 +2109,8 @@ def run_guest_script(
             except queue.Empty:
                 peak_bytes = _try_peak_rss(process, peak_bytes)
                 if process.poll() is not None:
+                    if interaction.containment is not None:
+                        interaction.containment.close(process)
                     continue
                 continue
             if chunk is None:

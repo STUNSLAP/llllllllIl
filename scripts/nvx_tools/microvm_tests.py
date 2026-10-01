@@ -231,6 +231,7 @@ def run_guest_script(
     windows_cpus: set[int] | None = None,
     teardown_mode: str = "guest-exit",
     log_path: Path | None = None,
+    contain_process_tree: bool = False,
 ) -> GuestCommandResult:
     return _run_guest_script(
         command,
@@ -241,6 +242,7 @@ def run_guest_script(
         teardown_mode=teardown_mode,
         log_path=log_path,
         boot_marker=BOOT_MARKER,
+        contain_process_tree=contain_process_tree,
     )
 
 
@@ -1506,6 +1508,7 @@ def run_l3_l4_egress_policy(
             L3_L4_EGRESS_COMPLETION_MARKER,
             timeout=timeout,
             log_path=output_dir / "l3-l4-egress-policy.log",
+            contain_process_tree=True,
         )
         server.join(timeout)
         if server.is_alive():

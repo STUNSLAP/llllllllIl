@@ -657,6 +657,50 @@ def _reap_contained_descendants(
         _reap_linux_descendants(children)
 
 
+class ProcessTreeContainment:
+    """Own a spawned process tree without discovering unrelated processes."""
+
+    def __init__(self) -> None:
+        _enable_linux_child_subreaper()
+        self._linux_children_before = (
+            frozenset(_linux_direct_children(os.getpid()))
+            if sys.platform.startswith("linux")
+            else frozenset[int]()
+        )
+        self._windows_job: _WindowsJob | None = (
+            _WindowsJob() if os.name == "nt" else None
+        )
+        self._closed = False
+
+    @property
+    def creationflags(self) -> int:
+        return _WINDOWS_CREATE_SUSPENDED if os.name == "nt" else 0
+
+    def attach(self, process: subprocess.Popen[bytes]) -> None:
+        if self._windows_job is not None:
+            self._windows_job.assign_and_resume(process)
+
+    def abort_spawn(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._windows_job is not None:
+            self._windows_job.close()
+
+    def close(self, process: subprocess.Popen[bytes]) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._windows_job is not None:
+            _cleanup_windows_job(self._windows_job)
+            return
+        if process.poll() is None:
+            _terminate_process(process, process_group=False)
+        _reap_contained_descendants(
+            linux_children_before=self._linux_children_before,
+        )
+
+
 def terminate_process_tree(
     process: subprocess.Popen[bytes],
     *,

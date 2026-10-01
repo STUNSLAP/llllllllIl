@@ -1780,6 +1780,10 @@ class MicrovmTests(unittest.TestCase):
                             "quiet loglevel=0",
                         ],
                     )
+                    self.assertIs(
+                        run_guest_script.call_args.kwargs["contain_process_tree"],
+                        True,
+                    )
                     requested = json.loads(policy_path.read_text(encoding="utf-8"))
                     self.assertEqual(requested["allow"][0]["port"], 21001)
                     self.assertEqual(requested["allow"][0]["endPort"], 21003)

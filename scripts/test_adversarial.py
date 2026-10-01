@@ -59,7 +59,7 @@ from nvx_tools.adversarial_oracles import (
     _WindowsJob,
     run_bounded_process,
 )
-from nvx_tools.benchmark import InteractiveProcess
+from nvx_tools.benchmark import InteractiveProcess, run_guest_script
 from nvx_tools.build_constants import (
     AlpineBuildConstants,
     InitramfsBuildConstants,
@@ -552,6 +552,61 @@ class AdversarialBrokerTests(unittest.TestCase):
 
 
 class AdversarialOracleTests(unittest.TestCase):
+    def test_contained_guest_runner_timeout_kills_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            child_pid_path = Path(temporary) / "child.pid"
+            command = [
+                sys.executable,
+                "-u",
+                "-c",
+                (
+                    "import pathlib,subprocess,sys,time; "
+                    "child=subprocess.Popen([sys.executable,'-c',"
+                    "'import time; time.sleep(60)']); "
+                    "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+                    "print('ALPINE-MICROVM-BOOT-OK',flush=True); time.sleep(60)"
+                ),
+                str(child_pid_path),
+            ]
+            with self.assertRaisesRegex(RuntimeError, "did not finish"):
+                run_guest_script(
+                    command,
+                    "exit\n",
+                    b"NEVER-COMPLETE",
+                    timeout=0.5,
+                    contain_process_tree=True,
+                )
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        self.assertFalse(_process_running(child_pid))
+
+    def test_contained_guest_runner_normal_exit_kills_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            child_pid_path = Path(temporary) / "child.pid"
+            command = [
+                sys.executable,
+                "-u",
+                "-c",
+                (
+                    "import pathlib,subprocess,sys; "
+                    "print('ALPINE-MICROVM-BOOT-OK',flush=True); sys.stdin.readline(); "
+                    "child=subprocess.Popen([sys.executable,'-c',"
+                    "'import time; time.sleep(60)']); "
+                    "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+                    "print('SYNTHETIC-COMPLETE',flush=True)"
+                ),
+                str(child_pid_path),
+            ]
+            result = run_guest_script(
+                command,
+                "continue\n",
+                b"SYNTHETIC-COMPLETE",
+                timeout=5.0,
+                contain_process_tree=True,
+            )
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        self.assertIn("SYNTHETIC-COMPLETE", result["text"])
+        self.assertFalse(_process_running(child_pid))
+
     def test_process_timeout_bounds_blocked_stdin_writer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result = run_bounded_process(
