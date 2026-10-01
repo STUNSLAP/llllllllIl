@@ -466,7 +466,13 @@ def _freeze_linux_process_tree(
     return frozen
 
 
-def _reap_linux_descendants(pids: Sequence[int]) -> None:
+def _reap_linux_descendants(
+    pids: Sequence[int],
+    *,
+    deadline: float | None = None,
+) -> None:
+    if deadline is None:
+        deadline = time.monotonic() + PROCESS_TERMINATION_WAIT_SECONDS
     sigkill = cast(int, getattr(signal, "SIGKILL"))  # noqa: B009
     wnohang = cast(int, getattr(os, "WNOHANG"))  # noqa: B009
     process_tree: list[int] = []
@@ -481,7 +487,6 @@ def _reap_linux_descendants(pids: Sequence[int]) -> None:
             os.kill(pid, sigkill)
         except ProcessLookupError:
             continue
-    deadline = time.monotonic() + PROCESS_TERMINATION_WAIT_SECONDS
     remaining = set(process_tree)
     while remaining:
         for pid in tuple(remaining):
@@ -501,6 +506,14 @@ def _reap_linux_descendants(pids: Sequence[int]) -> None:
                 + ", ".join(str(pid) for pid in sorted(remaining))
             )
         time.sleep(0.01)
+
+
+def _reap_linux_children(parent_pid: int) -> None:
+    deadline = time.monotonic() + PROCESS_TERMINATION_WAIT_SECONDS
+    while children := _linux_direct_children(parent_pid):
+        if time.monotonic() >= deadline:
+            raise ScriptError(f"timed out reaping descendants of process {parent_pid}")
+        _reap_linux_descendants(children, deadline=deadline)
 
 
 def _redeliver_linux_signal(signum: int) -> None:
@@ -537,7 +550,7 @@ def supervise_linux_process(command: Sequence[str]) -> int:
         previous_handlers[signum] = signal.signal(signum, forward_signal)
     returncode = process.wait()
     try:
-        _reap_linux_descendants(_linux_direct_children(os.getpid()))
+        _reap_linux_children(os.getpid())
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, cast(Any, handler))

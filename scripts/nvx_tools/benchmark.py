@@ -1362,9 +1362,30 @@ class InteractiveProcess:
             raise
         try:
             record_adversarial_openvmm_pid(self.process.pid, environment)
-        except BaseException:
-            terminate(self.process)
-            self.close()
+        except BaseException as primary_error:
+            cleanup_error: BaseException | None = None
+            if self.containment is not None:
+                try:
+                    self.close()
+                except BaseException as error:
+                    cleanup_error = error
+                try:
+                    terminate(self.process)
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+            else:
+                try:
+                    terminate(self.process)
+                except BaseException as error:
+                    cleanup_error = error
+                try:
+                    self.close()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+            if cleanup_error is not None:
+                raise primary_error from cleanup_error
             raise
 
     def read_output(self, chunks: queue.Queue[bytes | None]) -> None:

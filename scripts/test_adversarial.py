@@ -60,6 +60,7 @@ from nvx_tools.adversarial_oracles import (
     BoundedProcessResult,
     OracleSession,
     _freeze_linux_process_tree,
+    _reap_linux_children,
     _WindowsJob,
     run_bounded_process,
 )
@@ -556,6 +557,49 @@ class AdversarialBrokerTests(unittest.TestCase):
 
 
 class AdversarialOracleTests(unittest.TestCase):
+    def test_linux_child_reaping_rescans_reparented_descendants(self) -> None:
+        with (
+            patch(
+                "nvx_tools.adversarial_oracles._linux_direct_children",
+                side_effect=((101,), (202,), ()),
+            ),
+            patch("nvx_tools.adversarial_oracles._reap_linux_descendants") as reap,
+            patch(
+                "nvx_tools.adversarial_oracles.time.monotonic",
+                return_value=100.0,
+            ),
+        ):
+            _reap_linux_children(99)
+
+        self.assertEqual(
+            [entry.args[0] for entry in reap.call_args_list],
+            [(101,), (202,)],
+        )
+        self.assertEqual(
+            {entry.kwargs["deadline"] for entry in reap.call_args_list},
+            {105.0},
+        )
+
+    def test_linux_child_reaping_bounds_repeated_adoptions(self) -> None:
+        with (
+            patch(
+                "nvx_tools.adversarial_oracles._linux_direct_children",
+                return_value=(101,),
+            ),
+            patch("nvx_tools.adversarial_oracles._reap_linux_descendants") as reap,
+            patch(
+                "nvx_tools.adversarial_oracles.time.monotonic",
+                side_effect=(100.0, 100.0, 106.0),
+            ),
+            self.assertRaisesRegex(
+                ScriptError,
+                "timed out reaping descendants of process 99",
+            ),
+        ):
+            _reap_linux_children(99)
+
+        reap.assert_called_once_with((101,), deadline=105.0)
+
     def test_process_tree_enumeration_waits_for_every_thread_to_stop(self) -> None:
         events: list[str] = []
 
@@ -1003,6 +1047,100 @@ class AdversarialOracleTests(unittest.TestCase):
                     {"NVX_ADVERSARIAL_OPENVMM_PID_JOURNAL": str(missing)},
                 )
         terminate.assert_called_once_with(process)
+
+    def test_pid_journal_failure_preserves_cleanup_error_as_cause(self) -> None:
+        process = MagicMock()
+        process.pid = 4321
+        with (
+            patch(
+                "nvx_tools.benchmark.subprocess.Popen",
+                return_value=process,
+            ),
+            patch("nvx_tools.benchmark.sys.platform", "win32"),
+            patch(
+                "nvx_tools.benchmark.record_adversarial_openvmm_pid",
+                side_effect=OSError("synthetic journal failure"),
+            ),
+            patch(
+                "nvx_tools.benchmark.terminate",
+                side_effect=RuntimeError("synthetic cleanup failure"),
+            ),
+            patch.object(InteractiveProcess, "close") as close,
+            self.assertRaisesRegex(OSError, "synthetic journal failure") as raised,
+        ):
+            InteractiveProcess(["openvmm"], {})
+
+        close.assert_called_once_with()
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertEqual(
+            str(raised.exception.__cause__),
+            "synthetic cleanup failure",
+        )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process ownership")
+    def test_pid_journal_failure_cleans_contained_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command_pid_path = root / "command.pid"
+            descendant_pid_path = root / "descendant.pid"
+            unrelated = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"]
+            )
+            owned_pids: list[int] = []
+
+            def fail_pid_journal(_pid: int, _environment: object) -> None:
+                deadline = time.monotonic() + 5.0
+                while not descendant_pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not descendant_pid_path.exists():
+                    raise AssertionError("contained descendant did not start")
+                raise OSError("synthetic PID journal failure")
+
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import os,pathlib,subprocess,sys,time; "
+                    "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+                    "child=subprocess.Popen([sys.executable,'-c',"
+                    "'import os,time; os.setsid(); time.sleep(60)'],"
+                    "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+                    "stderr=subprocess.DEVNULL); "
+                    "pathlib.Path(sys.argv[2]).write_text(str(child.pid)); "
+                    "time.sleep(60)"
+                ),
+                str(command_pid_path),
+                str(descendant_pid_path),
+            ]
+            try:
+                with (
+                    patch(
+                        "nvx_tools.benchmark.record_adversarial_openvmm_pid",
+                        side_effect=fail_pid_journal,
+                    ),
+                    self.assertRaisesRegex(
+                        OSError,
+                        "synthetic PID journal failure",
+                    ),
+                ):
+                    InteractiveProcess(
+                        command,
+                        dict(os.environ),
+                        contain_process_tree=True,
+                    )
+
+                owned_pids = [
+                    int(command_pid_path.read_text(encoding="utf-8")),
+                    int(descendant_pid_path.read_text(encoding="utf-8")),
+                ]
+                self.assertTrue(all(not _process_running(pid) for pid in owned_pids))
+                self.assertIsNone(unrelated.poll())
+            finally:
+                for pid in owned_pids:
+                    if _process_running(pid):
+                        os.kill(pid, 9)
+                unrelated.kill()
+                unrelated.wait()
 
     def test_filesystem_and_network_canaries_detect_policy_violations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
