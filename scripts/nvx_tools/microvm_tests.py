@@ -1845,6 +1845,28 @@ def run_host_loopback_rejections(
             )
 
 
+IO_REPARSE_TAG_LX_SYMLINK = 0xA000001D
+
+
+def assert_guest_symlink(path: Path, target: str) -> None:
+    """Check a symbolic link that the guest created on a virtio-fs share.
+
+    Linux hosts store the exact target. Windows hosts store a WSL-style link,
+    which Windows neither reports as a symbolic link nor follows.
+    """
+    if os.name == "nt":
+        reparse_tag = getattr(path.lstat(), "st_reparse_tag", None)
+        if reparse_tag != IO_REPARSE_TAG_LX_SYMLINK:
+            raise RuntimeError(f"guest symbolic link is not a WSL-style link: {path}")
+        try:
+            path.read_bytes()
+        except OSError:
+            return
+        raise RuntimeError(f"the host followed a guest symbolic link: {path}")
+    if not path.is_symlink() or os.readlink(path) != target:
+        raise RuntimeError(f"guest symbolic link {path} does not point to {target!r}")
+
+
 def run_denied_filesystem_paths(
     executable: Path,
     kernel: Path,
@@ -1901,6 +1923,10 @@ def run_denied_filesystem_paths(
             raise RuntimeError("allowed filesystem path did not remain writable")
         if secret.read_bytes() != b"NVX-SECRET\n":
             raise RuntimeError("denied filesystem path was modified")
+        assert_guest_symlink(allowed / "token-link", "../secrets/token")
+        assert_guest_symlink(root / "guest-alias", "secrets")
+        if os.path.lexists(secrets / "guest-link"):
+            raise RuntimeError("guest created a symbolic link in a denied path")
 
         outside = Path(temporary) / "outside"
         outside.mkdir()
@@ -2968,6 +2994,8 @@ def run_filesystem_snapshot(
         )
         if (read_only_root / "mutation").exists():
             raise RuntimeError("read-only virtio-fs mount accepted a host mutation")
+        if os.path.lexists(read_only_root / "link"):
+            raise RuntimeError("read-only virtio-fs mount accepted a symbolic link")
 
         dormant_snapshot = root / "dormant-snapshot"
         dormant_capture = [
@@ -3079,6 +3107,7 @@ def run_filesystem_snapshot(
             raise RuntimeError("live filesystem source crossed the capture boundary")
         if open_handle.read_bytes() != b"NVX-HANDLE-BEFORE":
             raise RuntimeError("live filesystem source completed a post-capture write")
+        assert_guest_symlink(live_root / "handle-link", "open-handle")
         live_fingerprint = _snapshot_fingerprint(live_snapshot)
 
         _expect_process_failure(

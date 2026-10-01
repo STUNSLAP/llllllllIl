@@ -158,6 +158,108 @@ class GuestIdentityScriptTests(unittest.TestCase):
                     run_guest_script.reset_mock()
 
 
+def _create_wsl_symlink(path: Path, target: str) -> None:
+    """Create the WSL-style link that OpenVMM stores for a guest on Windows."""
+    if sys.platform != "win32":
+        raise unittest.SkipTest("WSL-style links exist only on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.DeviceIoControl.restype = wintypes.BOOL
+    kernel32.DeviceIoControl.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    generic_write = 0x40000000
+    create_new = 1
+    open_reparse_point = 0x00200000
+    fsctl_set_reparse_point = 0x000900A4
+    handle = kernel32.CreateFileW(
+        str(path), generic_write, 0, None, create_new, open_reparse_point, None
+    )
+    if handle in (None, wintypes.HANDLE(-1).value):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        # Version 2 of the LX link layout stores the UTF-8 target after a
+        # 32-bit version field.
+        data = (2).to_bytes(4, "little") + target.encode()
+        reparse = (
+            microvm_tests.IO_REPARSE_TAG_LX_SYMLINK.to_bytes(4, "little")
+            + len(data).to_bytes(2, "little")
+            + bytes(2)
+            + data
+        )
+        buffer = ctypes.create_string_buffer(reparse, len(reparse))
+        returned = wintypes.DWORD()
+        if not kernel32.DeviceIoControl(
+            handle,
+            fsctl_set_reparse_point,
+            buffer,
+            len(reparse),
+            None,
+            0,
+            ctypes.byref(returned),
+            None,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+class GuestSymlinkTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.target = self.root / "target"
+        self.target.write_text("host data\n", encoding="utf-8")
+
+    @unittest.skipIf(sys.platform == "win32", "Windows hosts store WSL-style links")
+    def test_posix_link_must_keep_the_exact_target(self):
+        link = self.root / "link"
+        link.symlink_to("../target")
+        microvm_tests.assert_guest_symlink(link, "../target")
+
+        with self.assertRaisesRegex(RuntimeError, "does not point to"):
+            microvm_tests.assert_guest_symlink(link, "target")
+        with self.assertRaisesRegex(RuntimeError, "does not point to"):
+            microvm_tests.assert_guest_symlink(self.target, "target")
+
+    @unittest.skipUnless(sys.platform == "win32", "WSL-style links exist on Windows")
+    def test_windows_link_must_be_an_inert_wsl_link(self):
+        link = self.root / "link"
+        _create_wsl_symlink(link, "target")
+        microvm_tests.assert_guest_symlink(link, "target")
+
+        with self.assertRaisesRegex(RuntimeError, "not a WSL-style link"):
+            microvm_tests.assert_guest_symlink(self.target, "target")
+        followable = self.root / "followable"
+        try:
+            followable.symlink_to(self.target)
+        except OSError as error:
+            self.skipTest(f"NT symbolic links are unavailable: {error}")
+        with self.assertRaisesRegex(RuntimeError, "not a WSL-style link"):
+            microvm_tests.assert_guest_symlink(followable, str(self.target))
+
+
 class ControlSessionTests(unittest.TestCase):
     def test_named_pipe_connect_retries_transient_invalid_argument(self):
         error = OSError(control_session.errno.EINVAL, "Invalid argument")
