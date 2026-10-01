@@ -3162,6 +3162,18 @@ class BuildConstantsTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class UbuntuSourceCollectionTests(unittest.TestCase):
+    def test_malformed_package_manifest_is_reported_as_script_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = Path(temporary) / "packages.json"
+            manifest.write_text("{", encoding="utf-8")
+
+            with self.assertRaises(collect_ubuntu_sources.ScriptError) as context:
+                collect_ubuntu_sources._source_requirements([manifest])
+
+        self.assertIn("cannot read Ubuntu package manifest", str(context.exception))
+
+
 class BuildTests(unittest.TestCase):
     def test_build_config_owns_standard_runtime_paths(self):
         config = build_config.BuildConfig()
