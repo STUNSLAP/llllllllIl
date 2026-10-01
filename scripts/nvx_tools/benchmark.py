@@ -42,6 +42,7 @@ from .build_constants import (
     OpenVMMBuildConstants,
 )
 from .common import bytes_to_mib, sha256_file
+from .time_abi import TimeAbiMonitor
 
 BOOT_MARKER = b"ALPINE-MICROVM-BOOT-OK"
 RESTORE_MARKER = b"OPENVMM-SNAPSHOT-RESTORE-OK"
@@ -1252,6 +1253,41 @@ def wait_for_process_exit(process: subprocess.Popen[bytes], timeout: float) -> i
     return process.wait(timeout=timeout)
 
 
+def drain_exited_output(
+    output: SeparatedOutput,
+    monitor: TimeAbiMonitor,
+    timeout: float = OUTPUT_DRAIN_TIMEOUT_SECONDS,
+) -> None:
+    """Consume the output an exited OpenVMM process left in the reader queues.
+
+    A time ABI power-off writes its violation event to the guest console just
+    before the exit, so the event must reach the monitor before the exit
+    status is classified.
+    """
+    deadline = time.monotonic() + timeout
+    while not output.closed:
+        try:
+            stream, chunk = output.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            return
+        if stream != "console":
+            continue
+        if chunk is None:
+            monitor.finish()
+        else:
+            monitor.feed(chunk)
+
+
+def exit_status_after_eof(
+    process: subprocess.Popen[bytes], timeout: float = 5.0
+) -> int | None:
+    """Return the exit status of a process whose output reached EOF."""
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+
+
 def contains_output_line(output: bytes | bytearray, marker: bytes) -> bool:
     return any(line.removesuffix(b"\r") == marker for line in output.split(b"\n"))
 
@@ -1745,15 +1781,17 @@ def measure_once(
 
     Peak RSS is None when OpenVMM exited before it could be sampled at the
     marker, which a prequeued guest exit makes possible. A completed output
-    line starting with ``failure_marker`` stops the launch immediately. Both
-    markers match only the guest console, and profile records come only from
-    OpenVMM's stderr. A launch that keeps a profile or a log reads both
-    streams to their end after teardown, within ``timeout``, and fails if they
-    do not end.
+    line starting with ``failure_marker`` stops the launch immediately, and so
+    does a time ABI violation event or failed conformance check. Both markers
+    and the time ABI lines match only the guest console, and profile records
+    come only from OpenVMM's stderr. A launch that keeps a profile or a log
+    reads both streams to their end after teardown, within ``timeout``, and
+    fails if they do not end.
     """
     started = time.perf_counter_ns()
     interaction = InteractiveProcess(command, environment, separate_stderr=True)
     process = interaction.process
+    monitor = TimeAbiMonitor(command)
     profile = (
         SnapshotProfileCollector(process.pid, started) if snapshot_profile else None
     )
@@ -1791,6 +1829,8 @@ def measure_once(
                 stream, chunk = output.get(timeout=min(remaining, 0.25))
             except queue.Empty:
                 if process.poll() is not None:
+                    drain_exited_output(output, monitor)
+                    monitor.check_exit(process.returncode)
                     raise RuntimeError(
                         f"OpenVMM exited with status {process.returncode}"
                     ) from None
@@ -1800,7 +1840,11 @@ def measure_once(
                     profile.feed(chunk)
                 continue
             if chunk is None:
-                raise RuntimeError(f"OpenVMM exited with status {process.poll()}")
+                monitor.finish()
+                returncode = exit_status_after_eof(process)
+                monitor.check_exit(returncode)
+                raise RuntimeError(f"OpenVMM exited with status {returncode}")
+            monitor.feed(chunk)
             console = output.console
             if failure_marker is not None:
                 failure = completed_output_line_with_prefix(console, failure_marker)
@@ -1854,11 +1898,15 @@ def measure_once(
                 process_exited = time.perf_counter_ns()
                 teardown_ms = (process_exited - teardown_started) / 1_000_000
                 wall_ms = (process_exited - started) / 1_000_000
-                finish_output(marker_reached, readiness_counters)
                 if teardown_mode == "guest-exit" and returncode != 0:
+                    # The monitor needs the console's last lines before
+                    # finish_output() would drain them.
+                    drain_exited_output(output, monitor)
+                    monitor.check_exit(returncode)
                     raise RuntimeError(
                         f"OpenVMM exited with status {returncode} during teardown"
                     )
+                finish_output(marker_reached, readiness_counters)
                 return elapsed_ms, peak_bytes, teardown_ms, wall_ms
     except GuestFailureReported:
         raise
@@ -2420,6 +2468,7 @@ def run_guest_script(
         contain_process_tree=contain_process_tree,
     )
     process = interaction.process
+    monitor = TimeAbiMonitor(command)
     if windows_cpus is not None:
         set_windows_affinity(process.pid, windows_cpus)
 
@@ -2452,6 +2501,7 @@ def run_guest_script(
             if chunk is None:
                 break
             output.extend(chunk)
+            monitor.feed(chunk)
             peak_bytes = _try_peak_rss(process, peak_bytes)
             if not input_sent and boot_marker in output:
                 interaction.write_input(script.encode("utf-8"))
@@ -2465,7 +2515,9 @@ def run_guest_script(
                         time.monotonic() + TEARDOWN_TIMEOUT_SECONDS,
                     )
 
+        monitor.finish()
         returncode = process.wait()
+        monitor.check_exit(returncode)
         if teardown_mode == "guest-exit" and returncode != 0:
             raise RuntimeError(f"OpenVMM exited with status {returncode}")
         if not input_sent:
@@ -2528,6 +2580,7 @@ def capture_automatic_snapshot(
     environment["OPENVMM_LOG"] = "off"
     interaction = InteractiveProcess(command, environment)
     process = interaction.process
+    monitor = TimeAbiMonitor(command)
     if windows_cpus is not None:
         set_windows_affinity(process.pid, windows_cpus)
 
@@ -2549,8 +2602,11 @@ def capture_automatic_snapshot(
             if chunk is None:
                 break
             output.extend(chunk)
+            monitor.feed(chunk)
 
+        monitor.finish()
         returncode = process.wait()
+        monitor.check_exit(returncode)
         if returncode != 0:
             raise RuntimeError(f"snapshot source exited with status {returncode}")
         for marker in required_markers:
@@ -2612,6 +2668,7 @@ def capture_device_restore_snapshot(
     environment["OPENVMM_LOG"] = "off"
     interaction = InteractiveProcess(command, environment)
     process = interaction.process
+    monitor = TimeAbiMonitor(command)
     if windows_cpus is not None:
         set_windows_affinity(process.pid, windows_cpus)
     chunks: queue.Queue[bytes | None] = queue.Queue()
@@ -2636,7 +2693,10 @@ def capture_device_restore_snapshot(
             if chunk is None:
                 break
             output.extend(chunk)
+            monitor.feed(chunk)
+        monitor.finish()
         returncode = process.wait()
+        monitor.check_exit(returncode)
         if returncode != 0:
             raise RuntimeError(
                 f"{device}/{mode} snapshot source exited with status {returncode}"
@@ -2678,6 +2738,7 @@ def run_device_restore_sample(
     started_ns = time.perf_counter_ns()
     interaction = InteractiveProcess(command, environment)
     process = interaction.process
+    monitor = TimeAbiMonitor(command)
     if windows_cpus is not None:
         set_windows_affinity(process.pid, windows_cpus)
     chunks: queue.Queue[bytes | None] = queue.Queue()
@@ -2746,11 +2807,14 @@ def run_device_restore_sample(
                 break
             observed_ns = time.perf_counter_ns()
             output.extend(chunk)
+            monitor.feed(chunk)
             observe_chunk(chunk, observed_ns)
         if pending:
             observe_line(bytes(pending), time.perf_counter_ns())
             pending.clear()
+        monitor.finish()
         returncode = process.wait()
+        monitor.check_exit(returncode)
         if returncode != 0:
             raise RuntimeError(
                 f"{device}/{mode} restore exited with status {returncode}"
@@ -4667,6 +4731,7 @@ def capture_snapshot(
     process_started_ns = time.perf_counter_ns()
     interaction = InteractiveProcess(command, environment, separate_stderr=True)
     process = interaction.process
+    monitor = TimeAbiMonitor(command)
     profile = SnapshotProfileCollector(
         process.pid,
         process_started_ns,
@@ -4723,6 +4788,8 @@ def capture_snapshot(
                 peak_bytes = _try_peak_rss(process, peak_bytes)
                 observe_snapshot_publication()
                 if process.poll() is not None and snapshot_published_ns is None:
+                    drain_exited_output(output, monitor)
+                    monitor.check_exit(process.returncode)
                     raise RuntimeError(
                         f"OpenVMM exited with status {process.returncode}"
                     ) from None
@@ -4736,6 +4803,7 @@ def capture_snapshot(
             if stream == "stderr":
                 profile.feed(chunk)
                 continue
+            monitor.feed(chunk)
             console = output.console
             if (
                 snapshot_requested
@@ -4767,8 +4835,10 @@ def capture_snapshot(
             if snapshot_requested and contains_output_line(console, RESTORE_MARKER):
                 raise RuntimeError("source guest continued past the snapshot boundary")
 
+        monitor.finish()
         returncode = process.wait()
         source_exited_ns = time.perf_counter_ns()
+        monitor.check_exit(returncode)
         if snapshot_published_ns is None and snapshot_path.is_dir():
             snapshot_published_ns = source_exited_ns
         if not snapshot_requested:

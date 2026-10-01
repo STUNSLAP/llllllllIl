@@ -59,6 +59,7 @@ from .egress_policy import CompiledEgressPolicy, compile_policy_file
 from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
 from .managed_exec_tests import run_managed_exec_configuration
 from .openvmm_process import OpenvmmProcess, TcpConsole
+from .time_abi import describe_exit_status
 
 MICROVM_TEST_SCENARIOS = (
     "console-exit",
@@ -962,8 +963,10 @@ def run_managed_lifecycle(
                     )
                 result = process.wait(timeout=timeout)
                 if result != 0:
+                    reason = describe_exit_status(result)
                     raise RuntimeError(
                         f"managed OpenVMM process exited with status {result}"
+                        + (f": {reason}; see {log_path}" if reason else "")
                     )
                 report = _read_outcome_report(report_path)
                 _preserve_outcome_report(
