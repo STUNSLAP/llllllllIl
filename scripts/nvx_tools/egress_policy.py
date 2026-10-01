@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -89,11 +90,6 @@ def _subtract_exclusions(
                 next_fragments.extend(fragment.address_exclude(exclusion))
             else:
                 next_fragments.append(fragment)
-            if len(next_fragments) > MAX_RULES_PER_ACTION:
-                raise ScriptError(
-                    f"{description} expands beyond the at most "
-                    f"{MAX_RULES_PER_ACTION} native rules"
-                )
         fragments = next_fragments
     return tuple(ipaddress.collapse_addresses(fragments))
 
@@ -122,41 +118,90 @@ def _parse_rule(value: object, description: str) -> _Rule:
     end = _port(rule.get("endPort", start), f"{description}.endPort")
     if end < start:
         raise ScriptError(f"{description}.endPort cannot be below port")
-    if len(networks) * (end - start + 1) > MAX_RULES_PER_ACTION:
-        raise ScriptError(
-            f"{description} expands beyond the at most "
-            f"{MAX_RULES_PER_ACTION} native rules"
-        )
     return _Rule(networks, protocol_value, start, end)
 
 
-def _compile_category(value: object, category: str) -> tuple[str, ...]:
-    rules = _array(value, category)
-    grouped: dict[tuple[str | None, int | None], list[ipaddress.IPv4Network]] = {}
-    for index, value in enumerate(rules):
-        rule = _parse_rule(value, f"{category}[{index}]")
-        if not rule.networks:
-            continue
-        if rule.protocol is None:
-            grouped.setdefault((None, None), []).extend(rule.networks)
+def _lower_protocol_rules(
+    rules: list[_Rule],
+    protocol: str,
+    category: str,
+    address_only: tuple[ipaddress.IPv4Network, ...],
+    remaining_budget: int,
+) -> list[tuple[ipaddress.IPv4Network, str, int]]:
+    events: dict[int, list[tuple[int, tuple[ipaddress.IPv4Network, ...]]]] = {}
+    for rule in rules:
+        if rule.protocol != protocol or not rule.networks:
             continue
         assert rule.start_port is not None
         assert rule.end_port is not None
-        for port in range(rule.start_port, rule.end_port + 1):
-            grouped.setdefault((rule.protocol, port), []).extend(rule.networks)
-            if len(grouped) > MAX_RULES_PER_ACTION:
-                raise ScriptError(
-                    f"{category} emits at most {MAX_RULES_PER_ACTION} native rules"
-                )
+        events.setdefault(rule.start_port, []).append((1, rule.networks))
+        events.setdefault(rule.end_port + 1, []).append((-1, rule.networks))
 
-    lowered: list[tuple[ipaddress.IPv4Network, str | None, int | None]] = []
-    for (protocol, port), networks in grouped.items():
-        for network in ipaddress.collapse_addresses(networks):
-            lowered.append((network, protocol, port))
-            if len(lowered) > MAX_RULES_PER_ACTION:
+    active: Counter[ipaddress.IPv4Network] = Counter()
+    lowered: list[tuple[ipaddress.IPv4Network, str, int]] = []
+    previous_port: int | None = None
+    for port in sorted(events):
+        if previous_port is not None and previous_port < port and active:
+            networks = list(ipaddress.collapse_addresses(active))
+            for covering in address_only:
+                uncovered: list[ipaddress.IPv4Network] = []
+                for network in networks:
+                    if network.subnet_of(covering):
+                        continue
+                    if covering.subnet_of(network):
+                        uncovered.extend(network.address_exclude(covering))
+                    else:
+                        uncovered.append(network)
+                networks = uncovered
+            emitted = len(networks) * (port - previous_port)
+            if len(lowered) + emitted > remaining_budget:
                 raise ScriptError(
                     f"{category} emits at most {MAX_RULES_PER_ACTION} native rules"
                 )
+            lowered.extend(
+                (network, protocol, current_port)
+                for current_port in range(previous_port, port)
+                for network in networks
+            )
+        for direction, networks in events[port]:
+            for network in networks:
+                active[network] += direction
+                if active[network] == 0:
+                    del active[network]
+        previous_port = port
+    return lowered
+
+
+def _compile_category(value: object, category: str) -> tuple[str, ...]:
+    values = _array(value, category)
+    rules = [
+        _parse_rule(rule, f"{category}[{index}]") for index, rule in enumerate(values)
+    ]
+    address_only = tuple(
+        ipaddress.collapse_addresses(
+            network
+            for rule in rules
+            if rule.protocol is None
+            for network in rule.networks
+        )
+    )
+    if len(address_only) > MAX_RULES_PER_ACTION:
+        raise ScriptError(
+            f"{category} emits at most {MAX_RULES_PER_ACTION} native rules"
+        )
+    lowered: list[tuple[ipaddress.IPv4Network, str | None, int | None]] = [
+        (network, None, None) for network in address_only
+    ]
+    for protocol in ("tcp", "udp"):
+        lowered.extend(
+            _lower_protocol_rules(
+                rules,
+                protocol,
+                category,
+                address_only,
+                MAX_RULES_PER_ACTION - len(lowered),
+            )
+        )
     lowered.sort(
         key=lambda item: (
             int(item[0].network_address),
@@ -194,6 +239,6 @@ def compile_policy_file(path: Path) -> CompiledEgressPolicy:
         )
     try:
         value = json.loads(data.decode("utf-8"), object_pairs_hook=strict_json_object)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, ValueError) as error:
         raise ScriptError(f"failed to read egress policy file: {path}") from error
     return compile_policy(value)

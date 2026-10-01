@@ -212,6 +212,18 @@ class EgressPolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ScriptError, "byte limit"):
                     compile_policy_file(path)
 
+    def test_wraps_oversized_json_integer_rejection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "policy.json"
+            path.write_text(
+                '{"allow":[{"cidr":' + ("9" * 10000) + "}]}",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ScriptError, "failed to read egress policy file"
+            ):
+                compile_policy_file(path)
+
     def test_many_source_networks_can_collapse_within_native_budget(self):
         start = int(ipaddress.IPv4Address("192.0.2.0"))
         compiled = self.compile(
@@ -302,6 +314,69 @@ class EgressPolicyTests(unittest.TestCase):
                     ]
                 }
             )
+
+    def test_canonicalizes_fragmented_rules_before_enforcing_native_budget(self):
+        exclusions = [
+            str(ipaddress.IPv4Address(int(ipaddress.IPv4Address("192.0.0.1")) + 2 * i))
+            for i in range(160)
+        ]
+        fragmented = {
+            "cidr": "192.0.0.0/16",
+            "except": exclusions,
+            "protocol": "tcp",
+            "port": 80,
+            "endPort": 81,
+        }
+        covering = {
+            "cidr": "192.0.0.0/16",
+            "protocol": "tcp",
+            "port": 80,
+            "endPort": 81,
+        }
+
+        for rules in ([fragmented, covering], [covering, fragmented]):
+            with self.subTest(order=rules):
+                compiled = self.compile({"allow": rules})
+                self.assertEqual(
+                    compiled.allow,
+                    ("192.0.0.0/16:tcp:80", "192.0.0.0/16:tcp:81"),
+                )
+
+    def test_validates_redundant_rules_before_canonicalization(self):
+        with self.assertRaisesRegex(ScriptError, "unknown field"):
+            self.compile(
+                {
+                    "allow": [
+                        {"cidr": "192.0.2.0/24"},
+                        {"cidr": "192.0.2.1", "unknown": True},
+                    ]
+                }
+            )
+
+    def test_address_only_rule_covers_large_protocol_range(self):
+        for rules in (
+            [
+                {
+                    "cidr": "192.0.2.0/24",
+                    "protocol": "tcp",
+                    "port": 1,
+                    "endPort": 65535,
+                },
+                {"cidr": "192.0.2.0/24"},
+            ],
+            [
+                {"cidr": "192.0.2.0/24"},
+                {
+                    "cidr": "192.0.2.0/24",
+                    "protocol": "tcp",
+                    "port": 1,
+                    "endPort": 65535,
+                },
+            ],
+        ):
+            with self.subTest(rules=rules):
+                compiled = self.compile({"allow": rules})
+                self.assertEqual(compiled.allow, ("192.0.2.0/24",))
 
 
 if __name__ == "__main__":
