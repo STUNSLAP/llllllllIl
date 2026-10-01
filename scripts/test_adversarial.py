@@ -819,6 +819,49 @@ class AdversarialOracleTests(unittest.TestCase):
         self.assertTrue(result.teardown_complete)
         self.assertFalse(_process_running(child_pid))
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process ownership")
+    def test_contained_native_process_isolates_supervisor_environment(self) -> None:
+        environment = dict(os.environ)
+        environment.update(
+            {
+                "NVX_SUPERVISED_CHILD_MARKER": "requested-value",
+                "PYTHONHOME": "/nonexistent",
+                "PYTHONINSPECT": "1",
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            success = run_bounded_process(
+                ["/bin/true"],
+                cwd=Path.cwd(),
+                output_dir=root / "success",
+                timeout=5.0,
+                environment=environment,
+                contained_by_parent=True,
+            )
+            propagated = run_bounded_process(
+                [
+                    "/bin/sh",
+                    "-c",
+                    (
+                        '[ "$NVX_SUPERVISED_CHILD_MARKER" = requested-value ]'
+                        ' && [ "$PYTHONHOME" = /nonexistent ]'
+                        ' && [ "$PYTHONINSPECT" = 1 ]'
+                        " || exit 9; exit 7"
+                    ),
+                ],
+                cwd=Path.cwd(),
+                output_dir=root / "propagated",
+                timeout=5.0,
+                environment=environment,
+                contained_by_parent=True,
+            )
+
+        self.assertFalse(success.timed_out)
+        self.assertEqual(success.returncode, 0)
+        self.assertFalse(propagated.timed_out)
+        self.assertEqual(propagated.returncode, 7)
+
     def test_failed_windows_job_assignment_does_not_resume_process(self) -> None:
         job = _WindowsJob.__new__(_WindowsJob)
         kernel32 = MagicMock()

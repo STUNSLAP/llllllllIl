@@ -757,7 +757,7 @@ class ProcessTreeContainment:
         if not sys.platform.startswith("linux"):
             return list(command)
         supervisor = Path(__file__).with_name("process_supervisor.py")
-        return [sys.executable, str(supervisor), "--", *command]
+        return [sys.executable, "-I", str(supervisor), "--", *command]
 
     @property
     def creationflags(self) -> int:
