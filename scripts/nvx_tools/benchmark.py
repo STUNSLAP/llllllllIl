@@ -52,10 +52,12 @@ OUTPUT_READER_STOP_TIMEOUT_SECONDS = 5.0
 OUTPUT_BUFFER_LIMIT_BYTES = 1024 * 1024
 PEAK_RSS_SAMPLE_ATTEMPTS = 3
 BASE_TUNING = (
-    "tsc=reliable no_timer_check random.trust_cpu=on "
-    "rcupdate.rcu_expedited=1 nokaslr mitigations=off "
+    "random.trust_cpu=on rcupdate.rcu_expedited=1 nokaslr mitigations=off "
     "cryptomgr.notests quiet loglevel=0"
 )
+# The cold-start clocksource variant selects the only clocksource the time ABI
+# allows, on every backend.
+COLD_START_CLOCKSOURCE = "clocksource=tsc"
 CLOCKSOURCE_CURRENT_PATH = (
     "/sys/devices/system/clocksource/clocksource0/current_clocksource"
 )
@@ -2085,10 +2087,6 @@ def format_sample_summary(samples: Sequence[float], *, unit: str = "ms") -> str:
     )
 
 
-def clocksource_parameter(backend: str) -> str:
-    return "clocksource=kvm-clock" if backend == "kvm" else "clocksource=tsc"
-
-
 def stable_clocksource_wait_script() -> str:
     """Wait up to five seconds for Linux to replace its tsc-early clocksource."""
     return "\n".join(
@@ -3016,10 +3014,9 @@ def benchmark_cold_start_workload(
     command_prefix: Sequence[str] = (),
     windows_cpus: set[int] | None = None,
 ) -> None:
-    clocksource = clocksource_parameter(backend)
     scenarios = (
         ("base", None),
-        (clocksource, clocksource),
+        (COLD_START_CLOCKSOURCE, COLD_START_CLOCKSOURCE),
         ("tsc=reliable", "tsc=reliable"),
         ("no_timer_check", "no_timer_check"),
         ("random.trust_cpu=on", "random.trust_cpu=on"),
@@ -5687,7 +5684,7 @@ def run_kvm_worker(args: argparse.Namespace) -> int:
         "--initrd",
         str(stage / AlpineBuildConstants.INITRAMFS_NAME),
         "--cmdline",
-        f"clocksource=kvm-clock {BASE_TUNING}",
+        BASE_TUNING,
     ]
     if args.net is not None:
         append_network_arguments(boot_command, args.net, args.network_profile)
@@ -5970,7 +5967,7 @@ def run_native_linux(args: argparse.Namespace) -> int:
                 "--initrd",
                 str(initrd),
                 "--cmdline",
-                f"{'clocksource=kvm-clock ' if backend == 'kvm' else ''}{BASE_TUNING}",
+                BASE_TUNING,
             ]
             if args.net is not None:
                 append_network_arguments(command, args.net, args.network_profile)
