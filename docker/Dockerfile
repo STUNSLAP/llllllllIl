@@ -113,6 +113,12 @@ for utility in arp awk basename cat chmod chroot cp grep head hostname ifconfig 
     sh mknod mount ping route rm sed sleep tr wget blkid losetup mountpoint flock unshare; do
     ln -sf busybox "/rootfs/bin/$utility"
 done
+# Workload identities require an existing home directory. Azure Linux points
+# nobody at /dev/null, so give it the empty home that Ubuntu Base uses.
+sed -i 's#^\(nobody:[^:]*:65534:65534:[^:]*:\)/dev/null:#\1/nonexistent:#' \
+    /rootfs/etc/passwd
+grep -q '^nobody:[^:]*:65534:65534:[^:]*:/nonexistent:' /rootfs/etc/passwd
+install -d -m 0755 /rootfs/nonexistent
 rm -f /rootfs/tmp/azurelinux-rpm-packages.tsv
 # The package manifest records the inventory; these databases and caches
 # record install-time state that differs between otherwise identical builds.

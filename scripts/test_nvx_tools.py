@@ -5119,6 +5119,23 @@ class BuildTests(unittest.TestCase):
             "busybox", [package["name"] for package in azurelinux.load_package_lock()]
         )
 
+    def test_azurelinux_initramfs_gives_nobody_a_home(self):
+        dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        azure_stage = dockerfile.split("FROM base AS azurelinux-initramfs", 1)[1]
+        self.assertIn(
+            "sed -i 's#^\\(nobody:[^:]*:65534:65534:[^:]*:\\)/dev/null:"
+            "#\\1/nonexistent:#'",
+            azure_stage,
+        )
+        self.assertIn(
+            "grep -q '^nobody:[^:]*:65534:65534:[^:]*:/nonexistent:' "
+            "/rootfs/etc/passwd",
+            azure_stage,
+        )
+        self.assertIn("install -d -m 0755 /rootfs/nonexistent", azure_stage)
+
     def test_azurelinux_rootfs_installs_only_locked_rpms(self):
         dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
             encoding="utf-8"
