@@ -76,7 +76,7 @@ flowchart TB
         P04["PR04<br/>PAL/PAL async on Windows<br/>U - 6 commits"]
         P05["PR05<br/>Hypervisor fixes<br/>U - 4 commits"]
         P06["PR06<br/>Device hardening<br/>U - 10 commits"]
-        P07["PR07<br/>Consomme bounding<br/>U - 3 commits"]
+        P07["PR07<br/>Consomme resource bounding<br/>U - 3 commits"]
         P08["PR08<br/>Preparatory refactors<br/>U - 6 commits"]
         P14["PR14<br/>Direct-boot loader<br/>U - 5 commits"]
     end
