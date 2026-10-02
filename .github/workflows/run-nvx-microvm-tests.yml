@@ -136,6 +136,10 @@ jobs:
           --scenario guest-boot
           --scenario guest-identity
           --scenario console-exit
+          --scenario virtio-net
+          --scenario network-snapshot
+          --scenario workload-identity
+          --scenario managed-lifecycle
           --output-dir "build/test-results/azurelinux-${{ inputs.backend }}"
 
       - name: Run Azure Linux guest smoke tests on Windows
@@ -149,6 +153,10 @@ jobs:
           --scenario guest-boot
           --scenario guest-identity
           --scenario console-exit
+          --scenario virtio-net
+          --scenario network-snapshot
+          --scenario workload-identity
+          --scenario managed-lifecycle
           --output-dir "build/test-results/azurelinux-${{ inputs.backend }}"
 
       - name: Run extended Ubuntu guest tests on Linux/KVM
