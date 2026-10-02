@@ -102,6 +102,10 @@ for utility in awk basename cat chmod chroot cp grep head hostname ifconfig ip m
     ln -sf busybox "/rootfs/bin/$utility"
 done
 rm -f /rootfs/tmp/azurelinux-rpm-packages.tsv
+# The package manifest records the inventory; these databases and caches
+# record install-time state that differs between otherwise identical builds.
+rm -rf /rootfs/usr/lib/sysimage/tdnf /rootfs/var/cache/tdnf \
+    /rootfs/var/cache/ldconfig /rootfs/var/lib/rpm
 python3 <<'PY'
 import json
 from pathlib import Path
@@ -143,7 +147,8 @@ Path('/tmp/azurelinux-packages.json').write_text(
 )
 PY
 cd /rootfs
-find . -print0 | sort -z | cpio --null --quiet --reproducible \
+find . -exec touch --no-dereference --date=@0 {} +
+find . -print0 | LC_ALL=C sort -z | cpio --null --quiet --reproducible \
     --owner=0:0 -o -H newc | gzip -n -9 > /tmp/initramfs-azurelinux.cpio.gz
 python3 <<'PY'
 import hashlib

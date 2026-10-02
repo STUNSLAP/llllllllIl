@@ -5021,6 +5021,23 @@ class BuildTests(unittest.TestCase):
         self.assertIn("busybox-package.tsv", dockerfile)
         self.assertIn("'packages': json.loads", dockerfile)
 
+    def test_azurelinux_initramfs_packs_normalized_rootfs(self):
+        dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        azure_stage = dockerfile.split("FROM base AS azurelinux-initramfs", 1)[1]
+        cleanup = azure_stage.index(
+            "rm -rf /rootfs/usr/lib/sysimage/tdnf /rootfs/var/cache/tdnf \\\n"
+            "    /rootfs/var/cache/ldconfig /rootfs/var/lib/rpm"
+        )
+        normalize = azure_stage.index(
+            "find . -exec touch --no-dereference "
+            f"--date=@{InitramfsBuildConstants.TIMESTAMP} {{}} +"
+        )
+        pack = azure_stage.index("find . -print0 | LC_ALL=C sort -z | cpio")
+        self.assertLess(cleanup, normalize)
+        self.assertLess(normalize, pack)
+
     def test_azurelinux_manifest_records_shared_input_digest(self):
         dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
             encoding="utf-8"
