@@ -4007,13 +4007,14 @@ class BuildTests(unittest.TestCase):
                 release,
                 "_guest_release_inputs",
                 return_value=((), (), (), ()),
-            ),
+            ) as guest_release_inputs,
             patch.object(release, "collect_alpine_sources"),
             patch.object(release, "collect_ubuntu_sources"),
             patch.object(release, "build_docker_linux_source") as linux_source,
         ):
             release.collect_release_sources(config)
 
+        guest_release_inputs.assert_called_once_with(include_azurelinux=False)
         linux_source.assert_called_once_with(config)
 
     def test_records_openvmm_revision_cleanliness_and_executable_hash(self):
@@ -9320,94 +9321,117 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn("binary-only package", stderr.getvalue())
 
     def test_source_package_omits_azure_linux_artifacts(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            paths, kernel_inputs, revision = _write_release_fixture(root)
-            build_dir = paths["build"]
-            source_dir = paths["source"]
-            openvmm_dir = paths["openvmm"]
-            binary = paths["binary"]
-            destination = root / "staged"
-            stderr = io.StringIO()
-            linux_source_archive = (
-                source_dir
-                / KernelBuildConstants.SOURCE_DIRECTORY_NAME
-                / KernelBuildConstants.SOURCE_ARCHIVE_NAME
-            )
-            linux_source_archive.parent.mkdir(parents=True, exist_ok=True)
-            linux_source_archive.write_bytes(b"linux-source")
-
-            def artifact_path(name: str) -> Path:
-                return build_dir / name
-
-            def write_source_archive(output: Path, *_args: object) -> None:
-                output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_bytes(output.name.encode("ascii"))
-
+        for azurelinux_built in (True, False):
             with (
-                patch.object(BuildConstants, "REPO_ROOT", root),
-                patch.object(BuildConstants, "SOURCE_DIR", source_dir),
-                patch.object(
-                    UbuntuBuildConstants,
-                    "PACKAGE_LOCK",
-                    root / "ubuntu" / "packages.lock.json",
-                ),
-                patch.object(OpenVMMBuildConstants, "DIRECTORY", openvmm_dir),
-                patch.object(
-                    release,
-                    "artifact_path",
-                    side_effect=artifact_path,
-                ),
-                patch.object(release, "openvmm_binary_path", return_value=binary),
-                patch.object(
-                    release,
-                    "kernel_provenance_inputs",
-                    return_value=kernel_inputs,
-                ),
-                patch.object(
-                    release,
-                    "openvmm_git_state",
-                    return_value=(revision, True),
-                ),
-                patch.object(release, "_validate_alpine_sources"),
-                patch.object(release, "_validate_ubuntu_sources"),
-                patch.object(release, "_validate_linux_source_archive"),
-                patch.object(
-                    release,
-                    "_project_source_archive",
-                    side_effect=write_source_archive,
-                ),
-                patch.object(
-                    release,
-                    "_alpine_source_archive",
-                    side_effect=write_source_archive,
-                ),
-                patch.object(
-                    release,
-                    "_ubuntu_source_archive",
-                    side_effect=write_source_archive,
-                ),
-                patch("sys.stderr", stderr),
+                self.subTest(azurelinux_built=azurelinux_built),
+                tempfile.TemporaryDirectory() as temporary,
             ):
-                release.package_release(
-                    version="1.0.0",
-                    destination=destination,
-                    include_source=True,
-                    force=False,
+                root = Path(temporary)
+                paths, kernel_inputs, revision = _write_release_fixture(root)
+                build_dir = paths["build"]
+                if not azurelinux_built:
+                    for name in ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES:
+                        (build_dir / name).unlink()
+                self._package_source_release_without_azure_linux(
+                    root, paths, kernel_inputs, revision
                 )
 
-            for name in ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES:
-                self.assertFalse((destination / "guest" / name).exists())
-            for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
-                if name in ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES:
-                    continue
-                self.assertTrue((destination / "guest" / name).is_file())
-            manifest = json.loads(
-                (destination / "SOURCE-MANIFEST.json").read_text(encoding="utf-8")
+    def _package_source_release_without_azure_linux(
+        self,
+        root: Path,
+        paths: dict[str, Path],
+        kernel_inputs: dict[str, object],
+        revision: str,
+    ) -> None:
+        build_dir = paths["build"]
+        source_dir = paths["source"]
+        openvmm_dir = paths["openvmm"]
+        binary = paths["binary"]
+        destination = root / "staged"
+        stderr = io.StringIO()
+        linux_source_archive = (
+            source_dir
+            / KernelBuildConstants.SOURCE_DIRECTORY_NAME
+            / KernelBuildConstants.SOURCE_ARCHIVE_NAME
+        )
+        linux_source_archive.parent.mkdir(parents=True, exist_ok=True)
+        linux_source_archive.write_bytes(b"linux-source")
+
+        def artifact_path(name: str) -> Path:
+            return build_dir / name
+
+        def write_source_archive(output: Path, *_args: object) -> None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(output.name.encode("ascii"))
+
+        with (
+            patch.object(BuildConstants, "REPO_ROOT", root),
+            patch.object(BuildConstants, "SOURCE_DIR", source_dir),
+            patch.object(
+                UbuntuBuildConstants,
+                "PACKAGE_LOCK",
+                root / "ubuntu" / "packages.lock.json",
+            ),
+            patch.object(OpenVMMBuildConstants, "DIRECTORY", openvmm_dir),
+            patch.object(
+                release,
+                "artifact_path",
+                side_effect=artifact_path,
+            ),
+            patch.object(release, "openvmm_binary_path", return_value=binary),
+            patch.object(
+                release,
+                "kernel_provenance_inputs",
+                return_value=kernel_inputs,
+            ),
+            patch.object(
+                release,
+                "openvmm_git_state",
+                return_value=(revision, True),
+            ),
+            patch.object(release, "_validate_alpine_sources"),
+            patch.object(release, "_validate_ubuntu_sources"),
+            patch.object(release, "_validate_linux_source_archive"),
+            patch.object(
+                release,
+                "_project_source_archive",
+                side_effect=write_source_archive,
+            ) as project_source_archive,
+            patch.object(
+                release,
+                "_alpine_source_archive",
+                side_effect=write_source_archive,
+            ),
+            patch.object(
+                release,
+                "_ubuntu_source_archive",
+                side_effect=write_source_archive,
+            ),
+            patch("sys.stderr", stderr),
+        ):
+            release.package_release(
+                version="1.0.0",
+                destination=destination,
+                include_source=True,
+                force=False,
             )
-            self.assertNotIn("azurelinux", manifest)
-            common.verify_sha256_sums(destination)
-            self.assertIn("omits the Azure Linux guest", stderr.getvalue())
+
+        for name in ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES:
+            self.assertFalse((destination / "guest" / name).exists())
+        for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
+            if name in ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES:
+                continue
+            self.assertTrue((destination / "guest" / name).is_file())
+        self.assertNotIn(
+            build_dir / AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME,
+            project_source_archive.call_args.args[2],
+        )
+        manifest = json.loads(
+            (destination / "SOURCE-MANIFEST.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("azurelinux", manifest)
+        common.verify_sha256_sums(destination)
+        self.assertIn("omits the Azure Linux guest", stderr.getvalue())
 
     def test_runtime_provenance_validation_uses_required_paths(self):
         build_dir = Path("build")
@@ -9557,7 +9581,7 @@ class ReleaseTests(unittest.TestCase):
                         "Ubuntu artifact manifest does not match",
                     ),
                 ):
-                    release._guest_release_inputs()
+                    release._guest_release_inputs(include_azurelinux=True)
 
     def test_guest_release_inputs_reject_stale_azurelinux_initramfs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -9578,7 +9602,7 @@ class ReleaseTests(unittest.TestCase):
                     "Azure Linux initramfs manifest is invalid",
                 ),
             ):
-                release._guest_release_inputs()
+                release._guest_release_inputs(include_azurelinux=True)
 
     def test_guest_release_inputs_reject_unpinned_azurelinux_image(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -9602,7 +9626,38 @@ class ReleaseTests(unittest.TestCase):
                     "Azure Linux initramfs manifest is invalid",
                 ),
             ):
-                release._guest_release_inputs()
+                release._guest_release_inputs(include_azurelinux=True)
+
+    def test_guest_release_inputs_require_azurelinux_only_when_included(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths, _kernel_inputs, _revision = _write_release_fixture(root)
+            build_dir = paths["build"]
+            for name in ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES:
+                (build_dir / name).unlink()
+            with patch.object(
+                release,
+                "artifact_path",
+                side_effect=build_dir.joinpath,
+            ):
+                guest_names, _alpine, _ubuntu, azurelinux_manifests = (
+                    release._guest_release_inputs(include_azurelinux=False)
+                )
+                with self.assertRaisesRegex(
+                    common.ScriptError,
+                    "required guest artifact initramfs-azurelinux.cpio.gz not found",
+                ):
+                    release._guest_release_inputs(include_azurelinux=True)
+
+        self.assertEqual(
+            guest_names,
+            [
+                name
+                for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES
+                if name not in ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES
+            ],
+        )
+        self.assertEqual(azurelinux_manifests, [])
 
     def test_guest_release_inputs_reject_stale_ubuntu_source_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -9624,7 +9679,7 @@ class ReleaseTests(unittest.TestCase):
                     "Ubuntu artifact manifest does not match",
                 ),
             ):
-                release._guest_release_inputs()
+                release._guest_release_inputs(include_azurelinux=True)
 
     def test_package_rejects_tampered_source_metadata_without_replacing_output(self):
         cases: tuple[tuple[str, str, object, str], ...] = (

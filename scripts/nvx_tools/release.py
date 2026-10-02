@@ -832,35 +832,44 @@ def _validate_linux_source_archive(path: Path) -> None:
                 raise ScriptError(f"{path} has stale contents for {suffix}")
 
 
-def _guest_release_inputs() -> tuple[list[str], list[Path], list[Path], list[Path]]:
-    for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
+def _validate_azurelinux_manifest(manifest_path: Path) -> None:
+    manifest = _read_json_object(manifest_path, "Azure Linux initramfs manifest")
+    initramfs = artifact_path(AzureLinuxBuildConstants.INITRAMFS_NAME)
+    if (
+        manifest.get("format") != AzureLinuxBuildConstants.PACKAGE_MANIFEST_VERSION
+        or manifest.get("guest") != AzureLinuxBuildConstants.GUEST_NAME
+        or manifest.get("artifact") != initramfs.name
+        or manifest.get("artifact_sha256") != sha256_file(initramfs)
+        or manifest.get("package_manifest_format")
+        != AzureLinuxBuildConstants.PACKAGE_MANIFEST_FORMAT
+        or manifest.get("image") != AzureLinuxBuildConstants.IMAGE
+    ):
+        raise ScriptError("Azure Linux initramfs manifest is invalid")
+
+
+def _guest_release_inputs(
+    *,
+    include_azurelinux: bool,
+) -> tuple[list[str], list[Path], list[Path], list[Path]]:
+    guest_names = [
+        name
+        for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES
+        if include_azurelinux
+        or name not in ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES
+    ]
+    for name in guest_names:
         require_file(artifact_path(name), f"required guest artifact {name}")
-    guest_names: list[str] = list(ReleaseBuildConstants.GUEST_ARTIFACT_NAMES)
     alpine_manifests = [artifact_path(AlpineBuildConstants.PACKAGE_MANIFEST_NAME)]
     ubuntu_manifests = [
         artifact_path(UbuntuBuildConstants.PACKAGE_MANIFEST_NAME),
         artifact_path(UbuntuBuildConstants.DISTRO_MANIFEST_NAME),
     ]
-    azurelinux_manifests = [
-        artifact_path(AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME)
-    ]
-    azurelinux_manifest = _read_json_object(
-        azurelinux_manifests[0],
-        "Azure Linux initramfs manifest",
-    )
-    azurelinux_initramfs = artifact_path(AzureLinuxBuildConstants.INITRAMFS_NAME)
-    if (
-        azurelinux_manifest.get("format")
-        != AzureLinuxBuildConstants.PACKAGE_MANIFEST_VERSION
-        or azurelinux_manifest.get("guest") != AzureLinuxBuildConstants.GUEST_NAME
-        or azurelinux_manifest.get("artifact") != azurelinux_initramfs.name
-        or azurelinux_manifest.get("artifact_sha256")
-        != sha256_file(azurelinux_initramfs)
-        or azurelinux_manifest.get("package_manifest_format")
-        != AzureLinuxBuildConstants.PACKAGE_MANIFEST_FORMAT
-        or azurelinux_manifest.get("image") != AzureLinuxBuildConstants.IMAGE
-    ):
-        raise ScriptError("Azure Linux initramfs manifest is invalid")
+    azurelinux_manifests: list[Path] = []
+    if include_azurelinux:
+        azurelinux_manifests.append(
+            artifact_path(AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME)
+        )
+        _validate_azurelinux_manifest(azurelinux_manifests[0])
     expected_input_sha256 = converter_input_sha256(customization_files())
     for artifact_name, manifest in zip(
         (UbuntuBuildConstants.INITRAMFS_NAME, UbuntuBuildConstants.DISTRO_NAME),
@@ -1312,7 +1321,7 @@ def _publish_release_directory(
 
 def collect_release_sources(config: DockerBuildConfig) -> None:
     _guest_names, alpine_manifests, ubuntu_manifests, _azurelinux_manifests = (
-        _guest_release_inputs()
+        _guest_release_inputs(include_azurelinux=False)
     )
     collect_alpine_sources(
         alpine_manifests,
@@ -1345,7 +1354,7 @@ def package_release(
     force: bool,
 ) -> None:
     guest_names, alpine_manifests, ubuntu_manifests, azurelinux_manifests = (
-        _guest_release_inputs()
+        _guest_release_inputs(include_azurelinux=not include_source)
     )
     linux_source_archive = (
         BuildConstants.SOURCE_DIR
@@ -1353,12 +1362,6 @@ def package_release(
         / KernelBuildConstants.SOURCE_ARCHIVE_NAME
     )
     if include_source:
-        guest_names = [
-            name
-            for name in guest_names
-            if name not in ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES
-        ]
-        azurelinux_manifests = []
         _validate_alpine_sources(alpine_manifests)
         _validate_ubuntu_sources(ubuntu_manifests)
         require_file(linux_source_archive, "Linux corresponding-source archive")
