@@ -211,7 +211,7 @@ the guest first; the remaining test artifacts are produced by OpenVMM itself.
 ```text
 python3 scripts/nvx.py test-microvm
     --backend {kvm,mshv,whp}
-    [--guest {alpine,ubuntu}]
+    [--guest {alpine,ubuntu,azurelinux}]
     [--scenario SCENARIO]...
     [--processors {1,2,4,8} ...]
     [--memory-mib MIB]
@@ -222,9 +222,10 @@ python3 scripts/nvx.py test-microvm
 Runs NVX-owned Linux, SMP, virtio, sandbox, and snapshot correctness scenarios
 against the public OpenVMM CLI. Repeat `--scenario` to select a subset; without
 it, every scenario supported by the selected guest runs. Alpine remains the
-default. Ubuntu rejects the Alpine-control-only `sandbox-blocks` and
-`scratch-snapshot` scenarios, the Alpine-prompt-specific `console-snapshot`
-scenario, and the sandbox-control-dependent `snapshot-tiers` scenario. The
+default. Ubuntu and Azure Linux cannot act as sandbox control, so they reject
+the Alpine-control-only `sandbox-blocks` and `scratch-snapshot` scenarios and
+the sandbox-control-dependent `snapshot-tiers` scenario. Ubuntu also rejects
+the Alpine-prompt-specific `console-snapshot` scenario. The
 command requires `build/vmlinux`, the selected initramfs, and
 `openvmm/target/release/openvmm[.exe]`.
 
