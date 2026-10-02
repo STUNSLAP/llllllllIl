@@ -4979,6 +4979,102 @@ class SandboxShareAgentTests(unittest.TestCase):
         self.assertFalse((outside / "project").exists())
 
 
+@unittest.skipIf(os.name == "nt", "requires POSIX symbolic links")
+class SandboxSmokeShareTests(unittest.TestCase):
+    SMOKE = Path(__file__).parents[1] / "guest" / "common" / "nvx-sandbox-smoke"
+
+    def setUp(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        self.shell = shell
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.share = self.root / "share"
+        self.links = self.share / "nvx-links"
+        self.links.mkdir(parents=True)
+        (self.share / "nvx-host-marker").write_text("host-to-guest\n", encoding="utf-8")
+        # The guest resolves nvx-links/outside to this path through ../..
+        self.outside = self.root / "nvx-outside-marker"
+        source = self.SMOKE.read_text(encoding="utf-8")
+        self.functions = "".join(
+            _shell_function(source, name)
+            for name in ("check_share", "check_share_symlinks")
+        ).replace("/tmp/nvx-tool", '"$scratch/nvx-tool"')
+
+    def _run(self, call: str) -> subprocess.CompletedProcess[str]:
+        scratch = self.root / "scratch"
+        scratch.mkdir(exist_ok=True)
+        return subprocess.run(
+            [self.shell, "-s", "--", self.share.as_posix(), scratch.as_posix()],
+            input=f"set -eu\nshare=$1\nscratch=$2\n{self.functions}{call}\n",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_rw_share_creates_links_with_exact_targets(self):
+        result = self._run('check_share "$share" rw')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            f"NVX-UBUNTU-SANDBOX-SYMLINK-OK target={self.share.as_posix()}",
+            result.stdout,
+        )
+        self.assertIn("NVX-UBUNTU-SANDBOX-SHARE-OK", result.stdout)
+        self.assertEqual(
+            {name: os.readlink(self.links / name) for name in os.listdir(self.links)},
+            {
+                "nvx-tool": "../nvx-tool",
+                "absolute": "/nvx/absolute/target",
+                "outside": "../../nvx-outside-marker",
+                "denied": "../nvx-denied/secret",
+                "denied-directory": "../nvx-denied",
+            },
+        )
+        self.assertEqual(
+            (self.share / "nvx-guest-marker").read_text(encoding="utf-8"),
+            "guest-to-host\n",
+        )
+        self.assertTrue((self.share / "nvx-guest-directory").is_dir())
+
+    def test_links_fail_when_they_expose_host_data(self):
+        (self.share / "nvx-guest-marker").write_text(
+            "guest-to-host\n", encoding="utf-8"
+        )
+        self.outside.write_text("host-outside\n", encoding="utf-8")
+        result = self._run('check_share_symlinks "$share"')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("NVX-UBUNTU-SANDBOX-SYMLINK-OK", result.stdout)
+
+        for path in self.links.iterdir():
+            path.unlink()
+        self.outside.unlink()
+        denied = self.share / "nvx-denied"
+        denied.mkdir()
+        (denied / "secret").write_text("secret\n", encoding="utf-8")
+        result = self._run('check_share_symlinks "$share"')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("NVX-UBUNTU-SANDBOX-SYMLINK-OK", result.stdout)
+
+    def test_ro_share_rejects_links(self):
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is not None and geteuid() == 0:
+            self.skipTest("root ignores directory write permissions")
+        self.share.chmod(0o555)
+        self.addCleanup(self.share.chmod, 0o755)
+
+        result = self._run('check_share "$share" ro')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("NVX-UBUNTU-SANDBOX-SHARE-OK", result.stdout)
+        self.assertFalse(os.path.lexists(self.share / "nvx-guest-link"))
+
+        self.share.chmod(0o755)
+        result = self._run('check_share "$share" ro')
+        self.assertEqual(result.returncode, 1, result.stdout)
+
+
 class ManagedAgentStopTests(unittest.TestCase):
     SOURCE = Path(__file__).parents[1] / "guest" / "common" / "nvx-managed-agent.c"
     OUTER = struct.Struct("<4sHBB16sQQI")

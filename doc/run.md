@@ -274,6 +274,14 @@ inside that root. Denied names are omitted from directory listings and remain
 inaccessible through `..`, a symlink/junction, or another mount of the same
 virtio-fs device. Unsafe, external, duplicate, overlapping, and nested-mount
 rules are rejected before boot.
+In an `rw` mapping, the guest can create symbolic links, and OpenVMM stores
+each target exactly as given. The guest resolves links in its own namespace;
+OpenVMM never follows a link while resolving a host path, so a link to an
+absolute host path, outside the root, or into a denied path cannot reach host
+data. An `ro` mapping rejects link creation with `EROFS`. On Windows, links
+are WSL-style reparse points, which Windows path resolution never follows.
+Treat links in a writable share as untrusted when host software later reads
+the directory.
 A snapshot captured without a mapping may restore with a new `--mount`; after
 resume, mount it explicitly inside the guest because the initramfs hook has
 already completed:
@@ -311,7 +319,8 @@ python3 scripts/nvx.py sandbox \
 CI uses `/sbin/nvx-sandbox-smoke` as the entrypoint to verify Ubuntu identity,
 the fixed non-root account, and a scratch-backed `/tmp` write before clean
 guest exit. With `--arg TARGET --arg ro|rw`, it also checks a live share at
-`TARGET` as described below.
+`TARGET` as described below, including symbolic links in an `rw` share; the
+share needs a host-created, world-writable `nvx-links` directory for them.
 
 The layer UUID is the EROFS superblock UUID, not a content digest. The command
 validates the files before launch, orders roles independently of option order,
@@ -370,9 +379,16 @@ instead of starting the workload without its share.
 
 Guest file permissions use the ownership and mode bits that OpenVMM reports
 for the exported files, so grant the selected workload identity access to the
-host directory. One share per microVM and the existing OpenVMM file-identity
-and symbolic-link policies apply. A managed sandbox stores the absolute host
-path in its configuration and reattaches the share on every `start`.
+host directory. On a Linux host, a file or directory that the workload creates
+is owned by the OpenVMM user, so the workload cannot create entries inside a
+directory it created unless the host grants write access to others
+([#297](https://github.com/microsoft/nvx/issues/297) tracks caller-owned
+files). An `rw` share supports the symbolic links that package managers and
+language toolchains create; see
+[virtio-fs host mapping](#virtio-fs-host-mapping) for their semantics. One
+share per microVM and the existing OpenVMM file-identity policy apply. A
+managed sandbox stores the absolute host path in its configuration and
+reattaches the share on every `start`.
 
 ### Managed lifecycle
 
