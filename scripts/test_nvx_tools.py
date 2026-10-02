@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import nvx  # noqa: E402
 from nvx_tools import (  # noqa: E402
     archive,
+    azurelinux,
     benchmark,
     build,
     build_config,
@@ -112,8 +113,10 @@ def _write_release_fixture(
     binary = openvmm_dir / "target" / "release" / binary_name
     revision = "0bc357bbcf3a654b63dfb51f1103c5751bf3d31f"
     guest_names = ReleaseBuildConstants.GUEST_ARTIFACT_NAMES
-    source_files = set(build._initramfs_source_files()) | set(
-        ubuntu.customization_files()
+    source_files = (
+        set(build._initramfs_source_files())
+        | set(ubuntu.customization_files())
+        | set(azurelinux.input_files())
     )
     for source in source_files:
         destination = root / source.relative_to(BuildConstants.REPO_ROOT)
@@ -165,6 +168,7 @@ def _write_release_fixture(
                     AzureLinuxBuildConstants.PACKAGE_MANIFEST_FORMAT
                 ),
                 "image": AzureLinuxBuildConstants.IMAGE,
+                "input_sha256": azurelinux.input_sha256(),
             }
         ),
         encoding="utf-8",
@@ -4914,6 +4918,7 @@ class BuildTests(unittest.TestCase):
             "KERNEL_INPUT_HASH",
             "ALPINE_INPUT_HASH",
             "UBUNTU_INPUT_HASH",
+            "AZURELINUX_INPUT_HASH",
         ):
             with self.subTest(cache=cache_name):
                 cache_input = next(
@@ -4923,6 +4928,35 @@ class BuildTests(unittest.TestCase):
                 )
                 self.assertIn("'scripts/nvx_tools/build_config.py'", cache_input)
                 self.assertIn("'scripts/nvx_tools/build_constants.py'", cache_input)
+
+    def test_ci_azurelinux_cache_key_covers_build_input_digest(self):
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "build-guest-artifacts"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        cache_input = next(
+            line
+            for line in action.splitlines()
+            if line.strip().startswith("AZURELINUX_INPUT_HASH:")
+        )
+        patterns = cache_input.split("'")[1::2]
+        self.assertIn("scripts/nvx_tools/azurelinux.py", patterns)
+        for path in azurelinux.input_files():
+            relative = path.relative_to(BuildConstants.REPO_ROOT).as_posix()
+            with self.subTest(path=relative):
+                self.assertTrue(
+                    any(
+                        relative == pattern
+                        or (
+                            pattern.endswith("/**")
+                            and relative.startswith(pattern[:-2])
+                        )
+                        for pattern in patterns
+                    )
+                )
 
     def test_kernel_input_config_uses_canonical_lf_line_endings(self):
         attributes = (BuildConstants.REPO_ROOT / ".gitattributes").read_text(
@@ -4986,6 +5020,49 @@ class BuildTests(unittest.TestCase):
         self.assertIn("rpm -qa --queryformat", dockerfile)
         self.assertIn("busybox-package.tsv", dockerfile)
         self.assertIn("'packages': json.loads", dockerfile)
+
+    def test_azurelinux_manifest_records_shared_input_digest(self):
+        dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        azure_stage = dockerfile.split("FROM base AS azurelinux-initramfs", 1)[1]
+        self.assertIn("from nvx_tools.azurelinux import input_sha256", azure_stage)
+        self.assertIn(
+            "'input_sha256': input_sha256(\n"
+            "        image=os.environ['AZURELINUX_IMAGE'],\n"
+            "        version=os.environ['AZURELINUX_VERSION'],\n"
+            "    ),",
+            azure_stage,
+        )
+
+    def test_azurelinux_input_digest_tracks_guest_sources_and_dockerfile(self):
+        checkout_digest = azurelinux.input_sha256()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for source in azurelinux.input_files():
+                destination = root / source.relative_to(BuildConstants.REPO_ROOT)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+            with patch.object(BuildConstants, "REPO_ROOT", root):
+                baseline = azurelinux.input_sha256()
+                self.assertEqual(baseline, checkout_digest)
+                self.assertNotEqual(
+                    azurelinux.input_sha256(image="example.invalid/other@sha256:0"),
+                    baseline,
+                )
+                self.assertNotEqual(azurelinux.input_sha256(version="3.1"), baseline)
+                for relative in ("guest/common/init", "docker/Dockerfile"):
+                    with self.subTest(path=relative):
+                        path = root / relative
+                        original = path.read_bytes()
+                        path.write_bytes(original + b"\n# changed\n")
+                        self.assertNotEqual(azurelinux.input_sha256(), baseline)
+                        path.write_bytes(original)
+                        self.assertEqual(azurelinux.input_sha256(), baseline)
+                unrelated = root / "guest" / "ubuntu" / "nvx-bashrc"
+                unrelated.parent.mkdir(parents=True, exist_ok=True)
+                unrelated.write_text("changed\n", encoding="utf-8")
+                self.assertEqual(azurelinux.input_sha256(), baseline)
 
     def test_guest_init_runs_virtfs_helper_from_installed_path(self):
         installed: list[Path] = []
@@ -9627,6 +9704,51 @@ class ReleaseTests(unittest.TestCase):
                 ),
             ):
                 release._guest_release_inputs(include_azurelinux=True)
+
+    def test_guest_release_inputs_reject_stale_azurelinux_build_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths, _kernel_inputs, _revision = _write_release_fixture(root)
+            build_dir = paths["build"]
+            manifest_path = build_dir / AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME
+            current_manifest = manifest_path.read_text(encoding="utf-8")
+            with (
+                patch.object(BuildConstants, "REPO_ROOT", root),
+                patch.object(
+                    UbuntuBuildConstants,
+                    "PACKAGE_LOCK",
+                    root / "ubuntu" / "packages.lock.json",
+                ),
+                patch.object(
+                    release,
+                    "artifact_path",
+                    side_effect=build_dir.joinpath,
+                ),
+            ):
+                release._guest_release_inputs(include_azurelinux=True)
+                with self.subTest(case="missing digest"):
+                    document = json.loads(current_manifest)
+                    del document["input_sha256"]
+                    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        common.ScriptError,
+                        "Azure Linux initramfs manifest does not match the "
+                        "current build inputs",
+                    ):
+                        release._guest_release_inputs(include_azurelinux=True)
+                manifest_path.write_text(current_manifest, encoding="utf-8")
+                with self.subTest(case="edited Dockerfile"):
+                    dockerfile = root / "docker" / "Dockerfile"
+                    dockerfile.write_text(
+                        dockerfile.read_text(encoding="utf-8") + "# changed\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        common.ScriptError,
+                        "Azure Linux initramfs manifest does not match the "
+                        "current build inputs",
+                    ):
+                        release._guest_release_inputs(include_azurelinux=True)
 
     def test_guest_release_inputs_require_azurelinux_only_when_included(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -149,7 +149,11 @@ python3 <<'PY'
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, '/repo/scripts')
+from nvx_tools.azurelinux import input_sha256
 
 def sha256(path: str) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -163,6 +167,10 @@ manifest = {
     'version': os.environ['AZURELINUX_VERSION'],
     'architecture': 'x86_64',
     'image': os.environ['AZURELINUX_IMAGE'],
+    'input_sha256': input_sha256(
+        image=os.environ['AZURELINUX_IMAGE'],
+        version=os.environ['AZURELINUX_VERSION'],
+    ),
     'package_manifest_format': 'azurelinux-v1',
     'packages': json.loads(Path('/tmp/azurelinux-packages.json').read_text(encoding='utf-8')),
     'helpers': {

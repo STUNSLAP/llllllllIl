@@ -239,6 +239,8 @@ class AzureLinuxBuildConstants:
     )
     PACKAGE_MANIFEST_FORMAT: Final = "azurelinux-v1"
     PACKAGE_MANIFEST_VERSION: Final = 1
+    INPUT_DIGEST_DOMAIN: Final = "nvx-azurelinux-initramfs-inputs"
+    INPUT_DIGEST_FORMAT: Final = 1
 
 
 class InitramfsBuildConstants:

@@ -23,6 +23,7 @@ from pathlib import Path, PurePosixPath
 from typing import cast
 
 from .archive import create_reproducible_release_archive, create_reproducible_tar_gz
+from .azurelinux import input_sha256 as azurelinux_input_sha256
 from .build import (
     assert_required_kernel_config,
     build_docker_linux_source,
@@ -845,6 +846,10 @@ def _validate_azurelinux_manifest(manifest_path: Path) -> None:
         or manifest.get("image") != AzureLinuxBuildConstants.IMAGE
     ):
         raise ScriptError("Azure Linux initramfs manifest is invalid")
+    if manifest.get("input_sha256") != azurelinux_input_sha256():
+        raise ScriptError(
+            "Azure Linux initramfs manifest does not match the current build inputs"
+        )
 
 
 def _guest_release_inputs(
