@@ -457,7 +457,7 @@ python3 scripts/nvx.py benchmark [OPTIONS]
 | `--platform NAME` | inferred OS/backend | Record the host-typed performance series. |
 | `--openvmm-dir PATH` | `openvmm/` | Select the OpenVMM repository. |
 | `--nvx-dir PATH` | repository root | Select the NVX repository containing guest artifacts. |
-| `--warmups N` | `5` for `device-io`; `1` for `device-restore-profile`; `3` otherwise | Set the number of excluded warmup attempts; zero is allowed. |
+| `--warmups N` | `5` for `device-io`; `3` otherwise | Set the number of excluded warmup attempts; zero is allowed. |
 | `--runs N` | `30` for `device-io`; `5` for `device-restore-profile`; `11` otherwise | Set the number of retained attempts. |
 | `--memory-mib MIB` | `128` | Set guest memory for the general suites. |
 | `--processors {1,2,4,8}` | `1` | Run every cold, capture, restore, and workload launch with this microVM count. |
