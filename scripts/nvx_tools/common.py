@@ -29,6 +29,15 @@ class ScriptError(RuntimeError):
     """Raised for an actionable command-line workflow failure."""
 
 
+def strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ScriptError(f"duplicate JSON property: {key}")
+        result[key] = value
+    return result
+
+
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:

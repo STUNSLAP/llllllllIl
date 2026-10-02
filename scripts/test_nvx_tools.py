@@ -754,6 +754,291 @@ class CliTests(unittest.TestCase):
                     network_arguments,
                 )
 
+    def test_run_lowers_structured_egress_policy_before_launch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            policy = Path(temporary) / "policy.json"
+            policy.write_text(
+                json.dumps(
+                    {
+                        "allow": [
+                            {
+                                "cidr": "192.0.2.0/24",
+                                "except": ["192.0.2.128/25"],
+                                "protocol": "tcp",
+                                "port": 8000,
+                                "endPort": 8001,
+                            },
+                            {"cidr": "192.0.2.200/32"},
+                        ],
+                        "deny": [
+                            {
+                                "cidr": "192.0.2.0/24",
+                                "protocol": "tcp",
+                                "port": 8001,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = nvx.parse_args(
+                [
+                    "run",
+                    "--dry-run",
+                    "--network-egress",
+                    "deny",
+                    "--network-egress-policy-file",
+                    str(policy),
+                ]
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(nvx, "require_file", side_effect=require),
+                patch.object(
+                    nvx, "_format_command", return_value="formatted"
+                ) as format_command,
+            ):
+                nvx.command_run(args)
+
+        command = format_command.call_args.args[0]
+        self.assertNotIn("--network-egress-policy-file", command)
+        self.assertEqual(command.count("--network-egress-allow"), 3)
+        self.assertIn("192.0.2.0/25:tcp:8000", command)
+        self.assertIn("192.0.2.0/25:tcp:8001", command)
+        self.assertIn("192.0.2.200/32", command)
+        self.assertEqual(command.count("--network-egress-deny"), 1)
+        self.assertIn("192.0.2.0/24:tcp:8001", command)
+
+    def test_policy_file_rejects_ambiguous_flags_before_artifact_access(self):
+        cases = (
+            [
+                "--network-egress",
+                "deny",
+                "--network-egress-policy-file",
+                "policy.json",
+                "--network-egress-allow",
+                "192.0.2.1",
+            ],
+            ["--network-egress-policy-file", "policy.json"],
+        )
+        for extra in cases:
+            with self.subTest(extra=extra):
+                args = nvx.parse_args(["run", "--dry-run", *extra])
+                with (
+                    patch.object(nvx, "require_file") as require,
+                    self.assertRaises(common.ScriptError),
+                ):
+                    nvx.command_run(args)
+                require.assert_not_called()
+
+    def test_sandbox_rejects_policy_mixing_before_validating_layer_files(self):
+        for operation in ("run", "provision"):
+            with self.subTest(operation=operation):
+                args = nvx.parse_args(
+                    [
+                        "sandbox",
+                        operation,
+                        "--layer",
+                        "distro,absent.erofs,00000000-0000-4000-8000-000000000001",
+                        "--scratch",
+                        "absent.ext4",
+                        "--network-egress",
+                        "deny",
+                        "--network-egress-policy-file",
+                        "absent.json",
+                        "--network-egress-allow",
+                        "192.0.2.1",
+                    ]
+                )
+                with (
+                    patch.object(nvx.SandboxLaunch, "validated") as validated,
+                    self.assertRaisesRegex(common.ScriptError, "cannot be combined"),
+                ):
+                    nvx.command_sandbox(args)
+                validated.assert_not_called()
+
+    def test_managed_provision_persists_lowered_policy_not_source_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            policy = root / "policy.json"
+            state = root / "state"
+            layer.write_bytes(b"layer")
+            scratch.write_bytes(b"scratch")
+            policy.write_text(
+                json.dumps(
+                    {
+                        "allow": [
+                            {
+                                "cidr": "192.0.2.0/24",
+                                "except": ["192.0.2.128/25"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = nvx.parse_args(
+                [
+                    "sandbox",
+                    "provision",
+                    "--state-dir",
+                    str(state),
+                    "--layer",
+                    f"distro,{layer},11111111-1111-1111-1111-111111111111",
+                    "--scratch",
+                    str(scratch),
+                    "--network-egress",
+                    "deny",
+                    "--network-egress-policy-file",
+                    str(policy),
+                ]
+            )
+
+            nvx.command_sandbox(args)
+            config = json.loads(
+                (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
+            )
+            policy.unlink()
+
+            self.assertEqual(config["network_egress"], "deny")
+            self.assertEqual(config["network_egress_allow"], ["192.0.2.0/25"])
+            self.assertEqual(config["network_egress_deny"], [])
+            self.assertNotIn("network_egress_policy_file", config)
+
+    def test_public_cli_provision_persists_policy_after_source_removal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            policy = root / "policy.json"
+            state = root / "state"
+            layer.write_bytes(b"layer")
+            scratch.write_bytes(b"scratch")
+            policy.write_text(
+                json.dumps(
+                    {
+                        "allow": [
+                            {
+                                "cidr": "192.0.2.0/24",
+                                "except": ["192.0.2.128/25"],
+                                "protocol": "tcp",
+                                "port": 8000,
+                                "endPort": 8001,
+                            }
+                        ],
+                        "deny": [
+                            {
+                                "cidr": "192.0.2.0/24",
+                                "protocol": "tcp",
+                                "port": 8001,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(nvx.__file__).resolve()),
+                    "sandbox",
+                    "provision",
+                    "--state-dir",
+                    str(state),
+                    "--layer",
+                    f"distro,{layer},11111111-1111-1111-1111-111111111111",
+                    "--scratch",
+                    str(scratch),
+                    "--network-egress",
+                    "deny",
+                    "--network-egress-policy-file",
+                    str(policy),
+                ],
+                cwd=BuildConstants.REPO_ROOT,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                result.stderr.decode("utf-8", "replace"),
+            )
+            policy.unlink()
+            config = json.loads(
+                (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(
+                config["network_egress_allow"],
+                ["192.0.2.0/25:tcp:8000", "192.0.2.0/25:tcp:8001"],
+            )
+            self.assertEqual(
+                config["network_egress_deny"],
+                ["192.0.2.0/24:tcp:8001"],
+            )
+            self.assertNotIn(str(policy), json.dumps(config))
+
+    def test_invalid_policy_has_no_managed_state_side_effect(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            policy = root / "policy.json"
+            state = root / "state"
+            layer.write_bytes(b"layer")
+            scratch.write_bytes(b"scratch")
+            policy.write_text(
+                '{"allow":[{"cidr":"192.0.2.0/24","protocol":"tcp"}]}',
+                encoding="utf-8",
+            )
+            args = nvx.parse_args(
+                [
+                    "sandbox",
+                    "provision",
+                    "--state-dir",
+                    str(state),
+                    "--layer",
+                    f"distro,{layer},11111111-1111-1111-1111-111111111111",
+                    "--scratch",
+                    str(scratch),
+                    "--network-egress",
+                    "deny",
+                    "--network-egress-policy-file",
+                    str(policy),
+                ]
+            )
+
+            with self.assertRaises(common.ScriptError):
+                nvx.command_sandbox(args)
+            self.assertFalse(state.exists())
+
+    def test_managed_non_launch_operations_reject_network_policy_options(self):
+        args = nvx.parse_args(
+            [
+                "sandbox",
+                "start",
+                "--state-dir",
+                "state",
+                "--network-egress",
+                "deny",
+                "--network-egress-policy-file",
+                "policy.json",
+            ]
+        )
+        with (
+            patch.object(sandbox_lifecycle, "start") as start,
+            self.assertRaisesRegex(
+                common.ScriptError, "only valid for sandbox run or provision"
+            ),
+        ):
+            nvx.command_sandbox(args)
+        start.assert_not_called()
+
     def test_run_parses_denied_filesystem_paths(self):
         args = nvx.parse_args(
             [
@@ -6477,6 +6762,101 @@ class BenchmarkTests(unittest.TestCase):
         terminate.assert_called_once_with(interaction.process)
         wait.assert_not_called()
         self.assertTrue(log.endswith(b"NVX-RESTORE-PROCESSORS-FAIL unstable-tsc\r\n"))
+
+    def test_guest_runner_preserves_primary_and_close_failures_with_bounded_tail(self):
+        class FakeProcess:
+            pid = 123
+
+            def poll(self):
+                return 7
+
+            def wait(self):
+                return 7
+
+        class FakeInteraction:
+            process = FakeProcess()
+            containment = None
+
+            def read_output(self, chunks: queue.Queue[bytes | None]):
+                chunks.put(benchmark.BOOT_MARKER + b"\n" + b"x" * 5000 + b"\nDONE\n")
+                chunks.put(None)
+
+            def write_input(self, _data: bytes):
+                pass
+
+            def close(self):
+                raise OSError("close failed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "guest.log"
+            with (
+                patch.object(
+                    benchmark, "InteractiveProcess", return_value=FakeInteraction()
+                ),
+                patch.object(benchmark, "_try_peak_rss", return_value=1024),
+                patch.object(benchmark, "terminate") as terminate,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "OpenVMM exited with status 7"
+                ) as raised:
+                    benchmark.run_guest_script(
+                        ["openvmm"],
+                        "guest command\n",
+                        b"DONE",
+                        timeout=1,
+                        log_path=log_path,
+                    )
+
+            error = raised.exception
+            cleanup_errors = cast(
+                tuple[BaseException, ...],
+                error.cleanup_errors,  # type: ignore[attr-defined]
+            )
+            self.assertEqual([str(item) for item in cleanup_errors], ["close failed"])
+            self.assertIn("--- OpenVMM output ---", str(error))
+            self.assertIn("--- cleanup failures ---", str(error))
+            self.assertNotIn(benchmark.BOOT_MARKER.decode(), str(error))
+            self.assertGreater(len(log_path.read_bytes()), 4096)
+            self.assertTrue(log_path.read_bytes().endswith(b"\nDONE\n"))
+            terminate.assert_called_once()
+
+    def test_guest_runner_propagates_success_only_close_failure(self):
+        class FakeProcess:
+            pid = 123
+
+            def poll(self):
+                return 0
+
+            def wait(self):
+                return 0
+
+        class FakeInteraction:
+            process = FakeProcess()
+            containment = None
+
+            def read_output(self, chunks: queue.Queue[bytes | None]):
+                chunks.put(benchmark.BOOT_MARKER + b"\nDONE\n")
+                chunks.put(None)
+
+            def write_input(self, _data: bytes):
+                pass
+
+            def close(self):
+                raise OSError("close after success")
+
+        with (
+            patch.object(
+                benchmark, "InteractiveProcess", return_value=FakeInteraction()
+            ),
+            patch.object(benchmark, "_try_peak_rss", return_value=1024),
+        ):
+            with self.assertRaisesRegex(OSError, "close after success"):
+                benchmark.run_guest_script(
+                    ["openvmm"],
+                    "guest command\n",
+                    b"DONE",
+                    timeout=1,
+                )
 
     def test_live_peak_rss_samples_linux_process_without_reaping(self):
         process = MagicMock(pid=123)

@@ -65,6 +65,7 @@ from nvx_tools.common import (
 from nvx_tools.create_linux_source_archive import (
     configure_parser as configure_linux_source_archive_parser,
 )
+from nvx_tools.egress_policy import compile_policy_file
 from nvx_tools.guests import GUEST_NAMES, guest_descriptor
 from nvx_tools.microvm_tests import configure_parser as configure_microvm_test_parser
 from nvx_tools.performance import configure_parser as configure_performance_parser
@@ -268,16 +269,42 @@ def _format_command(command: list[str]) -> str:
     return subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
 
 
-def _extend_network_arguments(command: list[str], args: argparse.Namespace) -> None:
+def _resolve_network_egress_rules(
+    args: argparse.Namespace,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    policy_path = args.network_egress_policy_file
+    explicit_allow = tuple(args.network_egress_allow)
+    explicit_deny = tuple(args.network_egress_deny)
+    if policy_path is None:
+        return explicit_allow, explicit_deny
+    if explicit_allow or explicit_deny:
+        raise ScriptError(
+            "--network-egress-policy-file cannot be combined with "
+            "--network-egress-allow or --network-egress-deny"
+        )
+    if args.network_egress is None:
+        raise ScriptError(
+            "--network-egress is required with --network-egress-policy-file"
+        )
+    compiled = compile_policy_file(policy_path)
+    return compiled.allow, compiled.deny
+
+
+def _extend_network_arguments(
+    command: list[str],
+    args: argparse.Namespace,
+    network_egress_allow: tuple[str, ...],
+    network_egress_deny: tuple[str, ...],
+) -> None:
     if args.net is not None:
         command.extend(["--net", args.net, "--network-profile", args.network_profile])
     if args.network_egress is not None:
         command.extend(["--network-egress", args.network_egress])
     if args.network_ingress is not None:
         command.extend(["--network-ingress", args.network_ingress])
-    for rule in args.network_egress_allow:
+    for rule in network_egress_allow:
         command.extend(["--network-egress-allow", rule])
-    for rule in args.network_egress_deny:
+    for rule in network_egress_deny:
         command.extend(["--network-egress-deny", rule])
     if args.host_loopback is not None:
         command.extend(["--host-loopback", args.host_loopback])
@@ -313,6 +340,7 @@ def command_run(args: argparse.Namespace) -> None:
             raise ScriptError(
                 "--restore-processors cannot exceed --processors capacity"
             )
+    network_egress_allow, network_egress_deny = _resolve_network_egress_rules(args)
     executable = require_file(openvmm_binary_path(), "OpenVMM release binary")
     command = [
         str(executable),
@@ -360,7 +388,12 @@ def command_run(args: argparse.Namespace) -> None:
         command.extend(["--mount", args.mount])
     for denied_path in args.mount_deny:
         command.extend(["--mount-deny", str(denied_path)])
-    _extend_network_arguments(command, args)
+    _extend_network_arguments(
+        command,
+        args,
+        network_egress_allow,
+        network_egress_deny,
+    )
     if args.outcome_report is not None:
         command.extend(["--microvm-report", str(args.outcome_report)])
     if args.cmdline:
@@ -372,6 +405,24 @@ def command_run(args: argparse.Namespace) -> None:
 
 def command_sandbox(args: argparse.Namespace) -> None:
     operation = args.sandbox_operation
+    network_options = (
+        args.net,
+        args.network_profile,
+        args.network_egress,
+        args.network_ingress,
+        args.network_egress_policy_file,
+        args.host_loopback,
+        args.network_proxy,
+    )
+    if operation not in ("run", "provision") and (
+        any(value is not None for value in network_options)
+        or args.network_egress_allow
+        or args.network_egress_deny
+        or args.host_loopback_forward
+    ):
+        raise ScriptError(
+            "network policy options are only valid for sandbox run or provision"
+        )
     if operation in ("run", "provision", "exec") and (
         args.entrypoint in SYSTEMD_ENTRYPOINTS
     ):
@@ -391,6 +442,7 @@ def command_sandbox(args: argparse.Namespace) -> None:
             raise ScriptError("--net and --network-profile must be specified together")
         if not args.layer or args.scratch is None:
             raise ScriptError(f"sandbox {operation} requires --layer and --scratch")
+        network_egress_allow, network_egress_deny = _resolve_network_egress_rules(args)
         launch = SandboxLaunch(
             layers=tuple(args.layer),
             scratch=args.scratch,
@@ -409,6 +461,8 @@ def command_sandbox(args: argparse.Namespace) -> None:
         _validate_sandbox_systemd_policy(launch)
     else:
         launch = None
+        network_egress_allow = ()
+        network_egress_deny = ()
 
     if operation == "provision":
         if args.state_dir is None:
@@ -423,8 +477,8 @@ def command_sandbox(args: argparse.Namespace) -> None:
             network_profile=args.network_profile,
             network_egress=args.network_egress,
             network_ingress=args.network_ingress,
-            network_egress_allow=tuple(args.network_egress_allow),
-            network_egress_deny=tuple(args.network_egress_deny),
+            network_egress_allow=network_egress_allow,
+            network_egress_deny=network_egress_deny,
             host_loopback=args.host_loopback,
             network_proxy=args.network_proxy,
             host_loopback_forward=tuple(args.host_loopback_forward),
@@ -495,7 +549,12 @@ def command_sandbox(args: argparse.Namespace) -> None:
         "--cmdline",
         launch.kernel_command_line(args.cmdline),
     ]
-    _extend_network_arguments(command, args)
+    _extend_network_arguments(
+        command,
+        args,
+        network_egress_allow,
+        network_egress_deny,
+    )
     if args.outcome_report is not None:
         command.extend(["--microvm-report", str(args.outcome_report)])
     print(f">> {_format_command(command)}")
@@ -727,6 +786,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument("--network-ingress", choices=("allow", "deny"))
     run.add_argument("--network-egress-allow", action="append", default=[])
     run.add_argument("--network-egress-deny", action="append", default=[])
+    run.add_argument(
+        "--network-egress-policy-file",
+        type=Path,
+        metavar="PATH",
+        help="load bounded IPv4 ranges and rule-local exclusions from JSON",
+    )
     run.add_argument("--host-loopback", choices=("allow", "deny"))
     run.add_argument("--network-proxy", metavar="IPV4:TCP-PORT")
     run.add_argument("--host-loopback-forward", action="append", default=[])
@@ -819,6 +884,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sandbox.add_argument("--network-ingress", choices=("allow", "deny"))
     sandbox.add_argument("--network-egress-allow", action="append", default=[])
     sandbox.add_argument("--network-egress-deny", action="append", default=[])
+    sandbox.add_argument(
+        "--network-egress-policy-file",
+        type=Path,
+        metavar="PATH",
+        help="load bounded IPv4 ranges and rule-local exclusions for run/provision",
+    )
     sandbox.add_argument("--host-loopback", choices=("allow", "deny"))
     sandbox.add_argument("--network-proxy", metavar="IPV4:TCP-PORT")
     sandbox.add_argument("--host-loopback-forward", action="append", default=[])
