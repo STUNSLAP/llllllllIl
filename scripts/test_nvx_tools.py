@@ -5114,7 +5114,16 @@ class BuildTests(unittest.TestCase):
         )
         for applet in ("sh", "arp", "nc", "wget", "mdev", "ifconfig", "route"):
             self.assertIn(applet, applets)
+        # util-linux provides these; the BusyBox applets lack required options.
         self.assertNotIn("setpriv", applets)
+        self.assertNotIn("unshare", applets)
+        launcher = (
+            BuildConstants.REPO_ROOT
+            / "guest"
+            / "common"
+            / "nvx-container-launch-azurelinux"
+        ).read_text(encoding="utf-8")
+        self.assertIn("exec unshare --mount --pid --uts --fork --kill-child", launcher)
         self.assertIn(
             "busybox", [package["name"] for package in azurelinux.load_package_lock()]
         )

@@ -110,7 +110,7 @@ install -m 0755 /repo/guest/common/nvx-container-launch-azurelinux \
 ln -sf ../sbin/busybox /rootfs/usr/bin/busybox
 rm -f /rootfs/bin/sh;
 for utility in arp awk basename cat chmod chroot cp grep head hostname ifconfig ip mdev mkdir nc \
-    sh mknod mount ping route rm sed sleep tr wget blkid losetup mountpoint flock unshare; do
+    sh mknod mount ping route rm sed sleep tr wget blkid losetup mountpoint flock; do
     ln -sf busybox "/rootfs/bin/$utility"
 done
 # Workload identities require an existing home directory. Azure Linux points
