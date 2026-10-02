@@ -5218,6 +5218,8 @@ class BuildTests(unittest.TestCase):
                     "docker/Dockerfile",
                     "azurelinux/packages.lock.json",
                     "scripts/nvx_tools/azurelinux.py",
+                    "scripts/nvx_tools/build_constants.py",
+                    "scripts/nvx_tools/common.py",
                 ):
                     with self.subTest(path=relative):
                         path = root / relative

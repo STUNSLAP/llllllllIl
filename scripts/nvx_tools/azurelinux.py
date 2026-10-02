@@ -123,9 +123,12 @@ def input_files() -> tuple[Path, ...]:
     files = [
         root / DockerBuildConstants.DOCKERFILE,
         package_lock_path(),
-        # The Docker build runs this module to download the RPMs and record
-        # this digest, so changes to it must also rebuild the artifact.
-        root / "scripts" / "nvx_tools" / "azurelinux.py",
+        # The Docker build runs these modules to download the RPMs and record
+        # this digest, so changes to them must also rebuild the artifact.
+        *(
+            root / "scripts" / "nvx_tools" / name
+            for name in ("azurelinux.py", "build_constants.py", "common.py")
+        ),
     ]
     for directory in AzureLinuxBuildConstants.GUEST_SOURCE_DIRECTORIES:
         files.extend(path for path in (root / directory).rglob("*") if path.is_file())
