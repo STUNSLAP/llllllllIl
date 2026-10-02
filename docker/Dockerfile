@@ -12,7 +12,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         binutils \
         bison \
         build-essential \
-        busybox-static \
         ca-certificates \
         cpio \
         curl \
@@ -31,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /repo
 COPY guest/ /repo/guest/
 COPY ubuntu/ /repo/ubuntu/
+COPY azurelinux/ /repo/azurelinux/
 COPY docker/ /repo/docker/
 COPY kernel/ /repo/kernel/
 COPY scripts/ /repo/scripts/
@@ -63,19 +63,30 @@ RUN set -eux; \
     done; \
     cc -nostdlib -static -Os -fno-builtin -fno-pie -fno-stack-protector -no-pie \
         -Wl,--build-id=none -Wl,-z,noexecstack -s -o /out/helpers/nvx-device-io \
-        /repo/guest/common/nvx-device-io.c; \
-    ! readelf -l /bin/busybox | grep -q INTERP; \
-    cp /bin/busybox /out/busybox; \
-    dpkg-query -W -f='${binary:Package}\t${Version}\t${Architecture}\t${source:Package}\t${source:Version}\n' \
-        busybox-static > /out/busybox-package.tsv
+        /repo/guest/common/nvx-device-io.c
+
+FROM base AS azurelinux-packages
+RUN python3 - <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, '/repo/scripts')
+from nvx_tools.azurelinux import download_packages
+
+download_packages(Path('/out/rpms'))
+PY
 
 FROM ${AZURELINUX_IMAGE} AS azurelinux-rootfs
-RUN tdnf install -y util-linux \
+COPY --from=azurelinux-packages /out/rpms/ /tmp/azurelinux-rpms/
+RUN rpm --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY \
+    && rpm --checksig /tmp/azurelinux-rpms/*.rpm \
+    && rpm --upgrade --verbose --hash /tmp/azurelinux-rpms/*.rpm \
+    && rm -rf /tmp/azurelinux-rpms \
     && test -x /usr/bin/ldd \
     && test -x /usr/bin/setpriv \
+    && test -x /usr/sbin/busybox \
     && rpm -qa --queryformat '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{LICENSE}\t%{SOURCERPM}\n' \
-        | sort > /tmp/azurelinux-rpm-packages.tsv \
-    && tdnf clean all
+        | sort > /tmp/azurelinux-rpm-packages.tsv
 
 FROM base AS azurelinux-initramfs
 ARG AZURELINUX_IMAGE
@@ -83,8 +94,6 @@ ARG AZURELINUX_VERSION
 COPY --from=azurelinux-rootfs / /rootfs/
 COPY --from=azurelinux-rootfs /tmp/azurelinux-rpm-packages.tsv /tmp/azurelinux-rpm-packages.tsv
 COPY --from=azurelinux-helpers /out/helpers/ /rootfs/sbin/
-COPY --from=azurelinux-helpers /out/busybox /rootfs/bin/busybox
-COPY --from=azurelinux-helpers /out/busybox-package.tsv /tmp/busybox-package.tsv
 RUN <<'EOF'
 set -eux
 install -m 0755 /repo/guest/common/init /rootfs/init
@@ -96,9 +105,12 @@ install -m 0755 /repo/guest/common/nvx-exit \
     /repo/guest/common/nvx-container-enter-azurelinux /rootfs/sbin/
 install -m 0755 /repo/guest/common/nvx-container-launch-azurelinux \
     /rootfs/sbin/nvx-container-launch
+# Link the BusyBox applets that the shared guest scripts expect; every other
+# command resolves through PATH to the Azure Linux packages.
+ln -sf ../sbin/busybox /rootfs/usr/bin/busybox
 rm -f /rootfs/bin/sh;
-for utility in awk basename cat chmod chroot cp grep head hostname ifconfig ip mdev mkdir sh \
-    mknod mount ping route rm sed sleep tr blkid losetup mkfs.ext4 mountpoint flock unshare; do
+for utility in arp awk basename cat chmod chroot cp grep head hostname ifconfig ip mdev mkdir nc \
+    sh mknod mount ping route rm sed sleep tr wget blkid losetup mountpoint flock unshare; do
     ln -sf busybox "/rootfs/bin/$utility"
 done
 rm -f /rootfs/tmp/azurelinux-rpm-packages.tsv
@@ -116,6 +128,8 @@ for line in Path('/tmp/azurelinux-rpm-packages.tsv').read_text(encoding='utf-8')
     if len(fields) != 6:
         raise ValueError(f'malformed RPM package metadata: {line!r}')
     name, version, release, architecture, license_text, source_rpm = fields
+    if name == 'gpg-pubkey':
+        continue
     packages.append({
         'type': 'rpm',
         'name': name,
@@ -125,22 +139,6 @@ for line in Path('/tmp/azurelinux-rpm-packages.tsv').read_text(encoding='utf-8')
         'license': license_text,
         'source_rpm': source_rpm,
     })
-busybox_fields = (
-    Path('/tmp/busybox-package.tsv').read_text(encoding='utf-8').strip().split('\t')
-)
-if len(busybox_fields) != 5:
-    raise ValueError(f'malformed BusyBox package metadata: {busybox_fields!r}')
-name, version, architecture, source_name, source_version = busybox_fields
-packages.append({
-    'type': 'deb',
-    'name': name,
-    'version': version,
-    'architecture': architecture,
-    'source_name': source_name,
-    'source_version': source_version,
-    'license': 'GPL-2.0-only',
-    'installed_path': '/bin/busybox',
-})
 Path('/tmp/azurelinux-packages.json').write_text(
     json.dumps(packages, indent=2, sort_keys=True) + '\n',
     encoding='utf-8',

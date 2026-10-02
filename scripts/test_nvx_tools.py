@@ -247,9 +247,14 @@ def _write_release_fixture(
             "version": AzureLinuxBuildConstants.VERSION,
             "architecture": AzureLinuxBuildConstants.ARCHITECTURE,
             "image": AzureLinuxBuildConstants.IMAGE,
+            "package_lock": "azurelinux/packages.lock.json",
+            "package_lock_sha256": azurelinux.package_lock_sha256(),
             "guest_sources": [
-                path.as_posix()
-                for path in AzureLinuxBuildConstants.GUEST_SOURCE_DIRECTORIES
+                *(
+                    path.as_posix()
+                    for path in AzureLinuxBuildConstants.GUEST_SOURCE_DIRECTORIES
+                ),
+                "azurelinux/packages.lock.json",
             ],
             "package_manifests": [
                 (
@@ -4289,6 +4294,96 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(azurelinux_guest.default_memory_mib, 256)
         self.assertFalse(azurelinux_guest.sandbox_control)
 
+    def test_azurelinux_manifest_and_package_lock_match_build_pins(self):
+        manifest = json.loads(
+            (BuildConstants.REPO_ROOT / "SOURCE-MANIFEST.json").read_text(
+                encoding="utf-8"
+            )
+        )["azurelinux"]
+        self.assertEqual(manifest["image"], AzureLinuxBuildConstants.IMAGE)
+        self.assertEqual(manifest["package_lock"], "azurelinux/packages.lock.json")
+        self.assertEqual(
+            manifest["package_lock_sha256"],
+            azurelinux.package_lock_sha256(),
+        )
+        packages = azurelinux.load_package_lock()
+        self.assertEqual(
+            {"busybox", "util-linux"} - {package["name"] for package in packages},
+            set(),
+        )
+        for package in packages:
+            self.assertTrue(
+                package["url"].startswith(
+                    f"{AzureLinuxBuildConstants.REPOSITORY_URL}/Packages/"
+                )
+            )
+        attributes = (BuildConstants.REPO_ROOT / ".gitattributes").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("azurelinux/packages.lock.json text eol=lf", attributes)
+
+    def test_azurelinux_package_lock_rejects_unpinned_records(self):
+        document = json.loads(
+            azurelinux.package_lock_path().read_text(encoding="utf-8")
+        )
+        first = document["packages"][0]
+        cases: tuple[tuple[str, dict[str, object], str], ...] = (
+            ("image", {"image": "mcr.microsoft.com/azurelinux/base/core:3.0"}, "image"),
+            (
+                "url",
+                {
+                    "packages": [
+                        {**first, "url": first["url"].replace("/prod/", "/preview/")},
+                        *document["packages"][1:],
+                    ]
+                },
+                "must be fetched from",
+            ),
+            (
+                "sha256",
+                {
+                    "packages": [
+                        {**first, "sha256": "0" * 63},
+                        *document["packages"][1:],
+                    ]
+                },
+                "invalid SHA-256",
+            ),
+            (
+                "order",
+                {"packages": list(reversed(document["packages"]))},
+                "sorted by name",
+            ),
+        )
+        for name, update, message in cases:
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                path = Path(temporary) / "packages.lock.json"
+                path.write_text(json.dumps({**document, **update}), encoding="utf-8")
+                with self.assertRaisesRegex(common.ScriptError, message):
+                    azurelinux.load_package_lock(path)
+
+    def test_azurelinux_download_packages_verifies_each_locked_rpm(self):
+        destination = Path("rpms")
+        with patch.object(azurelinux, "download_verified") as download_verified:
+            downloaded = azurelinux.download_packages(destination)
+
+        packages = azurelinux.load_package_lock()
+        self.assertEqual(
+            download_verified.call_args_list,
+            [
+                call(
+                    package["url"],
+                    destination / package["url"].rsplit("/", maxsplit=1)[-1],
+                    package["sha256"],
+                )
+                for package in packages
+            ],
+        )
+        self.assertEqual(len(downloaded), len(packages))
+
     def test_ubuntu_manifest_and_package_lock_match_build_pins(self):
         manifest = json.loads(
             (BuildConstants.REPO_ROOT / "SOURCE-MANIFEST.json").read_text(
@@ -5003,22 +5098,55 @@ class BuildTests(unittest.TestCase):
         self.assertIn("ARG EROFS_UTILS_VERSION=1.5-1", dockerfile)
         self.assertIn("erofs-utils=${EROFS_UTILS_VERSION}", dockerfile)
 
-    def test_azurelinux_initramfs_uses_static_busybox_shell(self):
+    def test_azurelinux_initramfs_uses_locked_busybox_applets(self):
         dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
             encoding="utf-8"
         )
-        self.assertIn(
-            "awk basename cat chmod chroot cp grep head hostname ifconfig ip mdev mkdir sh",
-            dockerfile,
+        base_stage = dockerfile.split("FROM base AS kernel", 1)[0]
+        self.assertNotIn("busybox", base_stage)
+        azure_stage = dockerfile.split("FROM base AS azurelinux-initramfs", 1)[1]
+        self.assertIn("ln -sf ../sbin/busybox /rootfs/usr/bin/busybox", azure_stage)
+        applets = (
+            azure_stage.split("for utility in ", 1)[1]
+            .split("; do", 1)[0]
+            .replace("\\\n", " ")
+            .split()
         )
-        self.assertIn("rm -f /rootfs/bin/sh;", dockerfile)
+        for applet in ("sh", "arp", "nc", "wget", "mdev", "ifconfig", "route"):
+            self.assertIn(applet, applets)
+        self.assertNotIn("setpriv", applets)
+        self.assertIn(
+            "busybox", [package["name"] for package in azurelinux.load_package_lock()]
+        )
+
+    def test_azurelinux_rootfs_installs_only_locked_rpms(self):
+        dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("tdnf install", dockerfile)
+        packages_stage = dockerfile.split("FROM base AS azurelinux-packages", 1)[1]
+        self.assertIn(
+            "from nvx_tools.azurelinux import download_packages",
+            packages_stage.split("\nFROM ", 1)[0],
+        )
+        rootfs_stage = dockerfile.split(
+            "FROM ${AZURELINUX_IMAGE} AS azurelinux-rootfs", 1
+        )[1].split("\nFROM ", 1)[0]
+        self.assertIn(
+            "COPY --from=azurelinux-packages /out/rpms/ /tmp/azurelinux-rpms/",
+            rootfs_stage,
+        )
+        checksig = rootfs_stage.index("rpm --checksig /tmp/azurelinux-rpms/*.rpm")
+        install = rootfs_stage.index("rpm --upgrade --verbose --hash")
+        self.assertLess(checksig, install)
 
     def test_azurelinux_manifest_uses_package_metadata(self):
         dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
             encoding="utf-8"
         )
         self.assertIn("rpm -qa --queryformat", dockerfile)
-        self.assertIn("busybox-package.tsv", dockerfile)
+        self.assertIn("if name == 'gpg-pubkey':", dockerfile)
+        self.assertNotIn("'type': 'deb'", dockerfile)
         self.assertIn("'packages': json.loads", dockerfile)
 
     def test_azurelinux_initramfs_packs_normalized_rootfs(self):
@@ -5068,7 +5196,11 @@ class BuildTests(unittest.TestCase):
                     baseline,
                 )
                 self.assertNotEqual(azurelinux.input_sha256(version="3.1"), baseline)
-                for relative in ("guest/common/init", "docker/Dockerfile"):
+                for relative in (
+                    "guest/common/init",
+                    "docker/Dockerfile",
+                    "azurelinux/packages.lock.json",
+                ):
                     with self.subTest(path=relative):
                         path = root / relative
                         original = path.read_bytes()

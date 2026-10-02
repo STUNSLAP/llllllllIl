@@ -24,6 +24,7 @@ from typing import cast
 
 from .archive import create_reproducible_release_archive, create_reproducible_tar_gz
 from .azurelinux import input_sha256 as azurelinux_input_sha256
+from .azurelinux import package_lock_sha256 as azurelinux_package_lock_sha256
 from .build import (
     assert_required_kernel_config,
     build_docker_linux_source,
@@ -1258,9 +1259,14 @@ def _validate_source_manifest_metadata(
         "version": AzureLinuxBuildConstants.VERSION,
         "architecture": AzureLinuxBuildConstants.ARCHITECTURE,
         "image": AzureLinuxBuildConstants.IMAGE,
+        "package_lock": AzureLinuxBuildConstants.PACKAGE_LOCK_RELATIVE_PATH.as_posix(),
+        "package_lock_sha256": azurelinux_package_lock_sha256(),
         "guest_sources": [
-            path.as_posix()
-            for path in AzureLinuxBuildConstants.GUEST_SOURCE_DIRECTORIES
+            *(
+                path.as_posix()
+                for path in AzureLinuxBuildConstants.GUEST_SOURCE_DIRECTORIES
+            ),
+            AzureLinuxBuildConstants.PACKAGE_LOCK_RELATIVE_PATH.as_posix(),
         ],
         "package_manifests": [
             (

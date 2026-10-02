@@ -233,6 +233,11 @@ class AzureLinuxBuildConstants:
         "mcr.microsoft.com/azurelinux/base/core@"
         "sha256:c877612270d1ee2d6ab2bc1f64bfe38ab697ac50be325154ee5129fce89c17e4"
     )
+    REPOSITORY_URL: Final = (
+        f"https://packages.microsoft.com/azurelinux/{VERSION}/prod/base/{ARCHITECTURE}"
+    )
+    PACKAGE_LOCK_RELATIVE_PATH: Final = Path(GUEST_NAME) / "packages.lock.json"
+    PACKAGE_LOCK_FORMAT: Final = 1
     INITRAMFS_NAME: Final = "initramfs-azurelinux.cpio.gz"
     PACKAGE_MANIFEST_NAME: Final = (
         f"{INITRAMFS_NAME}{BuildConstants.PACKAGE_MANIFEST_SUFFIX}"
@@ -327,6 +332,7 @@ class ReleaseBuildConstants:
         ".github/agents/nvx-adversary.md",
         "guest",
         "ubuntu",
+        "azurelinux",
         "data/linux-kvm-virtual-machine.csv",
         "data/linux-mshv-virtual-machine.csv",
         "data/windows-whp-virtual-machine.csv",
