@@ -109,8 +109,7 @@ if [ -n "$nvx_exec" ]; then
     exec "$nvx_exec"
 fi
 mount_virtfs() {
-    /bin/busybox sh /usr/sbin/nvx-hostmount ||
-        fatal "virtfs: failed to mount live host directory"
+    /sbin/nvx-hostmount || fatal "virtfs: failed to mount live host directory"
 }
 if [ "$sandbox_mode" = false ]; then
     mount_virtfs

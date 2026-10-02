@@ -4963,19 +4963,42 @@ class BuildTests(unittest.TestCase):
         self.assertIn("busybox-package.tsv", dockerfile)
         self.assertIn("'packages': json.loads", dockerfile)
 
-    def test_azurelinux_initramfs_installs_virtfs_mount_helper(self):
+    def test_guest_init_runs_virtfs_helper_from_installed_path(self):
+        installed: list[Path] = []
+
+        def install(_source: Path, destination: Path) -> dict[str, str]:
+            installed.append(destination)
+            return {}
+
+        root = Path("rootfs")
+        with (
+            patch.object(build, "_install", side_effect=install),
+            patch.object(build, "_build_static_helper", return_value={}),
+            patch.object(build, "_build_device_io_helper", return_value={}),
+        ):
+            build._install_guest_files(
+                build_config.InitramfsBuildConfig(work=Path("work")),
+                root,
+                guests.ALPINE_GUEST,
+            )
+        self.assertIn(root / "sbin" / "nvx-hostmount", installed)
+
         dockerfile = (BuildConstants.REPO_ROOT / "docker" / "Dockerfile").read_text(
             encoding="utf-8"
         )
         azure_stage = dockerfile.split("FROM base AS azurelinux-initramfs", 1)[1]
-        self.assertIn(
-            "install -m 0755 /repo/guest/common/nvx-hostmount /rootfs/usr/sbin/",
-            azure_stage,
-        )
+        azure_sbin_scripts = azure_stage.split(
+            "install -m 0755 /repo/guest/common/nvx-exit", 1
+        )[1].split("/rootfs/sbin/", 1)[0]
+        self.assertIn("/repo/guest/common/nvx-hostmount", azure_sbin_scripts)
         init_script = (
             BuildConstants.REPO_ROOT / "guest" / "common" / "init"
         ).read_text(encoding="utf-8")
-        self.assertIn("/bin/busybox sh /usr/sbin/nvx-hostmount", init_script)
+        self.assertIn(
+            '/sbin/nvx-hostmount || fatal "virtfs: failed to mount live host directory"',
+            init_script,
+        )
+        self.assertNotIn("/usr/sbin/nvx-hostmount", init_script)
 
     def test_openvmm_ci_downloads_guest_artifacts(self):
         workflow = (

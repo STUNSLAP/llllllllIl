@@ -89,11 +89,11 @@ RUN <<'EOF'
 set -eux
 install -m 0755 /repo/guest/common/init /rootfs/init
 install -m 0755 /repo/guest/common/nvx-exit \
+    /repo/guest/common/nvx-hostmount \
     /repo/guest/common/nvx-identity-probe \
     /repo/guest/common/nvx-snapshot \
     /repo/guest/common/nvx-virtio-restore-probe \
     /repo/guest/common/nvx-container-enter-azurelinux /rootfs/sbin/
-install -m 0755 /repo/guest/common/nvx-hostmount /rootfs/usr/sbin/
 install -m 0755 /repo/guest/common/nvx-container-launch-azurelinux \
     /rootfs/sbin/nvx-container-launch
 rm -f /rootfs/bin/sh;
