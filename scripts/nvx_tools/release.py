@@ -32,6 +32,7 @@ from .build import (
 from .build_config import DockerBuildConfig
 from .build_constants import (
     AlpineBuildConstants,
+    AzureLinuxBuildConstants,
     BuildConstants,
     InitramfsBuildConstants,
     KernelBuildConstants,
@@ -538,6 +539,42 @@ def _replace_runtime_file(source: Path, destination: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _packaged_guest_artifact_names(package_root: Path) -> list[str]:
+    source_manifest = package_root / "SOURCE-MANIFEST.json"
+    if not source_manifest.exists():
+        return list(ReleaseBuildConstants.GUEST_ARTIFACT_NAMES)
+    manifest = _read_json_object(source_manifest, "packaged source manifest")
+    names: list[str] = []
+    if isinstance(manifest.get("linux"), dict):
+        names.extend(
+            (
+                KernelBuildConstants.BINARY_NAME,
+                KernelBuildConstants.CONFIG_NAME,
+            )
+        )
+    if isinstance(manifest.get("alpine"), dict):
+        names.extend(
+            (
+                AlpineBuildConstants.INITRAMFS_NAME,
+                AlpineBuildConstants.PACKAGE_MANIFEST_NAME,
+            )
+        )
+    if isinstance(manifest.get("ubuntu"), dict):
+        names.extend(
+            (
+                UbuntuBuildConstants.INITRAMFS_NAME,
+                UbuntuBuildConstants.PACKAGE_MANIFEST_NAME,
+                UbuntuBuildConstants.DISTRO_NAME,
+                UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
+            )
+        )
+    if isinstance(manifest.get("azurelinux"), dict):
+        names.extend(ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES)
+    if not names:
+        raise ScriptError("packaged source manifest does not declare guest artifacts")
+    return names
+
+
 def _install_release_archive(archive_path: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="nvx-release-") as temporary:
         extraction_root = Path(temporary)
@@ -560,7 +597,7 @@ def _install_release_archive(archive_path: Path) -> None:
                 package_root / "guest" / name,
                 f"packaged guest artifact {name}",
             )
-            for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES
+            for name in _packaged_guest_artifact_names(package_root)
         }
         provenance_sources = {
             name: require_file(
@@ -795,7 +832,7 @@ def _validate_linux_source_archive(path: Path) -> None:
                 raise ScriptError(f"{path} has stale contents for {suffix}")
 
 
-def _guest_release_inputs() -> tuple[list[str], list[Path], list[Path]]:
+def _guest_release_inputs() -> tuple[list[str], list[Path], list[Path], list[Path]]:
     for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
         require_file(artifact_path(name), f"required guest artifact {name}")
     guest_names: list[str] = list(ReleaseBuildConstants.GUEST_ARTIFACT_NAMES)
@@ -804,6 +841,26 @@ def _guest_release_inputs() -> tuple[list[str], list[Path], list[Path]]:
         artifact_path(UbuntuBuildConstants.PACKAGE_MANIFEST_NAME),
         artifact_path(UbuntuBuildConstants.DISTRO_MANIFEST_NAME),
     ]
+    azurelinux_manifests = [
+        artifact_path(AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME)
+    ]
+    azurelinux_manifest = _read_json_object(
+        azurelinux_manifests[0],
+        "Azure Linux initramfs manifest",
+    )
+    azurelinux_initramfs = artifact_path(AzureLinuxBuildConstants.INITRAMFS_NAME)
+    if (
+        azurelinux_manifest.get("format")
+        != AzureLinuxBuildConstants.PACKAGE_MANIFEST_VERSION
+        or azurelinux_manifest.get("guest") != AzureLinuxBuildConstants.GUEST_NAME
+        or azurelinux_manifest.get("artifact") != azurelinux_initramfs.name
+        or azurelinux_manifest.get("artifact_sha256")
+        != sha256_file(azurelinux_initramfs)
+        or azurelinux_manifest.get("package_manifest_format")
+        != AzureLinuxBuildConstants.PACKAGE_MANIFEST_FORMAT
+        or azurelinux_manifest.get("image") != AzureLinuxBuildConstants.IMAGE
+    ):
+        raise ScriptError("Azure Linux initramfs manifest is invalid")
     expected_input_sha256 = converter_input_sha256(customization_files())
     for artifact_name, manifest in zip(
         (UbuntuBuildConstants.INITRAMFS_NAME, UbuntuBuildConstants.DISTRO_NAME),
@@ -822,7 +879,7 @@ def _guest_release_inputs() -> tuple[list[str], list[Path], list[Path]]:
             raise ScriptError(
                 f"Ubuntu artifact manifest does not match {artifact_name}"
             )
-    return guest_names, alpine_manifests, ubuntu_manifests
+    return guest_names, alpine_manifests, ubuntu_manifests, azurelinux_manifests
 
 
 def _read_json_object(path: Path, description: str) -> dict[str, object]:
@@ -954,15 +1011,18 @@ def _packaged_source_manifest(
     release_root: Path,
     openvmm_provenance: dict[str, object],
     binary_name: str,
+    *,
+    include_azurelinux: bool,
 ) -> bytes:
     distribution = root_manifest.get("distribution")
     openvmm = root_manifest.get("openvmm")
     linux = root_manifest.get("linux")
     alpine = root_manifest.get("alpine")
     ubuntu = root_manifest.get("ubuntu")
+    azurelinux = root_manifest.get("azurelinux")
     if not all(
         isinstance(section, dict)
-        for section in (distribution, openvmm, linux, alpine, ubuntu)
+        for section in (distribution, openvmm, linux, alpine, ubuntu, azurelinux)
     ):
         raise ScriptError("SOURCE-MANIFEST.json is missing a required object")
     distribution_section = cast(dict[str, object], distribution)
@@ -999,6 +1059,16 @@ def _packaged_source_manifest(
     ubuntu_section["distro_layer_manifest_sha256"] = sha256_file(
         release_root / "guest" / UbuntuBuildConstants.DISTRO_MANIFEST_NAME
     )
+    if include_azurelinux:
+        azurelinux_section = cast(dict[str, object], azurelinux)
+        azurelinux_section["initramfs_sha256"] = sha256_file(
+            release_root / "guest" / AzureLinuxBuildConstants.INITRAMFS_NAME
+        )
+        azurelinux_section["initramfs_package_manifest_sha256"] = sha256_file(
+            release_root / "guest" / AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME
+        )
+    else:
+        del root_manifest["azurelinux"]
     return (json.dumps(root_manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
@@ -1046,6 +1116,7 @@ def _validate_source_manifest_metadata(
     linux_value = manifest.get("linux")
     alpine_value = manifest.get("alpine")
     ubuntu_value = manifest.get("ubuntu")
+    azurelinux_value = manifest.get("azurelinux")
     source_value = kernel_inputs.get("source")
     config_value = kernel_inputs.get("input_config")
     if not all(
@@ -1054,6 +1125,7 @@ def _validate_source_manifest_metadata(
             linux_value,
             alpine_value,
             ubuntu_value,
+            azurelinux_value,
             source_value,
             config_value,
         )
@@ -1062,6 +1134,7 @@ def _validate_source_manifest_metadata(
     linux = cast(dict[str, object], linux_value)
     alpine = cast(dict[str, object], alpine_value)
     ubuntu = cast(dict[str, object], ubuntu_value)
+    azurelinux = cast(dict[str, object], azurelinux_value)
     source = cast(dict[str, object], source_value)
     input_config = cast(dict[str, object], config_value)
     source_patches = source.get("patches")
@@ -1163,6 +1236,27 @@ def _validate_source_manifest_metadata(
             raise ScriptError(
                 f"SOURCE-MANIFEST.json Ubuntu {field} does not match the build pin"
             )
+    expected_azurelinux: dict[str, object] = {
+        "distribution": AzureLinuxBuildConstants.DISTRIBUTION,
+        "version": AzureLinuxBuildConstants.VERSION,
+        "architecture": AzureLinuxBuildConstants.ARCHITECTURE,
+        "image": AzureLinuxBuildConstants.IMAGE,
+        "guest_sources": [
+            path.as_posix()
+            for path in AzureLinuxBuildConstants.GUEST_SOURCE_DIRECTORIES
+        ],
+        "package_manifests": [
+            (
+                Path(BuildConstants.BUILD_DIRECTORY_NAME)
+                / AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME
+            ).as_posix()
+        ],
+    }
+    for field, expected in expected_azurelinux.items():
+        if azurelinux.get(field) != expected:
+            raise ScriptError(
+                f"SOURCE-MANIFEST.json Azure Linux {field} does not match the build pin"
+            )
     return patch_paths
 
 
@@ -1217,7 +1311,9 @@ def _publish_release_directory(
 
 
 def collect_release_sources(config: DockerBuildConfig) -> None:
-    _guest_names, alpine_manifests, ubuntu_manifests = _guest_release_inputs()
+    _guest_names, alpine_manifests, ubuntu_manifests, _azurelinux_manifests = (
+        _guest_release_inputs()
+    )
     collect_alpine_sources(
         alpine_manifests,
         BuildConstants.SOURCE_DIR / AlpineBuildConstants.GUEST_NAME,
@@ -1233,6 +1329,11 @@ def collect_release_sources(config: DockerBuildConfig) -> None:
         / UbuntuBuildConstants.SOURCE_CACHE_DIRECTORY_NAME,
     )
     build_docker_linux_source(config)
+    print(
+        "!! Azure Linux corresponding source is not collected: source-inclusive "
+        "packages omit the Azure Linux guest",
+        file=sys.stderr,
+    )
     print(f">> collected release sources under {BuildConstants.SOURCE_DIR}")
 
 
@@ -1243,24 +1344,41 @@ def package_release(
     include_source: bool,
     force: bool,
 ) -> None:
-    guest_names, alpine_manifests, ubuntu_manifests = _guest_release_inputs()
-    package_manifests = [*alpine_manifests, *ubuntu_manifests]
+    guest_names, alpine_manifests, ubuntu_manifests, azurelinux_manifests = (
+        _guest_release_inputs()
+    )
     linux_source_archive = (
         BuildConstants.SOURCE_DIR
         / KernelBuildConstants.SOURCE_DIRECTORY_NAME
         / KernelBuildConstants.SOURCE_ARCHIVE_NAME
     )
     if include_source:
+        guest_names = [
+            name
+            for name in guest_names
+            if name not in ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES
+        ]
+        azurelinux_manifests = []
         _validate_alpine_sources(alpine_manifests)
         _validate_ubuntu_sources(ubuntu_manifests)
         require_file(linux_source_archive, "Linux corresponding-source archive")
         _validate_linux_source_archive(linux_source_archive)
-    else:
         print(
-            "!! binary-only package: publish matching Linux, Alpine, and Ubuntu "
-            "corresponding source separately",
+            "!! source-inclusive package omits the Azure Linux guest: "
+            "collect-sources does not collect its corresponding source",
             file=sys.stderr,
         )
+    else:
+        print(
+            "!! binary-only package: publish matching Linux, Alpine, Ubuntu, and "
+            "Azure Linux corresponding source separately",
+            file=sys.stderr,
+        )
+    package_manifests = [
+        *alpine_manifests,
+        *ubuntu_manifests,
+        *azurelinux_manifests,
+    ]
 
     release_version = (
         version
@@ -1442,6 +1560,7 @@ def package_release(
                 staging,
                 openvmm_provenance,
                 binary.name,
+                include_azurelinux=not include_source,
             )
         )
         write_sha256_sums(staging)
