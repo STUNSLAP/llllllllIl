@@ -613,6 +613,9 @@ def _install_release_archive(archive_path: Path) -> None:
         _replace_runtime_file(binary_source, binary_destination)
         for name, source in guest_sources.items():
             _replace_runtime_file(source, artifact_path(name))
+        for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
+            if name not in guest_sources:
+                artifact_path(name).unlink(missing_ok=True)
         for name, source in provenance_sources.items():
             _replace_runtime_file(source, artifact_path(name))
 

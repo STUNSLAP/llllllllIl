@@ -300,6 +300,10 @@ python3 scripts/nvx.py download
 | `--repository OWNER/REPOSITORY` | `microsoft/nvx` | GitHub repository from which to download the latest release. |
 | `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the release platform. `auto` chooses WHP on Windows and KVM on Linux. |
 
+Installing a release replaces the packaged guest artifacts under `build/` and
+removes any known guest artifact that the release does not declare, such as the
+Azure Linux guest that source-inclusive packages omit.
+
 Windows release downloads support WHP. Linux release downloads support KVM
 and MSHV. `download` first uses `GH_TOKEN` or `GITHUB_TOKEN` when configured.
 If GitHub rejects that token with HTTP 401 or 403, NVX reports the failure and

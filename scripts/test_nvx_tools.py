@@ -10180,7 +10180,7 @@ class ReleaseTests(unittest.TestCase):
                     name.encode("ascii"),
                 )
 
-    def test_source_release_archive_installs_without_azure_artifacts(self):
+    def test_source_release_archive_removes_stale_azure_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             package_root = root / "package" / "nvx-1.2.3-test"
@@ -10221,6 +10221,9 @@ class ReleaseTests(unittest.TestCase):
             binary_destination = (
                 root / "runtime" / "openvmm" / "target" / "release" / binary_name
             )
+            build_dir.mkdir(parents=True)
+            for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
+                (build_dir / name).write_bytes(b"stale " + name.encode("ascii"))
 
             def artifact_path(name: str) -> Path:
                 return build_dir / name
