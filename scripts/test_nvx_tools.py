@@ -9362,6 +9362,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertNotIn("azurelinux", manifest)
             common.verify_sha256_sums(destination)
             self.assertIn("omits the Azure Linux guest", stderr.getvalue())
+
     def test_runtime_provenance_validation_uses_required_paths(self):
         build_dir = Path("build")
         binary = Path("openvmm")
