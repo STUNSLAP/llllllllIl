@@ -599,6 +599,29 @@ class CliTests(unittest.TestCase):
             "initramfs-ubuntu.cpio.gz",
         )
 
+    def test_azurelinux_run_selects_artifact_and_default_memory(self):
+        args = nvx.parse_args(["run", "--guest", "azurelinux", "--dry-run"])
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with (
+            patch.object(nvx, "require_file", side_effect=require),
+            patch.object(
+                nvx,
+                "_format_command",
+                return_value="formatted",
+            ) as format_command,
+        ):
+            nvx.command_run(args)
+
+        command = format_command.call_args.args[0]
+        self.assertEqual(command[command.index("--memory") + 1], "256M")
+        self.assertEqual(
+            Path(command[command.index("--initrd") + 1]).name,
+            "initramfs-azurelinux.cpio.gz",
+        )
+
     def test_restore_rejects_ubuntu_guest_selection(self):
         args = nvx.parse_args(
             [
@@ -4258,7 +4281,7 @@ class BuildTests(unittest.TestCase):
             azurelinux_guest.initramfs_name,
             "initramfs-azurelinux.cpio.gz",
         )
-        self.assertEqual(azurelinux_guest.default_memory_mib, 128)
+        self.assertEqual(azurelinux_guest.default_memory_mib, 256)
         self.assertFalse(azurelinux_guest.sandbox_control)
 
     def test_ubuntu_manifest_and_package_lock_match_build_pins(self):
