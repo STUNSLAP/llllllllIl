@@ -22,8 +22,10 @@ request is provided, find the pull request associated with the current branch.
   guess. Explain the status and any blocker in the final summary.
 - The `dev` ruleset requires every review thread to be resolved before merge, so resolve a thread
   only when the pull-request head already reflects its outcome:
-  - Do not reply to or resolve a thread whose fix exists only in the local working tree. Draft its
-    reply for the user to post after pushing, as `Fixed in <commit URL>. <what changed>`.
+  - Do not reply to or resolve a thread whose fix exists only in the local working tree. Draft a
+    template reply for the user to post after committing and pushing, for example
+    `Fixed in <commit URL after push>. <what changed>`, and make clear that the placeholder must be
+    replaced once the real commit URL exists.
   - When a commit on the pull-request head already addresses the comment, reply
     `Fixed in <commit URL>. <what changed>` citing that commit, then resolve the thread.
   - When no change is needed, reply `No change needed here. <evidence>`, then resolve the thread.
