@@ -5217,6 +5217,7 @@ class BuildTests(unittest.TestCase):
                     "guest/common/init",
                     "docker/Dockerfile",
                     "azurelinux/packages.lock.json",
+                    "scripts/nvx_tools/azurelinux.py",
                 ):
                     with self.subTest(path=relative):
                         path = root / relative

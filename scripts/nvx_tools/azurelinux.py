@@ -120,7 +120,13 @@ def download_packages(destination: Path) -> tuple[Path, ...]:
 def input_files() -> tuple[Path, ...]:
     """Return the checkout files that define the Azure Linux initramfs."""
     root = BuildConstants.REPO_ROOT
-    files = [root / DockerBuildConstants.DOCKERFILE, package_lock_path()]
+    files = [
+        root / DockerBuildConstants.DOCKERFILE,
+        package_lock_path(),
+        # The Docker build runs this module to download the RPMs and record
+        # this digest, so changes to it must also rebuild the artifact.
+        root / "scripts" / "nvx_tools" / "azurelinux.py",
+    ]
     for directory in AzureLinuxBuildConstants.GUEST_SOURCE_DIRECTORIES:
         files.extend(path for path in (root / directory).rglob("*") if path.is_file())
     return tuple(sorted(files, key=lambda path: path.relative_to(root).as_posix()))
