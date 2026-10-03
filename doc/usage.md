@@ -96,6 +96,16 @@ are reported as errors and cause a nonzero exit.
 
 See [Setup](setup.md) for host prerequisites.
 
+### `materialize-kernel-provenance-inputs`
+
+```console
+python3 scripts/nvx.py materialize-kernel-provenance-inputs
+```
+
+Recreates the tracked kernel configuration and patch files from the current
+Git run head. It removes stale worktree patches that are absent from that
+revision and is used before packaging kernel provenance inputs.
+
 ## Build commands
 
 ### `build-guest`
