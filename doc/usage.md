@@ -652,19 +652,6 @@ Materializes the verified Linux, Alpine, and Ubuntu source artifacts needed
 for a source-inclusive release. Azure Linux corresponding source is not
 collected, so source-inclusive packages omit the Azure Linux guest.
 
-### `create-linux-source-archive`
-
-```text
-python3 scripts/nvx.py create-linux-source-archive
-    --config PATH
-    --output PATH
-```
-
-Creates the deterministic Linux corresponding-source archive from the pinned
-kernel inputs and the generated kernel configuration. `--config` must name an
-existing generated kernel configuration, and `--output` names the archive to
-create.
-
 ### `collect-alpine-sources`
 
 ```text
@@ -708,8 +695,10 @@ python3 scripts/nvx.py create-linux-source-archive
     --output PATH
 ```
 
-Creates the Linux corresponding-source archive using the required kernel
-configuration and output paths.
+Creates the deterministic Linux corresponding-source archive from the pinned
+kernel inputs and the generated kernel configuration. `--config` must name an
+existing generated kernel configuration, and `--output` names the archive to
+create.
 
 ### `package`
 
