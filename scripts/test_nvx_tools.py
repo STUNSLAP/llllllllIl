@@ -508,6 +508,21 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(args.shell_memories, [128, 256, 512])
 
+    def test_benchmark_positive_integer_diagnostics_are_stable(self):
+        for value, message in (
+            ("not-an-int", "argument --runs: invalid positive_int value: 'not-an-int'"),
+            ("0", "argument --runs: must be at least 1"),
+        ):
+            with self.subTest(value=value):
+                with (
+                    patch("sys.stderr", new_callable=io.StringIO) as errors,
+                    self.assertRaises(SystemExit) as exit_context,
+                ):
+                    nvx.parse_args(["benchmark", "--runs", value])
+
+                self.assertEqual(exit_context.exception.code, 2)
+                self.assertIn(message, errors.getvalue())
+
     def test_release_commands_keep_their_cli_contract(self):
         download = nvx.parse_args(
             ["download", "--repository", "example/nvx", "--hypervisor", "auto"]
@@ -11857,6 +11872,10 @@ class PositiveIntTests(unittest.TestCase):
     def test_rejects_non_integer_input(self):
         with self.assertRaises(ValueError):
             common.positive_int("not-an-int")
+
+    def test_accepts_custom_error_message(self):
+        with self.assertRaisesRegex(argparse.ArgumentTypeError, "^must be at least 1$"):
+            common.positive_int("0", message="must be at least 1")
 
 
 class PositiveFloatTests(unittest.TestCase):
