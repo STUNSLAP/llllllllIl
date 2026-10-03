@@ -99,6 +99,18 @@ int main(int argc, char **argv) {
 #include "nvx-managed-agent.c"
 #undef main
 
+static int barrier_reader = -1;
+
+ssize_t __real_write(int, const void *, size_t);
+ssize_t __wrap_write(int fd, const void *buffer, size_t length) {
+    if (barrier_reader >= 0 && length == 6 &&
+        memcmp(buffer, "start\\n", length) == 0) {
+        close(barrier_reader);
+        barrier_reader = -1;
+    }
+    return __real_write(fd, buffer, length);
+}
+
 int __real_setenv(const char *, const char *, int);
 int __wrap_setenv(const char *name, const char *value, int overwrite) {
     const char *failure = getenv("NVX_TEST_FAIL_SETENV");
@@ -126,6 +138,15 @@ int __wrap_execvp(const char *file, char *const argv[]) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 3 && strcmp(argv[1], "--release-closing-barrier") == 0) {
+        barrier_reader = open(argv[2], O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (barrier_reader < 0) return 2;
+        errno = 0;
+        int result = release_container_barrier(argv[2], -1);
+        int status = errno;
+        if (barrier_reader >= 0) close(barrier_reader);
+        return result == -1 && status == EPIPE ? 0 : 1;
+    }
     if (argc == 3 && strcmp(argv[1], "--release-orphaned-barrier") == 0) {
         pid_t child = fork();
         if (child < 0) return 2;
@@ -180,6 +201,7 @@ int main(int argc, char **argv) {
                 "-I",
                 str(guest),
                 str(fault_harness),
+                "-Wl,--wrap=write",
                 "-Wl,--wrap=setenv",
                 "-Wl,--wrap=execv",
                 "-Wl,--wrap=execvp",
@@ -344,6 +366,17 @@ int main(int argc, char **argv) {
         subprocess.run(["mkfifo", str(barrier)], check=True, timeout=5)
         result = subprocess.run(
             [str(self.fault_executable), "--release-orphaned-barrier", str(barrier)],
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual((result.returncode, result.stderr), (0, b""))
+
+    def test_parent_barrier_release_handles_reader_close_during_write(self):
+        barrier = self.root / "closing-barrier"
+        barrier.unlink(missing_ok=True)
+        subprocess.run(["mkfifo", str(barrier)], check=True, timeout=5)
+        result = subprocess.run(
+            [str(self.fault_executable), "--release-closing-barrier", str(barrier)],
             capture_output=True,
             timeout=5,
         )

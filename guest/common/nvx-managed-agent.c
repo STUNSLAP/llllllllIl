@@ -730,6 +730,29 @@ static int write_pid_to_cgroup(pid_t pid)
     return close(fd);
 }
 
+static int write_container_barrier(int fd)
+{
+    struct sigaction ignored = {0};
+    struct sigaction previous;
+    int result;
+    int status;
+
+    ignored.sa_handler = SIG_IGN;
+    if (sigemptyset(&ignored.sa_mask) != 0 ||
+        sigaction(SIGPIPE, &ignored, &previous) != 0) {
+        return -1;
+    }
+    result = write_all(fd, "start\n", 6);
+    status = errno;
+    if (sigaction(SIGPIPE, &previous, NULL) != 0) {
+        return -1;
+    }
+    if (result != 0) {
+        errno = status;
+    }
+    return result;
+}
+
 /* Returns 0 after writing, 1 for an unreaped child exit, or -1 on failure. */
 static int release_container_barrier(const char *path, pid_t child)
 {
@@ -739,7 +762,7 @@ static int release_container_barrier(const char *path, pid_t child)
         int fd = open(path, O_WRONLY | O_CLOEXEC | O_NONBLOCK);
 
         if (fd >= 0) {
-            int result = write_all(fd, "start\n", 6);
+            int result = write_container_barrier(fd);
 
             close(fd);
             return result;
