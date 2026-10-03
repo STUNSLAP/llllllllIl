@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Protocol, cast
 
 from nvx_tools.adversarial_broker import append_json_line
-from nvx_tools.common import ScriptError
+from nvx_tools.common import ScriptError, sha256_file
 
 MAX_CAPTURE_BYTES = 16 * 1024 * 1024
 MAX_OBSERVATION_BYTES = 8192
@@ -51,14 +51,6 @@ def _enable_linux_child_subreaper() -> None:
     if prctl(_LINUX_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
         error = ctypes.get_errno()
         raise OSError(error, "prctl(PR_SET_CHILD_SUBREAPER) failed")
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _resource_sample(path: Path) -> dict[str, object]:
