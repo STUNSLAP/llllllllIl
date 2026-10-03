@@ -1059,6 +1059,7 @@ static int decode_exec_payload(
     char **arguments;
     uint16_t index;
 
+    memset(config, 0, sizeof(*config));
     if (payload_len < 8) {
         return -1;
     }

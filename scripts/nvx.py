@@ -66,6 +66,7 @@ from nvx_tools.common import (
     require_file,
     sha256_file,
 )
+from nvx_tools.control_session import encode_exec_environment
 from nvx_tools.create_linux_source_archive import (
     configure_parser as configure_linux_source_archive_parser,
 )
@@ -447,6 +448,11 @@ def command_sandbox(args: argparse.Namespace) -> None:
             exec_environment = tuple(cast(list[str], entries))
         elif args.environment:
             exec_environment = tuple(args.environment)
+        if exec_environment is not None:
+            try:
+                encode_exec_environment(exec_environment)
+            except (TypeError, ValueError) as error:
+                raise ScriptError(str(error)) from error
     network_options = (
         args.net,
         args.network_profile,

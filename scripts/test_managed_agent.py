@@ -32,7 +32,8 @@ int main(int argc, char **argv) {
     unsigned char bytes[65536];
     uint32_t timeout_ms = 0;
     char **arguments = NULL;
-    struct exec_config config = {0};
+    struct exec_config config;
+    memset(&config, 0xa5, sizeof(config));
     if (argc > 1 && strcmp(argv[1], "--exec-config-fd") == 0)
         return launch_workload(argc, argv);
     int launch = argc == 3 && strcmp(argv[1], "--launch") == 0;
@@ -75,6 +76,7 @@ int main(int argc, char **argv) {
         subprocess.run(
             [
                 compiler,
+                "-D_GNU_SOURCE",
                 "-std=c11",
                 "-I",
                 str(guest),
@@ -168,6 +170,7 @@ int main(int argc, char **argv) {
         subprocess.run(
             [
                 compiler,
+                "-D_GNU_SOURCE",
                 "-std=c11",
                 "-I",
                 str(guest),

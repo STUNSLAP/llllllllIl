@@ -47,6 +47,35 @@ MANAGED_EXIT_CATEGORIES = frozenset(
 )
 
 
+def encode_exec_environment(environment: tuple[str, ...]) -> tuple[bytes, ...]:
+    if len(environment) > APP_MAX_ENVIRONMENT:
+        raise ValueError("managed exec environment exceeds 256 entries")
+    names: set[str] = set()
+    encoded: list[bytes] = []
+    for entry in environment:
+        if type(entry) is not str:
+            raise TypeError("managed exec environment entries must be strings")
+        name, separator, _value = entry.partition("=")
+        value = entry.encode("utf-8")
+        if (
+            not separator
+            or not name
+            or "\0" in entry
+            or len(value) > APP_MAX_ENVIRONMENT_BYTES
+        ):
+            raise ValueError(
+                "managed exec environment entries must be non-empty "
+                "KEY=VALUE strings of at most 4096 bytes"
+            )
+        if name in names:
+            raise ValueError(
+                f"managed exec environment contains duplicate key: {name}"
+            )
+        names.add(name)
+        encoded.append(value)
+    return tuple(encoded)
+
+
 @dataclass(frozen=True)
 class ManagedExecResult:
     returncode: int
@@ -398,29 +427,7 @@ class ControlSession:
 
         encoded_environment: list[bytes] = []
         if environment is not None:
-            if len(environment) > APP_MAX_ENVIRONMENT:
-                raise ValueError("managed exec environment exceeds 256 entries")
-            names: set[str] = set()
-            for entry in environment:
-                if type(entry) is not str:
-                    raise TypeError("managed exec environment entries must be strings")
-                name, separator, _value = entry.partition("=")
-                value = entry.encode("utf-8")
-                if (
-                    not separator
-                    or not name
-                    or "\0" in entry
-                    or len(value) > APP_MAX_ENVIRONMENT_BYTES
-                ):
-                    raise ValueError(
-                        "managed exec environment entries must be non-empty "
-                        "KEY=VALUE strings of at most 4096 bytes"
-                    )
-                if name in names:
-                    raise ValueError(
-                        f"managed exec environment contains duplicate key: {name}"
-                    )
-                names.add(name)
+            for value in encode_exec_environment(environment):
                 encoded_environment.append(struct.pack("<I", len(value)) + value)
             flags |= APP_EXEC_ENVIRONMENT_PRESENT
 

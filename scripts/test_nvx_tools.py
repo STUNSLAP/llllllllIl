@@ -901,6 +901,68 @@ class CliTests(unittest.TestCase):
                 nvx.command_sandbox(args)
             execute.assert_not_called()
 
+    def test_sandbox_environment_is_validated_before_state_access(self):
+        too_many = [
+            value
+            for index in range(257)
+            for value in ("--environment", f"KEY{index}=value")
+        ]
+        cases = (
+            (too_many, "exceeds 256 entries"),
+            (["--environment", "NO_EQUALS"], "non-empty KEY=VALUE"),
+            (["--environment", "=empty-key"], "non-empty KEY=VALUE"),
+            (["--environment", "KEY=embedded\0nul"], "non-empty KEY=VALUE"),
+            (
+                ["--environment", "KEY=" + "\N{SNOWMAN}" * 1365],
+                "at most 4096 bytes",
+            ),
+            (
+                ["--environment", "DUPLICATE=one", "--environment", "DUPLICATE=two"],
+                "duplicate key",
+            ),
+        )
+        for environment_args, message in cases:
+            with self.subTest(message=message):
+                args = nvx.parse_args(
+                    [
+                        "sandbox",
+                        "exec",
+                        "--state-dir",
+                        "absent-state",
+                        *environment_args,
+                    ]
+                )
+                with (
+                    patch.object(sandbox_lifecycle, "exec_workload") as execute,
+                    self.assertRaisesRegex(common.ScriptError, message),
+                ):
+                    nvx.command_sandbox(args)
+                execute.assert_not_called()
+
+    def test_sandbox_environment_file_entries_are_validated_before_state_access(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "environment.json"
+            path.write_text(
+                json.dumps(["DUPLICATE=one", "DUPLICATE=two"]),
+                encoding="utf-8",
+            )
+            args = nvx.parse_args(
+                [
+                    "sandbox",
+                    "exec",
+                    "--state-dir",
+                    "absent-state",
+                    "--environment-file",
+                    str(path),
+                ]
+            )
+            with (
+                patch.object(sandbox_lifecycle, "exec_workload") as execute,
+                self.assertRaisesRegex(common.ScriptError, "duplicate key"),
+            ):
+                nvx.command_sandbox(args)
+            execute.assert_not_called()
+
     def test_network_requires_explicit_portable_profile(self):
         args = nvx.parse_args(
             [
