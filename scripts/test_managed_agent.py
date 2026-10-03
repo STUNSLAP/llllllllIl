@@ -89,6 +89,10 @@ int main(int argc, char **argv) {
             timeout=30,
         )
         fault_harness = cls.root / "fault-injection.c"
+        fault_cgroup_root = cls.root / "cgroup"
+        fault_exec_cgroup = fault_cgroup_root / "nvx-exec"
+        fault_exec_cgroup.mkdir(parents=True)
+        (fault_exec_cgroup / "cgroup.procs").write_text("", encoding="utf-8")
         fault_harness.write_text(
             """
 #define main nvx_agent_main
@@ -170,6 +174,7 @@ int main(int argc, char **argv) {
         subprocess.run(
             [
                 compiler,
+                f'-DCGROUP_ROOT="{fault_cgroup_root}"',
                 "-D_GNU_SOURCE",
                 "-std=c11",
                 "-I",

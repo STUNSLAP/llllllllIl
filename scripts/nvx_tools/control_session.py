@@ -68,9 +68,7 @@ def encode_exec_environment(environment: tuple[str, ...]) -> tuple[bytes, ...]:
                 "KEY=VALUE strings of at most 4096 bytes"
             )
         if name in names:
-            raise ValueError(
-                f"managed exec environment contains duplicate key: {name}"
-            )
+            raise ValueError(f"managed exec environment contains duplicate key: {name}")
         names.add(name)
         encoded.append(value)
     return tuple(encoded)

@@ -168,9 +168,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         def require(path: Path, _description: str) -> Path:
             return path
 
-        def copyfile(
-            source: Path | str, destination: Path | str
-        ) -> Path | str:
+        def copyfile(source: Path | str, destination: Path | str) -> Path | str:
             if (
                 evidence_failure
                 and Path(destination) == output_dir / "public-exec-openvmm.log"
@@ -295,9 +293,9 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                 elif outcome_mutation == "float-schema":
                     payload["schema_version"] = 1.0
                 elif outcome_mutation == "float-status":
-                    cast(dict[str, object], payload["outcome"])[
-                        "status_code"
-                    ] = float(returncode)
+                    cast(dict[str, object], payload["outcome"])["status_code"] = float(
+                        returncode
+                    )
                 report.write_text(
                     json.dumps(payload),
                     encoding="utf-8",
@@ -440,13 +438,14 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
             "float-schema",
             "float-status",
         ):
-            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 with self.assertRaisesRegex(
                     RuntimeError, "outcome has unexpected typed fields"
                 ):
-                    self._run_acceptance(
-                        Path(temporary), outcome_mutation=mutation
-                    )
+                    self._run_acceptance(Path(temporary), outcome_mutation=mutation)
 
     def test_public_acceptance_rejects_default_environment_mutations(self):
         valid = {
@@ -468,11 +467,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
             *[
                 (
                     f"missing-{missing}",
-                    {
-                        name: value
-                        for name, value in valid.items()
-                        if name != missing
-                    },
+                    {name: value for name, value in valid.items() if name != missing},
                 )
                 for missing in required_names
             ],
@@ -491,13 +486,14 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
             output = "".join(
                 f"{name}={value}\n" for name, value in environment.items()
             ).encode()
-            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 with self.assertRaisesRegex(
                     RuntimeError, "did not match workload defaults"
                 ):
-                    self._run_acceptance(
-                        Path(temporary), default_environment=output
-                    )
+                    self._run_acceptance(Path(temporary), default_environment=output)
 
     def test_public_acceptance_allows_unrelated_bootstrap_environment(self):
         environment = (
@@ -507,9 +503,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
             b"nvx_workload_gid=65534\nnvx_hostname=nvx\n"
         )
         with tempfile.TemporaryDirectory() as temporary:
-            self._run_acceptance(
-                Path(temporary), default_environment=environment
-            )
+            self._run_acceptance(Path(temporary), default_environment=environment)
 
     def test_evidence_failure_still_deprovisions_stopped_sandbox(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -529,9 +523,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
 
         self.assertIn("deprovision", [command[3] for command in commands])
         self.assertEqual(records[-1]["operation"], "deprovision")
-        fixture_root = Path(
-            commands[0][commands[0].index("--state-dir") + 1]
-        ).parent
+        fixture_root = Path(commands[0][commands[0].index("--state-dir") + 1]).parent
         self.assertFalse(fixture_root.exists())
 
     def test_failed_start_deprovisions_safely_stopped_sandbox(self):
@@ -545,9 +537,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                 )
 
         self.assertIn("deprovision", [command[3] for command in commands])
-        fixture_root = Path(
-            commands[0][commands[0].index("--state-dir") + 1]
-        ).parent
+        fixture_root = Path(commands[0][commands[0].index("--state-dir") + 1]).parent
         self.assertFalse(fixture_root.exists())
 
     def test_failed_stop_attempts_guarded_deprovision(self):
@@ -565,9 +555,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                 )
 
         self.assertIn("deprovision", [command[3] for command in commands])
-        fixture_root = Path(
-            commands[0][commands[0].index("--state-dir") + 1]
-        ).parent
+        fixture_root = Path(commands[0][commands[0].index("--state-dir") + 1]).parent
         self.assertIn(str(fixture_root), str(raised.exception))
         self.assertTrue((fixture_root / "state" / "openvmm.log").is_file())
         self.assertTrue((fixture_root / "scratch.ext4").is_file())
@@ -3456,7 +3444,7 @@ class MicrovmTests(unittest.TestCase):
         launcher = (root / "guest" / "alpine" / "nvx-container-enter").read_text()
         self.assertLess(
             bootstrap.index('>"$runtime/workload-machine-id"'),
-            bootstrap.index("exec /sbin/nvx-managed-agent"),
+            bootstrap.index("    /sbin/nvx-managed-agent \\"),
         )
         self.assertIn(
             "set -- /.nvx-agent/nvx-managed-agent \\\n"
