@@ -59,6 +59,7 @@ from nvx_tools.adversarial_executor import (
 )
 from nvx_tools.adversarial_oracles import (
     BoundedProcessResult,
+    NetworkCanary,
     OracleSession,
     _freeze_linux_process_tree,
     _linux_process_exited,
@@ -1255,6 +1256,18 @@ class AdversarialOracleTests(unittest.TestCase):
                             os.kill(pid, 9)
                 unrelated.kill()
                 unrelated.wait()
+
+    def test_network_canary_counts_connections_queued_at_close(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            canary = NetworkCanary(Path(temporary) / "network-canary.jsonl")
+            with socket.create_connection(("127.0.0.1", canary.port), timeout=2.0):
+                pass
+            # Stop before the accept thread runs, leaving the connection queued.
+            canary._stop.set()
+            canary.start()
+            canary.close()
+        self.assertEqual(canary.connections, 1)
+        self.assertIsNone(canary.error)
 
     def test_filesystem_and_network_canaries_detect_policy_violations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -126,21 +126,25 @@ class NetworkCanary:
 
     def close(self) -> None:
         self._stop.set()
-        self._listener.close()
         self._thread.join(timeout=2.0)
+        self._listener.close()
         if self._thread.is_alive():
             raise ScriptError("network canary did not stop")
 
     def _serve(self) -> None:
         try:
-            while not self._stop.is_set():
+            while True:
+                stopping = self._stop.is_set()
+                if stopping:
+                    # Count connections that the kernel queued before close().
+                    self._listener.setblocking(False)
                 try:
                     connection, peer = self._listener.accept()
-                except TimeoutError:
+                except (TimeoutError, BlockingIOError):
+                    if stopping:
+                        return
                     continue
                 except OSError as error:
-                    if self._stop.is_set():
-                        return
                     with self._lock:
                         self._error = str(error)
                     return
