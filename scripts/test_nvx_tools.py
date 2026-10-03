@@ -6020,9 +6020,12 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "retry") == 0) {{
         struct control_session session = {{.fd = STDOUT_FILENO}};
         struct agent_config config = {{.direct = 1}};
+        struct exec_config exec_config = {{0}};
         char *command[] = {{"/bin/true", NULL}};
-        result = run_exec(&session, &config, 42, 0, command);
-        return result == 0 ? run_exec(&session, &config, 43, 0, command) : result;
+        result = run_exec(&session, &config, 42, 0, command, &exec_config);
+        return result == 0
+                   ? run_exec(&session, &config, 43, 0, command, &exec_config)
+                   : result;
     }}
     if (strcmp(argv[1], "population") == 0) {{
         result = exec_cgroup_populated();
