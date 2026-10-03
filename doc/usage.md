@@ -25,7 +25,7 @@ python3 scripts/nvx.py performance gate --help
 | `init` | Initialize the OpenVMM submodule and its nested submodules. |
 | `build-guest` | Build the Linux kernel and selected guest artifacts. |
 | `build-kernel` | Build the pinned and patched Linux kernel natively. |
-| `build-initramfs` | Build the selected Alpine or Ubuntu initramfs natively. |
+| `build-initramfs` | Build the selected Alpine, Ubuntu, or Azure Linux initramfs. |
 | `build-distro-layer` | Build a deterministic Ubuntu EROFS distro layer. |
 | `verify-guest-determinism` | Rebuild Ubuntu guest artifacts twice and compare SHA-256 values. |
 | `build-openvmm` | Build the OpenVMM release binary. |
@@ -112,13 +112,14 @@ revision and is used before packaging kernel provenance inputs.
 
 ```text
 python3 scripts/nvx.py build-guest
-    [--guest {alpine,ubuntu,all}]
+    [--guest {alpine,ubuntu,azurelinux,all}]
     [--native]
 ```
 
 By default, builds the guest kernel and initramfs with Docker. `--native`
 builds the selected artifacts directly on Linux instead. Alpine is the
-default. `--guest all` also builds the Ubuntu EROFS distro layer.
+default. Azure Linux does not support `--native` and always builds through
+Docker. `--guest all` also builds the Ubuntu EROFS distro layer.
 
 ### `build-kernel`
 
@@ -131,10 +132,11 @@ Fetches, verifies, patches, and builds the pinned kernel directly on Linux.
 ### `build-initramfs`
 
 ```console
-python3 scripts/nvx.py build-initramfs [--guest {alpine,ubuntu}]
+python3 scripts/nvx.py build-initramfs [--guest {alpine,ubuntu,azurelinux}]
 ```
 
-Builds the selected initramfs directly on Linux. Alpine is the default.
+Builds the selected initramfs. Alpine and Ubuntu build directly on Linux; Azure
+Linux uses Docker. Alpine is the default.
 
 ### `build-distro-layer`
 
@@ -194,7 +196,7 @@ prerequisite is missing.
 
 ```text
 python3 scripts/nvx.py build
-    [--guest {alpine,ubuntu,all}]
+    [--guest {alpine,ubuntu,azurelinux,all}]
     [--native]
     [--skip-restore]
     [--backend {kvm,mshv,whp}]
@@ -233,7 +235,7 @@ the guest first; the remaining test artifacts are produced by OpenVMM itself.
 ```text
 python3 scripts/nvx.py test-microvm
     --backend {kvm,mshv,whp}
-    [--guest {alpine,ubuntu}]
+    [--guest {alpine,ubuntu,azurelinux}]
     [--scenario SCENARIO]...
     [--processors {1,2,4,8} ...]
     [--memory-mib MIB]
@@ -244,9 +246,10 @@ python3 scripts/nvx.py test-microvm
 Runs NVX-owned Linux, SMP, virtio, sandbox, and snapshot correctness scenarios
 against the public OpenVMM CLI. Repeat `--scenario` to select a subset; without
 it, every scenario supported by the selected guest runs. Alpine remains the
-default. Ubuntu rejects the Alpine-control-only `sandbox-blocks` and
-`scratch-snapshot` scenarios, the Alpine-prompt-specific `console-snapshot`
-scenario, and the sandbox-control-dependent `snapshot-tiers` scenario. The
+default. Ubuntu and Azure Linux cannot act as sandbox control, so they reject
+the Alpine-control-only `sandbox-blocks` and `scratch-snapshot` scenarios and
+the sandbox-control-dependent `snapshot-tiers` scenario. Ubuntu also rejects
+the Alpine-prompt-specific `console-snapshot` scenario. The
 command requires `build/vmlinux`, the selected initramfs, and
 `openvmm/target/release/openvmm[.exe]`.
 
@@ -322,6 +325,10 @@ python3 scripts/nvx.py download
 | `--repository OWNER/REPOSITORY` | `microsoft/nvx` | GitHub repository from which to download the latest release. |
 | `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the release platform. `auto` chooses WHP on Windows and KVM on Linux. |
 
+Installing a release replaces the packaged guest artifacts under `build/` and
+removes any known guest artifact that the release does not declare, such as the
+Azure Linux guest that source-inclusive packages omit.
+
 Windows release downloads support WHP. Linux release downloads support KVM
 and MSHV. `download` first uses `GH_TOKEN` or `GITHUB_TOKEN` when configured.
 If GitHub rejects that token with HTTP 401 or 403, NVX reports the failure and
@@ -333,7 +340,7 @@ is authorized for the organization when it enforces single sign-on.
 
 ```text
 python3 scripts/nvx.py run
-    [--guest {alpine,ubuntu}]
+    [--guest {alpine,ubuntu,azurelinux}]
     [--hypervisor {auto,whp,kvm,mshv}]
     [--machine {microvm}]
     [--memory-mib MIB]
@@ -362,10 +369,10 @@ python3 scripts/nvx.py run
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--guest {alpine,ubuntu}` | `alpine` | Select Alpine or Ubuntu userland with the same NVX kernel. This option is not used for snapshot restore. |
+| `--guest {alpine,ubuntu,azurelinux}` | `alpine` | Select Alpine, Ubuntu, or Azure Linux userland with the same NVX kernel. This option is not used for snapshot restore. |
 | `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the OpenVMM hypervisor. `auto` chooses WHP on Windows and KVM elsewhere. |
 | `--machine {microvm}` | `microvm` | Select the fixed-topology microVM with shared-status edge interrupts. |
-| `--memory-mib MIB` | guest-specific | Set guest memory in MiB. Defaults to 128 for Alpine and 256 for Ubuntu. |
+| `--memory-mib MIB` | guest-specific | Set guest memory in MiB. Defaults to 128 for Alpine, 256 for Ubuntu, and 512 for Azure Linux. |
 | `--memory-capacity-mib MIB` | none | Reserve an immutable, 128 MiB-aligned RAM capacity for a fresh microVM snapshot. |
 | `--processors {1,2,4,8}` | `1` | Select the microVM processor count. |
 | `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Expose one host directory to the absolute guest target. An `rw` mapping accepts guest-created symbolic links, which the host never follows. Active snapshot restore requires the same canonical path, target, and mode; a dormant-slot restore may attach a new mapping that the resumed guest mounts explicitly. |
@@ -617,7 +624,8 @@ python3 scripts/nvx.py collect-sources
 ```
 
 Materializes the verified Linux, Alpine, and Ubuntu source artifacts needed
-for a source-inclusive release.
+for a source-inclusive release. Azure Linux corresponding source is not
+collected, so source-inclusive packages omit the Azure Linux guest.
 
 ### `collect-alpine-sources`
 
@@ -679,7 +687,7 @@ python3 scripts/nvx.py package
 | --- | --- |
 | `--version VERSION` | Override the packaged version. |
 | `--destination PATH` | Override the staging destination. |
-| `--include-source` | Include the corresponding source artifacts in the package. |
+| `--include-source` | Include the corresponding source artifacts in the package and omit the Azure Linux guest artifacts. |
 | `--binary-only` | Stage binaries only; publish corresponding source separately. |
 | `--force` | Replace an existing staging destination. |
 

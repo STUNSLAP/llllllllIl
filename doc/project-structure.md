@@ -14,6 +14,7 @@ are build products or caches and are not part of the tracked source tree. The
 | `kernel` | Reproducible configs and complete Linux patch series |
 | `guest` | Common guest sources plus Alpine-control-specific helpers |
 | `ubuntu` | Pinned Ubuntu supplemental binary-package lock |
+| `azurelinux` | Checksum-pinned Azure Linux supplemental RPM lock |
 | `openvmm` | Private OpenVMM submodule pinned to `microvm/mshv` |
 | `data` | Tracked performance history and generated benchmark data |
 | `scripts/nvx_tools` | Retained NVX build and benchmark implementation |
@@ -39,6 +40,8 @@ nvx/
 |   `-- ubuntu/                  Ubuntu interactive-shell startup policy
 |-- ubuntu/
 |   `-- packages.lock.json       Exact supplemental Ubuntu binary package closure
+|-- azurelinux/
+|   `-- packages.lock.json       Checksum-pinned supplemental Azure Linux RPM closure
 |-- data/                        Benchmark data
 |   |-- linux-kvm-virtual-machine*.csv       Rolling Linux/KVM CI histories
 |   |-- linux-mshv-virtual-machine*.csv      Rolling Linux/MSHV CI histories
@@ -127,6 +130,11 @@ performs the ordered unmount teardown after a stop request. The remaining
 common helpers handle shutdown, virtio-fs mounting, and
 snapshot preparation. `ubuntu/packages.lock.json` pins the complete
 supplemental `.deb` closure installed without maintainer-script execution.
+`azurelinux/packages.lock.json` pins the SHA-256 of every RPM that the Azure
+Linux initramfs adds to its digest-pinned base image; the Docker build
+downloads exactly those RPMs, verifies their checksums and signatures, and
+installs them without resolving packages from a repository.
+Update it whenever the base image pin or the added packages change.
 
 ### `data/`
 
@@ -136,9 +144,9 @@ hold run logs, downloaded artifacts, collected results, and gate inputs.
 
 ### `docker/`
 
-The container definition used to build the Linux kernel, Alpine and Ubuntu
-initramfs images, and the Ubuntu EROFS distro layer in a reproducible Linux
-environment.
+The container definition used to build the Linux kernel, the Alpine, Ubuntu,
+and Azure Linux initramfs images, and the Ubuntu EROFS distro layer in a
+reproducible Linux environment.
 
 ### `kernel/`
 
