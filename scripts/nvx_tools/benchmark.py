@@ -1568,22 +1568,24 @@ class SeparatedOutput:
         self,
         timeout: float,
         on_stderr: Callable[[bytes], None] | None = None,
-    ) -> None:
+    ) -> bool:
         """Records output until both streams end or ``timeout`` expires.
 
-        ``on_stderr`` also receives each stderr chunk.
+        ``on_stderr`` also receives each stderr chunk. Returns whether both
+        streams ended.
         """
         deadline = time.monotonic() + timeout
         while self._open_streams:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return
+                return False
             try:
                 stream, chunk = self.get(remaining)
             except queue.Empty:
-                return
+                return False
             if stream == "stderr" and chunk is not None and on_stderr is not None:
                 on_stderr(chunk)
+        return True
 
     def contents(self) -> bytes:
         """Returns the whole-line transcript, then any unterminated lines."""
@@ -1660,7 +1662,9 @@ def measure_once(
     marker, which a prequeued guest exit makes possible. A completed output
     line starting with ``failure_marker`` stops the launch immediately. Both
     markers match only the guest console, and profile records come only from
-    OpenVMM's stderr.
+    OpenVMM's stderr. A launch that keeps a profile or a log reads both
+    streams to their end after teardown, within ``timeout``, and fails if they
+    do not end.
     """
     started = time.perf_counter_ns()
     interaction = InteractiveProcess(command, environment, separate_stderr=True)
@@ -1674,16 +1678,24 @@ def measure_once(
     output = SeparatedOutput(interaction)
     deadline = time.monotonic() + timeout
 
-    def finish_profile(
+    def finish_output(
         marker_reached: int,
         readiness_counters: dict[str, int] | None,
     ) -> None:
-        if profile is None or profile_sink is None:
+        if (profile is None or profile_sink is None) and log_path is None:
             return
         # OpenVMM writes some records after it resumes the guest, and the
         # stderr reader can deliver earlier ones after the console marker.
-        output.drain(OUTPUT_DRAIN_TIMEOUT_SECONDS, profile.feed)
-        profile_sink.append(profile.finish_restore(marker_reached, readiness_counters))
+        # A profile or log completed before both streams end would silently
+        # omit records or parse an unterminated one.
+        if not output.drain(timeout, profile.feed if profile is not None else None):
+            raise RuntimeError(
+                f"OpenVMM output did not reach EOF within {timeout:g}s of its exit"
+            )
+        if profile is not None and profile_sink is not None:
+            profile_sink.append(
+                profile.finish_restore(marker_reached, readiness_counters)
+            )
 
     try:
         while True:
@@ -1752,12 +1764,12 @@ def measure_once(
                 except subprocess.TimeoutExpired:
                     terminate(process)
                     wall_ms = (time.perf_counter_ns() - started) / 1_000_000
-                    finish_profile(marker_reached, readiness_counters)
+                    finish_output(marker_reached, readiness_counters)
                     return elapsed_ms, peak_bytes, None, wall_ms
                 process_exited = time.perf_counter_ns()
                 teardown_ms = (process_exited - teardown_started) / 1_000_000
                 wall_ms = (process_exited - started) / 1_000_000
-                finish_profile(marker_reached, readiness_counters)
+                finish_output(marker_reached, readiness_counters)
                 if teardown_mode == "guest-exit" and returncode != 0:
                     raise RuntimeError(
                         f"OpenVMM exited with status {returncode} during teardown"

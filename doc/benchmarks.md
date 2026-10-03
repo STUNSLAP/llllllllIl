@@ -450,7 +450,10 @@ OpenVMM relays the guest console to stdout from its own thread, with no ordering
 stderr writes, so either stream can split a line of the other when they share a terminal or
 pipe. Snapshot capture and launch measurements therefore read stderr through a separate pipe:
 they parse profile records only from stderr and match guest markers only on the console. Their
-logs and error reports interleave the two streams by whole lines.
+logs and error reports interleave the two streams by whole lines. Because the streams are read
+independently, a record written before a guest marker can arrive after it. Snapshot capture, and
+launch measurements that keep a profile or a log, read both streams to their end within the
+configured timeout and fail if either stream does not end.
 
 With full profiling, the coordinator retains every record in `profile.raw_samples`. It derives
 `capture.snapshot_generation` from the OpenVMM clock and adds observer-defined

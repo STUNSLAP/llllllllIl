@@ -7719,6 +7719,153 @@ class BenchmarkTests(unittest.TestCase):
         readiness = by_phase["process_launch_to_readiness"]
         self.assertEqual(readiness["host_counters"], {"rss_bytes": 7})
 
+    def test_measure_once_reads_output_to_its_end_before_finishing(self):
+        record = (
+            b"OPENVMM_SNAPSHOT_PROFILE_V1 operation=restore "
+            b"phase=guest_repair_gate exclusive=0 duration_ns=1500 "
+            b"process_elapsed_ns=90000000 pid=4321\n"
+        )
+        split = record.index(b"duration_ns=") + len(b"duration_ns=")
+
+        class FakeInteraction:
+            def __init__(self, exited: threading.Event) -> None:
+                self.process = MagicMock(pid=4321)
+                self.process.poll.return_value = None
+                self.exited = exited
+
+            def read_output(self, chunks: queue.Queue[bytes | None]) -> None:
+                chunks.put(benchmark.RESTORE_MARKER + b"\r\n")
+                chunks.put(None)
+
+            def read_stderr(self, chunks: queue.Queue[bytes | None]) -> None:
+                if self.exited.wait(5):
+                    chunks.put(record[:split])
+                    # The rest of the record outlasts the bounded drain that
+                    # error paths use.
+                    time.sleep(0.2)
+                    chunks.put(record[split:])
+                chunks.put(None)
+
+            def write_input(self, data: bytes) -> None:
+                raise AssertionError(f"unexpected input: {data!r}")
+
+            def close(self) -> None:
+                pass
+
+        for profiled in (False, True):
+            with self.subTest(profiled=profiled):
+                exited = threading.Event()
+
+                def wait_for_exit(
+                    _process: object, _timeout: float, exited: threading.Event = exited
+                ) -> int:
+                    exited.set()
+                    return 0
+
+                profiles: list[dict[str, object]] = []
+                with tempfile.TemporaryDirectory() as temporary:
+                    log_path = Path(temporary) / "restore.log"
+                    with (
+                        patch.object(
+                            benchmark,
+                            "InteractiveProcess",
+                            return_value=FakeInteraction(exited),
+                        ),
+                        patch.object(benchmark, "OUTPUT_DRAIN_TIMEOUT_SECONDS", 0.05),
+                        patch.object(
+                            benchmark, "live_peak_rss_bytes", return_value=1024
+                        ),
+                        patch.object(
+                            benchmark,
+                            "wait_for_process_exit",
+                            side_effect=wait_for_exit,
+                        ),
+                        patch.object(
+                            benchmark, "process_resource_counters", return_value={}
+                        ),
+                    ):
+                        benchmark.measure_once(
+                            ["openvmm"],
+                            environment={},
+                            timeout=10,
+                            marker=benchmark.RESTORE_MARKER,
+                            marker_must_be_line=True,
+                            guest_exit_prequeued=True,
+                            snapshot_profile=profiled,
+                            profile_sink=profiles if profiled else None,
+                            log_path=log_path,
+                        )
+                    log = log_path.read_bytes()
+
+                self.assertTrue(
+                    benchmark.contains_output_line(log, record.removesuffix(b"\n"))
+                )
+                if profiled:
+                    records = cast(list[dict[str, object]], profiles[0]["records"])
+                    repair = next(
+                        item for item in records if item["phase"] == "guest_repair_gate"
+                    )
+                    self.assertEqual(repair["duration_ns"], 1500)
+                    self.assertEqual(repair["process_elapsed_ns"], 90_000_000)
+                else:
+                    self.assertEqual(profiles, [])
+
+    def test_measure_once_reports_output_that_does_not_reach_eof(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class FakeInteraction:
+            def __init__(self) -> None:
+                self.process = MagicMock(pid=4321)
+                self.process.poll.return_value = None
+
+            def read_output(self, chunks: queue.Queue[bytes | None]) -> None:
+                chunks.put(benchmark.RESTORE_MARKER + b"\r\n")
+                chunks.put(None)
+
+            def read_stderr(self, chunks: queue.Queue[bytes | None]) -> None:
+                chunks.put(
+                    b"OPENVMM_SNAPSHOT_PROFILE_V1 operation=restore "
+                    b"phase=guest_repair_gate exclusive=0 duration_ns="
+                )
+                release.wait(10)
+                chunks.put(None)
+
+            def write_input(self, data: bytes) -> None:
+                raise AssertionError(f"unexpected input: {data!r}")
+
+            def close(self) -> None:
+                pass
+
+        profiles: list[dict[str, object]] = []
+        with (
+            patch.object(
+                benchmark, "InteractiveProcess", return_value=FakeInteraction()
+            ),
+            patch.object(benchmark, "OUTPUT_DRAIN_TIMEOUT_SECONDS", 0.05),
+            patch.object(benchmark, "live_peak_rss_bytes", return_value=1024),
+            patch.object(benchmark, "wait_for_process_exit", return_value=0),
+            patch.object(benchmark, "process_resource_counters", return_value={}),
+            patch.object(benchmark, "terminate") as terminate,
+            self.assertRaisesRegex(
+                RuntimeError, r"did not reach EOF within 0\.5s"
+            ) as raised,
+        ):
+            benchmark.measure_once(
+                ["openvmm"],
+                environment={},
+                timeout=0.5,
+                marker=benchmark.RESTORE_MARKER,
+                marker_must_be_line=True,
+                guest_exit_prequeued=True,
+                snapshot_profile=True,
+                profile_sink=profiles,
+            )
+
+        self.assertEqual(profiles, [])
+        terminate.assert_called_once()
+        self.assertIn("phase=guest_repair_gate", str(raised.exception))
+
     def test_guest_failure_report_includes_stderr_written_after_the_marker(self):
         terminated = threading.Event()
 
