@@ -9,12 +9,22 @@ name: "Copilot Setup Steps"
 # NVX_COPILOT_SETUP. Copilot code review uses copilot-code-review.yml instead.
 on:
   workflow_dispatch:
+  # Revalidate the setup when the workflow or a file that its steps take
+  # versions, requirements, metadata, or code from changes. The openvmm entry
+  # matches updates of the submodule pin.
   push:
     paths:
       - .github/workflows/copilot-setup-steps.yml
       - .github/actions/build-guest-artifacts/action.yml
       - .github/actions/check-aci-edge-sandboxes/action.yml
       - .github/actions/check-quality/action.yml
+      - .gitmodules
+      - SOURCE-MANIFEST.json
+      - aci_edge_sandboxes/Cargo.toml
+      - openvmm
+      - requirements-dev.txt
+      - scripts/nvx.py
+      - scripts/nvx_tools/**
       - scripts/setup/setup-linux-runner.sh
 
 permissions:
