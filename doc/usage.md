@@ -166,6 +166,20 @@ selection does not probe `/dev/kvm` or `/dev/mshv`, so compilation also works
 on build-only hosts and hosts exposing both devices. Unsupported OS/backend
 combinations are rejected.
 
+### `record-openvmm-provenance`
+
+```console
+python3 scripts/nvx.py record-openvmm-provenance
+```
+
+Records the checked-out OpenVMM revision, clean-state flag, and executable
+SHA-256 for the existing `openvmm/target/release/openvmm[.exe]` binary in
+`build/openvmm.provenance.json`. The command takes no options. It requires
+the OpenVMM submodule to be checked out/initialized and the release binary to
+already exist at `openvmm/target/release/openvmm` on POSIX or
+`openvmm/target/release/openvmm.exe` on Windows. The command fails if either
+prerequisite is missing.
+
 ### `build`
 
 ```text
