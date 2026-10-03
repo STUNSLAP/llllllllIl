@@ -512,8 +512,10 @@ def _persist_console_log(
     output: bytes,
     log_path: Path,
 ) -> bytes:
+    # Only failure paths reach here with an open console; the monitor still
+    # scans the tail, but nothing is raised over the error being handled.
     if console is not None:
-        output = console.finish()
+        output = console.finish(check=False)
     log_path.write_bytes(output)
     return output
 
@@ -804,6 +806,7 @@ def run_managed_lifecycle(
             )
         )
         log_path = output_dir / "managed-lifecycle.log"
+        guest_log_path = output_dir / "managed-lifecycle-guest.log"
         process: subprocess.Popen[bytes] | None = None
         boot_console: TcpConsole | None = None
         with log_path.open("wb") as log:
@@ -822,7 +825,14 @@ def run_managed_lifecycle(
                     raise RuntimeError("failed to create control capability pipe")
                 process.stdin.write(capability)
                 process.stdin.close()
-                boot_console = TcpConsole.connect(boot_console_address, timeout)
+                # The guest console has no shell to query: init hands the boot
+                # to the managed agent, which serves the control console. The
+                # monitor still fails the run on a violation or failed check
+                # printed there, and a failed boot check powers the guest off
+                # with status 193, which fails the exit check below.
+                boot_console = TcpConsole.connect(
+                    boot_console_address, timeout, monitor=TimeAbiMonitor(command)
+                )
                 with ControlSession.connect(
                     Path(endpoint_value), capability, timeout
                 ) as session:
@@ -1002,11 +1012,14 @@ def run_managed_lifecycle(
                     )
                 if not all(report["teardown"].values()):
                     raise RuntimeError("managed lifecycle reported incomplete teardown")
+                # Keep the guest log, then fail on anything the monitor found
+                # in the console's tail.
+                guest_log_path.write_bytes(boot_console.finish(check=False))
+                boot_console.finish()
+                boot_console = None
             finally:
                 if boot_console is not None:
-                    (output_dir / "managed-lifecycle-guest.log").write_bytes(
-                        boot_console.finish()
-                    )
+                    guest_log_path.write_bytes(boot_console.finish(check=False))
                 if process is not None and process.poll() is None:
                     process.terminate()
                     try:
@@ -3319,7 +3332,14 @@ def run_console_snapshot(
             output_dir / "console-snapshot-capture-process.log",
         ) as process:
             try:
-                console = TcpConsole.connect(address, timeout)
+                # The guest's shell is on this virtio console, so it answers
+                # the cold boot's status query there.
+                console = TcpConsole.connect(
+                    address,
+                    timeout,
+                    monitor=TimeAbiMonitor(capture_command),
+                    time_abi_status=True,
+                )
                 console.wait_for(BOOT_MARKER, timeout)
                 console.wait_for(b"/ # ", timeout)
                 console.send_bytes(
@@ -3361,12 +3381,17 @@ def run_console_snapshot(
             )
             restored_console = b""
             console = None
+            restore_command = snapshot_restore_command(
+                executable, backend, snapshot_path
+            )
             with OpenvmmProcess(
-                snapshot_restore_command(executable, backend, snapshot_path),
+                restore_command,
                 output_dir / f"console-snapshot-restore-{restore_index}-process.log",
             ) as process:
                 try:
-                    console = TcpConsole.connect(address, timeout)
+                    console = TcpConsole.connect(
+                        address, timeout, monitor=TimeAbiMonitor(restore_command)
+                    )
                     if backend != "mshv":
                         console.wait_for_line(CONSOLE_RX_RESTORED_MARKER, timeout)
                         console.wait_for_line(CONSOLE_TX_DONE_MARKER, timeout)
@@ -4386,7 +4411,14 @@ def _run_snapshot_tier(
             output_dir / f"snapshot-tier-{tier}-capture-process.log",
         ) as process:
             try:
-                console = TcpConsole.connect(address, timeout)
+                # The guest's shell is on this virtio console, so it answers
+                # the cold boot's status query there.
+                console = TcpConsole.connect(
+                    address,
+                    timeout,
+                    monitor=TimeAbiMonitor(capture_command),
+                    time_abi_status=True,
+                )
                 console.wait_for(BOOT_MARKER, timeout)
                 script = _snapshot_tier_script(tier)
                 console.send_bytes(
@@ -4466,7 +4498,9 @@ def _run_snapshot_tier(
             output_dir / f"snapshot-tier-{tier}-restore-process.log",
         ) as process:
             try:
-                console = TcpConsole.connect(address, timeout)
+                console = TcpConsole.connect(
+                    address, timeout, monitor=TimeAbiMonitor(restore_command)
+                )
                 console.send_bytes(b"Z")
                 console.wait_for(repair_marker, timeout)
                 if workload_start:
@@ -4508,7 +4542,9 @@ def _run_snapshot_tier(
                 output_dir / f"snapshot-tier-{tier}-timeout-process.log",
             ) as process:
                 try:
-                    timeout_console = TcpConsole.connect(address, timeout)
+                    timeout_console = TcpConsole.connect(
+                        address, timeout, monitor=TimeAbiMonitor(timeout_command)
+                    )
                     timeout_console.send_bytes(b"Z")
                     timed_out = process.wait(timeout)
                     timeout_output = timeout_console.finish()
