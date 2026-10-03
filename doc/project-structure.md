@@ -8,7 +8,7 @@ are build products or caches and are not part of the tracked source tree. The
 
 | Path | Purpose |
 | --- | --- |
-| `.github/prompts` | Copilot prompts for common development workflows |
+| `.github/skills` | Copilot agent skills for common development workflows |
 | `.github/agents` | Bounded Copilot strategist definitions |
 | `.github/specula` | Incremental formal verification adapter and runner setup |
 | `kernel` | Reproducible configs and complete Linux patch series |
@@ -26,10 +26,10 @@ are build products or caches and are not part of the tracked source tree. The
 
 ```text
 nvx/
-|-- .github/                     GitHub automation and Copilot prompts
+|-- .github/                     GitHub automation and Copilot customizations
 |   |-- actions/                 Reusable local CI actions
 |   |-- agents/                  Bounded Copilot strategist definitions
-|   |-- prompts/                 Copilot development workflow prompts
+|   |-- skills/                  Copilot development workflow skills
 |   |-- specula/                 Incremental formal verification integration
 |   |-- workflows/adversarial.yml Trusted scheduled/manual adversarial campaigns
 |   `-- workflows/ci.yml         Main build, test, and benchmark workflow
@@ -107,7 +107,7 @@ Repository automation and Copilot customizations live here. `workflows/ci.yml`
 defines the main CI pipeline and its job-level orchestration. The `actions/`
 directory contains the reusable implementations for validation, artifact
 builds, benchmarks, packaging, releases, and performance history management.
-The `prompts/` directory defines Copilot prompts for common development
+The `skills/` directory defines Copilot agent skills for common development
 workflows. The `specula/` directory contains the adapter, tests, and dedicated
 runner setup for incremental formal verification of the pinned OpenVMM release.
 
