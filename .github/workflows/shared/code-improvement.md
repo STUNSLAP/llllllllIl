@@ -102,7 +102,6 @@ steps:
           "guest/common/init",
           "guest/alpine/nvx-container-enter",
           "guest/alpine/nvx-container-launch",
-          "guest/common/nvx-exit",
           "guest/common/nvx-hostmount",
           "guest/common/nvx-identity-probe",
           "guest/common/nvx-init-agent",
@@ -553,7 +552,6 @@ safe-outputs:
       - "guest/common/init"
       - "guest/alpine/nvx-container-enter"
       - "guest/alpine/nvx-container-launch"
-      - "guest/common/nvx-exit"
       - "guest/common/nvx-hostmount"
       - "guest/common/nvx-identity-probe"
       - "guest/common/nvx-init-agent"

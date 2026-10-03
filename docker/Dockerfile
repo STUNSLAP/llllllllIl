@@ -65,6 +65,8 @@ RUN set -eux; \
     for helper in nvx-reseed nvx-mmio-write nvx-port-io nvx-console-pending nvx-managed-agent; do \
         cc -static -Os -s -Wall -Wextra -Werror -o "/out/helpers/$helper" "/repo/guest/common/$helper.c"; \
     done; \
+    musl-gcc -static -Os -s -Wall -Wextra -Werror -o /out/helpers/nvx-exit \
+        /repo/guest/common/nvx-exit.c; \
     cc -nostdlib -static -Os -fno-builtin -fno-pie -fno-stack-protector -no-pie \
         -Wl,--build-id=none -Wl,-z,noexecstack -s -o /out/helpers/nvx-device-io \
         /repo/guest/common/nvx-device-io.c
@@ -101,8 +103,7 @@ COPY --from=azurelinux-helpers /out/helpers/ /rootfs/sbin/
 RUN <<'EOF'
 set -eux
 install -m 0755 /repo/guest/common/init /rootfs/init
-install -m 0755 /repo/guest/common/nvx-exit \
-    /repo/guest/common/nvx-hostmount \
+install -m 0755 /repo/guest/common/nvx-hostmount \
     /repo/guest/common/nvx-identity-probe \
     /repo/guest/common/nvx-snapshot \
     /repo/guest/common/nvx-virtio-restore-probe \
