@@ -31,6 +31,7 @@ PROCESS_CLEANUP_GRACE_SECONDS = (
     PROCESS_TERMINATION_WAIT_SECONDS * 2 + PROCESS_READER_JOIN_SECONDS * 2
 )
 _LINUX_CHILD_SUBREAPER = 36
+_LINUX_EXITED_TASK_STATES = frozenset({"Z", "X", "x"})
 _WINDOWS_CREATE_SUSPENDED = 0x00000004
 
 
@@ -398,7 +399,7 @@ def _linux_task_states(pid: int) -> tuple[tuple[int, str], ...]:
         stat_path = task_path / "stat"
         try:
             stat = stat_path.read_text()
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
         except OSError as error:
             raise ScriptError(
@@ -414,6 +415,13 @@ def _linux_task_states(pid: int) -> tuple[tuple[int, str], ...]:
             raise ScriptError(f"cannot parse task ID {task_path.name}") from error
         states.append((task_id, fields[0]))
     return tuple(sorted(states))
+
+
+def _linux_process_exited(pid: int) -> bool:
+    """Return whether every thread has exited, even if the PID awaits reaping."""
+    return all(
+        state in _LINUX_EXITED_TASK_STATES for _, state in _linux_task_states(pid)
+    )
 
 
 def _wait_linux_process_quiescent(pid: int, deadline: float) -> bool:
@@ -853,9 +861,13 @@ def terminate_process_tree(
                 try:
                     reaped, _ = os.waitpid(pid, os.WNOHANG)
                 except ChildProcessError:
-                    break
-                if reaped == pid:
-                    break
+                    # Another process reaps this descendant, so wait only until
+                    # all of its threads have exited.
+                    if _linux_process_exited(pid):
+                        break
+                else:
+                    if reaped == pid:
+                        break
                 if time.monotonic() >= deadline:
                     raise ScriptError(f"timed out reaping descendant process {pid}")
                 time.sleep(0.01)
