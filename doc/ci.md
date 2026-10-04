@@ -159,6 +159,7 @@ toolchain that MXC pins. It also runs the unit, mock, and fake-OpenVMM
 integration tests, checks the declared minimum Rust version, and cross-checks
 the macOS build that MXC compiles. The fake-OpenVMM tests drive the real
 OpenVMM backend through its control protocol without a hypervisor.
+The action also validates bundled artifact staging with a fixture package.
 The development release job depends on `aci-edge-sandboxes` and requires its combined
 Linux/Windows result to be successful; failed, cancelled, or skipped crate
 checks cannot publish a release.
