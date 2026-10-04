@@ -94,6 +94,15 @@ def _composite_action_step(action: str, step_name: str) -> str:
     return "\n".join(lines[start:end])
 
 
+def _composite_action_steps(action: str) -> list[str]:
+    lines = action.splitlines()
+    starts = [index for index, line in enumerate(lines) if line.startswith("    - ")]
+    return [
+        "\n".join(lines[start:end])
+        for start, end in zip(starts, starts[1:] + [len(lines)], strict=True)
+    ]
+
+
 def _composite_action_script(action: str, step_name: str) -> str:
     lines = _composite_action_step(action, step_name).splitlines()
     start = lines.index("      run: |") + 1
@@ -142,6 +151,53 @@ def _yaml_field(configuration: str, field: str) -> list[str]:
                 values.append(block_value)
         return values
     raise AssertionError(f"configuration has no {field} field")
+
+
+def _yaml_scalar(configuration: str, field: str) -> str:
+    lines = configuration.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("- "):
+            stripped = stripped[2:]
+        if not stripped.startswith(f"{field}: "):
+            continue
+        value = stripped[len(field) + 2 :].rstrip()
+        indent = len(line) - len(line.lstrip())
+        if line.lstrip().startswith("- "):
+            indent += 2
+        values: list[str] = [] if value in {">", ">-", "|", "|-"} else [value]
+        for block_line in lines[index + 1 :]:
+            block_value = block_line.strip()
+            if block_value and len(block_line) - len(block_line.lstrip()) <= indent:
+                break
+            if block_value:
+                values.append(block_value)
+        return " ".join(values)
+    raise AssertionError(f"configuration has no {field} field")
+
+
+def _outer_parentheses_enclose(expression: str) -> bool:
+    expression = expression.strip()
+    if not expression.startswith("("):
+        return False
+    depth = 0
+    quote: str | None = None
+    for index, character in enumerate(expression):
+        if quote is not None:
+            if character == quote and (index == 0 or expression[index - 1] != "\\"):
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0 and index != len(expression) - 1:
+                return False
+            if depth < 0:
+                return False
+    return depth == 0 and quote is None
 
 
 def _write_release_fixture(
@@ -2822,6 +2878,68 @@ class CiConfigurationTests(unittest.TestCase):
                 _composite_action_step(build_action, "Prepare Linux cache tools")
             ),
         )
+
+    def test_guest_artifact_restore_only_guards_builds_and_cache_saves(self):
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "build-guest-artifacts"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        steps = _composite_action_steps(action)
+        guarded_steps = [
+            step
+            for step in steps
+            if "docker build" in step or "uses: actions/cache/save@" in step
+        ]
+
+        self.assertTrue(guarded_steps)
+        for step in guarded_steps:
+            try:
+                name = _yaml_scalar(step, "name")
+            except AssertionError:
+                name = "<unnamed>"
+            with self.subTest(step=name):
+                condition = _yaml_scalar(step, "if")
+                guard = "inputs.restore-only != 'true' && "
+                self.assertTrue(condition.startswith(guard), condition)
+                cache_condition = condition.removeprefix(guard)
+                self.assertIn("cache-hit != 'true'", cache_condition)
+                if "||" in cache_condition:
+                    self.assertTrue(
+                        _outer_parentheses_enclose(cache_condition),
+                        cache_condition,
+                    )
+
+    def test_guest_artifact_restore_only_leaves_restore_and_scratch_steps_active(self):
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "build-guest-artifacts"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        steps = _composite_action_steps(action)
+        restore_steps = [
+            step for step in steps if "uses: actions/cache/restore@" in step
+        ]
+
+        self.assertTrue(restore_steps)
+        for step in restore_steps:
+            try:
+                name = _yaml_scalar(step, "name")
+            except AssertionError:
+                name = "<unnamed>"
+            with self.subTest(step=name):
+                with self.assertRaisesRegex(AssertionError, "has no if field"):
+                    _yaml_scalar(step, "if")
+
+        scratch = _composite_action_step(
+            action, "Prepare Ubuntu sandbox scratch template"
+        )
+        with self.assertRaisesRegex(AssertionError, "has no if field"):
+            _yaml_scalar(scratch, "if")
 
     def test_ci_runs_openvmm_tests_and_unit_tests_on_each_backend(self):
         workflow = (
