@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
     int result = decode_exec_payload(
         bytes, (uint32_t)length, &timeout_ms, &arguments, &config);
     if (result == 0 && launch) {
-        int fd = create_exec_config_fd(&config);
+        int fd = create_exec_config_fd(&config, 0);
         if (fd < 0) return 2;
         int seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
         if ((fcntl(fd, F_GET_SEALS) & seals) != seals) return 2;
@@ -329,6 +329,41 @@ int main(int argc, char **argv) {
             self.assertEqual(result.returncode, 125)
             self.assertEqual(result.stdout, b"")
             self.assertIn(b"invalid working directory", result.stderr)
+
+    def test_helper_keeps_a_directory_that_its_caller_entered(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            tempfile.TemporaryFile() as config,
+        ):
+            config.write(struct.pack("<HHI", 0x8000, 0, 0))
+            config.seek(0)
+            fd = config.fileno()
+            result = subprocess.run(
+                [str(self.executable), "--exec-config-fd", str(fd), "--", "/bin/pwd"],
+                pass_fds=(fd,),
+                capture_output=True,
+                timeout=5,
+                cwd=directory,
+                env={"BASE": "inherited"},
+            )
+            expected = f"{Path(directory).resolve()}\n".encode()
+        self.assertEqual(
+            (result.returncode, result.stdout, result.stderr), (0, expected, b"")
+        )
+
+    def test_helper_rejects_a_directory_that_is_both_entered_and_named(self):
+        with tempfile.TemporaryFile() as config:
+            config.write(struct.pack("<HHI", 0x8000 | 1, 0, 1) + b"/")
+            config.seek(0)
+            fd = config.fileno()
+            result = subprocess.run(
+                [str(self.executable), "--exec-config-fd", str(fd), "--", "/bin/pwd"],
+                pass_fds=(fd,),
+                capture_output=True,
+                timeout=5,
+                env={"BASE": "inherited"},
+            )
+        self.assertEqual((result.returncode, result.stdout), (125, b""))
 
     def test_helper_defensively_rejects_malformed_environment(self):
         for entry in (b"NO_EQUALS", b"=empty-key", b"KEY=embedded\0nul"):

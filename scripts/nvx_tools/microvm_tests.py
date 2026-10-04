@@ -54,7 +54,7 @@ from .common import (
     require_file,
     sha256_file,
 )
-from .control_session import ControlSession
+from .control_session import ControlSession, ManagedExecRefused
 from .egress_policy import CompiledEgressPolicy, compile_policy_file
 from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
 from .managed_exec_tests import run_managed_exec_configuration
@@ -147,6 +147,14 @@ SCRATCH_FRESH_POST_MARKER = b"NVX-SCRATCH-FRESH-POST-OUT"
 SCRATCH_FRESH_VALUE_PREFIX = b"NVX-SCRATCH-FRESH-VALUE-"
 SCRATCH_FRESH_VALUE_SUFFIX = b"-END"
 WORKLOAD_IDENTITY_MARKER = b"NVX-WORKLOAD-IDENTITY-OK uid=65534 gid=65534"
+# A direct-mode guest refuses a working directory that the workload cannot
+# enter with the Linux error number, which does not depend on the host.
+MANAGED_REFUSED_CWDS = (
+    ("missing", "/does-not-exist", 2),  # ENOENT
+    ("file", "/etc/passwd", 20),  # ENOTDIR
+    ("inaccessible", "/root", 13),  # EACCES
+)
+MANAGED_REFUSED_CWD_MARKER = "/tmp/nvx-refused-cwd-ran"
 BOOT_MARKER = b"NVX-GUEST-BOOT-OK:"
 GUEST_BOOT_COMPLETION_MARKER = b"NVX-GUEST-BOOT-CHECK-OK"
 GUEST_IDENTITY_COMPLETION_MARKER = b"NVX-GUEST-IDENTITY-OK"
@@ -715,6 +723,26 @@ def run_workload_identity(
         raise RuntimeError("root workload identity was not rejected before boot")
 
 
+def _refused_managed_exec(
+    session: ControlSession, cwd: str, *, timeout: float
+) -> ManagedExecRefused:
+    """Runs a workload in an unusable directory; returns the guest's refusal."""
+    try:
+        result = session.exec(
+            ("/bin/touch", MANAGED_REFUSED_CWD_MARKER),
+            timeout_ms=5_000,
+            response_timeout=timeout,
+            cwd=cwd,
+        )
+    except ManagedExecRefused as refusal:
+        return refusal
+    raise RuntimeError(
+        f"managed working directory {cwd} was not refused: "
+        f"returncode={result.returncode} category={result.category} "
+        f"stderr={result.stderr!r}"
+    )
+
+
 def run_managed_lifecycle(
     executable: Path,
     kernel: Path,
@@ -870,23 +898,24 @@ def run_managed_lifecycle(
                         timeout_ms=5_000,
                         response_timeout=timeout,
                     )
-                    missing_cwd = session.exec(
-                        ("/bin/true",),
+                    refused_cwds = [
+                        (
+                            description,
+                            cwd,
+                            error,
+                            _refused_managed_exec(session, cwd, timeout=timeout),
+                        )
+                        for description, cwd, error in MANAGED_REFUSED_CWDS
+                    ]
+                    after_refusals = session.exec(
+                        (
+                            "/bin/sh",
+                            "-c",
+                            f"test ! -e {MANAGED_REFUSED_CWD_MARKER} && "
+                            "printf still-usable",
+                        ),
                         timeout_ms=5_000,
                         response_timeout=timeout,
-                        cwd="/does-not-exist",
-                    )
-                    file_cwd = session.exec(
-                        ("/bin/true",),
-                        timeout_ms=5_000,
-                        response_timeout=timeout,
-                        cwd="/etc/passwd",
-                    )
-                    inaccessible_cwd = session.exec(
-                        ("/bin/true",),
-                        timeout_ms=5_000,
-                        response_timeout=timeout,
-                        cwd="/root",
                     )
                     session.stop(timeout)
                 if (
@@ -909,20 +938,28 @@ def run_managed_lifecycle(
                     raise RuntimeError(
                         "managed guest was not usable after a workload timeout"
                     )
-                for description, failed_cwd in (
-                    ("missing", missing_cwd),
-                    ("file", file_cwd),
-                    ("inaccessible", inaccessible_cwd),
-                ):
+                for description, cwd, error, refusal in refused_cwds:
                     if (
-                        failed_cwd.returncode != 125
-                        or failed_cwd.category != "exit"
-                        or b"cannot use working directory" not in failed_cwd.stderr
+                        refusal.category != "cwd-failed"
+                        or refusal.status != error
+                        or refusal.stdout
+                        or f"cannot enter working directory {cwd}: ".encode()
+                        not in refusal.stderr
                     ):
                         raise RuntimeError(
-                            f"{description} managed working directory did not "
-                            "fail clearly"
+                            f"{description} managed working directory was not "
+                            f"refused clearly: {refusal} stderr={refusal.stderr!r}"
                         )
+                if (
+                    after_refusals.returncode != 0
+                    or after_refusals.category != "exit"
+                    or after_refusals.stdout != b"still-usable"
+                    or after_refusals.stderr
+                ):
+                    raise RuntimeError(
+                        "a refused managed workload ran, or the guest was not "
+                        "usable after refusals"
+                    )
                 result = process.wait(timeout=timeout)
                 if result != 0:
                     raise RuntimeError(
