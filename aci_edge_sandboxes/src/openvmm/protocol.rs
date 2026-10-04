@@ -37,6 +37,11 @@ pub(crate) const APP_ERROR: u8 = 0xff;
 
 /// Error category with which a guest agent refuses a request kind that it does not know.
 pub(crate) const UNSUPPORTED_OPERATION: &[u8] = b"unsupported-operation";
+/// Error category with which a guest agent reports a workload that it could not launch.
+pub(crate) const LAUNCH_FAILED: &str = "launch-failed";
+/// Error category with which a guest agent reports a working directory that the workload cannot
+/// enter. The status is the guest's error number, and nothing of the workload ran.
+pub(crate) const CWD_FAILED: &str = "cwd-failed";
 
 /// Length of the launch capability that authenticates the host client.
 pub(crate) const CAPABILITY_LEN: usize = 32;
@@ -44,6 +49,9 @@ pub(crate) const CAPABILITY_LEN: usize = 32;
 pub(crate) const MAX_ARGUMENTS: usize = 64;
 /// Largest encoded size of one workload argument.
 pub(crate) const MAX_ARGUMENT_BYTES: usize = 4096;
+/// Largest working directory that the openvmm backend accepts: Linux's `PATH_MAX` without the
+/// terminating NUL, one byte below the agent's bound.
+pub(crate) const MAX_CWD_BYTES: usize = 4095;
 /// Largest number of workload environment entries.
 pub(crate) const MAX_ENVIRONMENT: usize = 256;
 /// Largest workload timeout the guest agent accepts.
@@ -330,21 +338,27 @@ impl GuestFeatures {
     /// Applies the working directory and the explicit environment of an extended `EXEC` request
     /// to that execution alone, and layers the environment over the default one on request.
     pub(crate) const EXEC_ENVIRONMENT: Self = Self(1 << 4);
+    /// Starts each workload in the working directory that its `EXEC` request names, or in `/`,
+    /// entered with the workload's identity, and refuses the launch with the `cwd-failed`
+    /// category when the workload cannot enter it.
+    pub(crate) const EXEC_CWD: Self = Self(1 << 5);
     /// The features that the openvmm backend depends on.
     pub(crate) const REQUIRED: Self = Self(
         Self::CANCEL.0
             | Self::HOST_MAPPINGS.0
             | Self::WORKLOAD_ACCOUNT.0
             | Self::EXEC_CGROUP.0
-            | Self::EXEC_ENVIRONMENT.0,
+            | Self::EXEC_ENVIRONMENT.0
+            | Self::EXEC_CWD.0,
     );
 
-    const NAMES: [(Self, &'static str); 5] = [
+    const NAMES: [(Self, &'static str); 6] = [
         (Self::CANCEL, "cancellation"),
         (Self::HOST_MAPPINGS, "host path mappings"),
         (Self::WORKLOAD_ACCOUNT, "workload accounts"),
         (Self::EXEC_CGROUP, "workload containment"),
         (Self::EXEC_ENVIRONMENT, "per-execution environments"),
+        (Self::EXEC_CWD, "working directories"),
     ];
 
     /// Decodes the payload of a features response.
@@ -613,6 +627,16 @@ mod tests {
         };
         assert!(encode_environment(&large(15)).is_ok());
         assert!(encode_environment(&large(17)).is_err());
+        // The working directory counts toward the same limit.
+        let full = vec![format!("/{}", "a".repeat(MAX_ARGUMENT_BYTES - 1)); 15];
+        assert!(encode(full.clone(), 0).is_ok());
+        let cwd = format!("/{}", "d".repeat(MAX_CWD_BYTES - 1));
+        let with_cwd = Workload {
+            argv: full,
+            cwd: Some(&cwd),
+            ..program(&[])
+        };
+        assert!(encode_exec_payload(&with_cwd).is_err());
     }
 
     #[test]
@@ -673,6 +697,7 @@ mod tests {
                 "workload accounts",
                 "workload containment",
                 "per-execution environments",
+                "working directories",
             ]
         );
         assert!(GuestFeatures::decode(&[1, 0, 0]).is_err());
@@ -685,14 +710,27 @@ mod tests {
     }
 
     #[test]
-    fn feature_definitions_match_the_guest_agent_source() {
+    fn guest_features_use_distinct_bits() {
+        let mut seen = 0u32;
+        for (feature, name) in GuestFeatures::NAMES {
+            assert_eq!(feature.0.count_ones(), 1, "{name}");
+            assert_eq!(seen & feature.0, 0, "{name} reuses a feature bit");
+            seen |= feature.0;
+        }
+    }
+
+    fn guest_agent_source() -> Option<String> {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
+            .parent()?
             .join("guest")
             .join("common")
             .join("nvx-managed-agent.c");
-        let Ok(source) = std::fs::read_to_string(source) else {
+        std::fs::read_to_string(source).ok()
+    }
+
+    #[test]
+    fn feature_definitions_match_the_guest_agent_source() {
+        let Some(source) = guest_agent_source() else {
             return;
         };
         let mut definitions = vec![format!("#define APP_FEATURES {APP_FEATURES}U")];
@@ -702,6 +740,7 @@ mod tests {
             ("WORKLOAD_ACCOUNT", GuestFeatures::WORKLOAD_ACCOUNT),
             ("EXEC_CGROUP", GuestFeatures::EXEC_CGROUP),
             ("EXEC_ENVIRONMENT", GuestFeatures::EXEC_ENVIRONMENT),
+            ("EXEC_CWD", GuestFeatures::EXEC_CWD),
         ] {
             let bit = feature.0.trailing_zeros();
             definitions.push(format!("#define FEATURE_{name} (1U << {bit})"));
@@ -710,6 +749,31 @@ mod tests {
             assert!(
                 source.contains(&definition),
                 "the guest agent does not define `{definition}`"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_extension_matches_the_guest_agent_source() {
+        // The agent accepts a working directory as long as one argument, more than any directory
+        // that a workload can enter.
+        const { assert!(MAX_CWD_BYTES < MAX_ARGUMENT_BYTES) };
+        let Some(source) = guest_agent_source() else {
+            return;
+        };
+        for expected in [
+            format!("#define EXEC_EXTENDED {EXEC_EXTENDED}U"),
+            format!("#define EXEC_CWD_PRESENT {EXEC_CWD_PRESENT}U"),
+            format!("#define EXEC_ENVIRONMENT_PRESENT {EXEC_ENVIRONMENT_PRESENT}U"),
+            format!("#define EXEC_INHERIT_DEFAULT_ENV {EXEC_INHERIT_DEFAULT_ENV}U"),
+            format!("#define MAX_ARGUMENT_LEN {MAX_ARGUMENT_BYTES}U"),
+            format!("#define MAX_ENVIRONMENT {MAX_ENVIRONMENT}U"),
+            format!("\"{CWD_FAILED}\""),
+            format!("\"{LAUNCH_FAILED}\""),
+        ] {
+            assert!(
+                source.contains(&expected),
+                "the guest agent does not contain `{expected}`"
             );
         }
     }

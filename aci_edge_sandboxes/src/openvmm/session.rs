@@ -575,6 +575,61 @@ mod tests {
     }
 
     #[test]
+    fn exec_sends_the_working_directory_and_reports_its_refusal() {
+        let (transport, output) = scripted(&[outer(OUTER_READY, 1, 0, &[])]);
+        let mut session =
+            ControlSession::attach(transport, &[1; CAPABILITY_LEN], deadline()).unwrap();
+        let workload = Workload {
+            argv: vec!["/bin/pwd".to_owned()],
+            timeout_ms: 0,
+            cwd: Some("/work"),
+            environment: WorkloadEnvironment::Default,
+        };
+        let request_id = session.start_exec(&workload, deadline()).unwrap();
+        let records = host_records(&output.lock().unwrap());
+        let frame = decode_app(&records[1].2).unwrap();
+        assert_eq!((frame.kind, frame.request_id), (APP_EXEC, request_id));
+        assert_eq!(
+            frame.payload,
+            protocol::encode_exec_payload(&workload).unwrap()
+        );
+
+        let diagnostic = b"nvx-managed-agent: cannot enter working directory /work: No such file\n";
+        session.transport = scripted(&[
+            outer(
+                OUTER_DATA,
+                1,
+                1,
+                &encode_app(APP_STDERR, request_id, 0, diagnostic),
+            ),
+            outer(
+                OUTER_DATA,
+                1,
+                2,
+                &encode_app(APP_ERROR, request_id, 2, protocol::CWD_FAILED.as_bytes()),
+            ),
+        ])
+        .0;
+        let events: Vec<ExecEvent> = (0..2)
+            .map(|_| {
+                session
+                    .next_exec_event(request_id, Some(deadline()))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [
+                ExecEvent::Stderr(diagnostic.to_vec()),
+                ExecEvent::Rejected {
+                    status: 2,
+                    category: protocol::CWD_FAILED.to_owned()
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn out_of_order_and_reset_records_fail_closed() {
         let (transport, _) = scripted(&[outer(OUTER_READY, 1, 0, &[])]);
         let mut session =
