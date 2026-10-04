@@ -266,47 +266,51 @@ class ControlSessionTests(unittest.TestCase):
         )
         self.assertEqual(captured["offset"], captured["payload_len"])
 
+    def _exec_payload(
+        self,
+        environment: tuple[str, ...] | None,
+        *,
+        inherit_default_environment: bool = False,
+    ) -> bytes:
+        client, server = socket.socketpair()
+        session = control_session.ControlSession(control_session._SocketStream(client))
+        session._instance_id = bytes.fromhex("44" * 16)
+        session._epoch = 1
+        captured = bytearray()
+
+        def serve() -> None:
+            *_, frame = _read_outer(server)
+            header = control_session.APP_HEADER.unpack(
+                frame[: control_session.APP_HEADER.size]
+            )
+            captured.extend(frame[control_session.APP_HEADER.size :])
+            _write_app(
+                server,
+                instance_id=session._instance_id,
+                sequence=0,
+                kind=control_session.APP_EXIT,
+                request_id=header[4],
+                status=0,
+                payload=b"exit",
+            )
+            server.close()
+
+        worker = threading.Thread(target=serve)
+        worker.start()
+        session.exec(
+            ("/bin/true",),
+            timeout_ms=0,
+            response_timeout=5,
+            environment=environment,
+            inherit_default_environment=inherit_default_environment,
+        )
+        worker.join(timeout=5)
+        session.close()
+        return bytes(captured)
+
     def test_exec_distinguishes_omitted_and_empty_environment(self):
-        def payload_for(environment: tuple[str, ...] | None) -> bytes:
-            client, server = socket.socketpair()
-            session = control_session.ControlSession(
-                control_session._SocketStream(client)
-            )
-            session._instance_id = bytes.fromhex("44" * 16)
-            session._epoch = 1
-            captured = bytearray()
-
-            def serve() -> None:
-                *_, frame = _read_outer(server)
-                header = control_session.APP_HEADER.unpack(
-                    frame[: control_session.APP_HEADER.size]
-                )
-                captured.extend(frame[control_session.APP_HEADER.size :])
-                _write_app(
-                    server,
-                    instance_id=session._instance_id,
-                    sequence=0,
-                    kind=control_session.APP_EXIT,
-                    request_id=header[4],
-                    status=0,
-                    payload=b"exit",
-                )
-                server.close()
-
-            worker = threading.Thread(target=serve)
-            worker.start()
-            session.exec(
-                ("/bin/true",),
-                timeout_ms=0,
-                response_timeout=5,
-                environment=environment,
-            )
-            worker.join(timeout=5)
-            session.close()
-            return bytes(captured)
-
-        omitted = payload_for(None)
-        empty = payload_for(())
+        omitted = self._exec_payload(None)
+        empty = self._exec_payload(())
         self.assertEqual(struct.unpack("<H", omitted[6:8])[0], 0)
         self.assertEqual(struct.unpack("<H", empty[6:8])[0], 1)
         self.assertEqual(
@@ -314,6 +318,34 @@ class ControlSessionTests(unittest.TestCase):
             control_session.APP_EXEC_ENVIRONMENT_PRESENT,
         )
         self.assertEqual(struct.unpack("<H", empty[10:12])[0], 0)
+
+    def test_exec_layers_only_a_supplied_environment_over_the_defaults(self):
+        layered_flags = (
+            control_session.APP_EXEC_ENVIRONMENT_PRESENT
+            | control_session.APP_EXEC_INHERIT_DEFAULT_ENV
+        )
+        layered = self._exec_payload(("A=1",), inherit_default_environment=True)
+        self.assertEqual(
+            struct.unpack("<HHHI", layered[6:16]),
+            (control_session.APP_EXEC_EXTENDED, layered_flags, 1, 0),
+        )
+        self.assertTrue(layered.endswith(struct.pack("<I", 3) + b"A=1"))
+        empty = self._exec_payload((), inherit_default_environment=True)
+        self.assertEqual(
+            struct.unpack("<HHHI", empty[6:16]),
+            (control_session.APP_EXEC_EXTENDED, layered_flags, 0, 0),
+        )
+        replaced = self._exec_payload(("A=1",))
+        self.assertEqual(
+            struct.unpack("<H", replaced[8:10])[0],
+            control_session.APP_EXEC_ENVIRONMENT_PRESENT,
+        )
+        # An omitted environment already is the default one, so the request stays the
+        # legacy one, which the guest agent accepts without an environment.
+        self.assertEqual(
+            self._exec_payload(None, inherit_default_environment=True),
+            self._exec_payload(None),
+        )
 
     def test_exec_accepts_full_uint32_timeout_range_without_waiting(self):
         for timeout in (0, 3_600_001, 86_400_000, 0xFFFFFFFF):
@@ -389,6 +421,18 @@ class ControlSessionTests(unittest.TestCase):
                     timeout_ms=0,
                     response_timeout=1,
                     **kwargs,  # type: ignore[arg-type]
+                )
+        for inherit in (1, "true", None):
+            with (
+                self.subTest(inherit=inherit),
+                self.assertRaisesRegex(TypeError, "inheritance must be a boolean"),
+            ):
+                session.exec(
+                    ("/bin/true",),
+                    timeout_ms=0,
+                    response_timeout=1,
+                    environment=("A=1",),
+                    inherit_default_environment=inherit,  # type: ignore[arg-type]
                 )
         server.setblocking(False)
         with self.assertRaises(BlockingIOError):

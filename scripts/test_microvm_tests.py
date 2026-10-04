@@ -40,6 +40,23 @@ def _posix_shell() -> str | None:
     return shell
 
 
+# What `/usr/bin/env` prints in the emulated workload without a supplied environment.
+WORKLOAD_DEFAULT_ENVIRONMENT = (
+    b"PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
+    b"TERM=linux\nHOME=/nonexistent\nUSER=nobody\nLOGNAME=nobody\n"
+    b"SHLVL=1\nnvx_workload_uid=65534\nnvx_hostname=nvx\n"
+)
+
+
+def _layered(environment: bytes, entries: list[str]) -> bytes:
+    """Applies entries over an `env` listing the way the guest agent's putenv does."""
+    variables: dict[str, str] = {}
+    for entry in [*environment.decode().splitlines(), *entries]:
+        name, _, value = entry.partition("=")
+        variables[name] = value
+    return "".join(f"{name}={value}\n" for name, value in variables.items()).encode()
+
+
 def _vp_binding_profile(vp_indices: list[int]) -> bytes:
     fields = "duration_ns=1 process_elapsed_ns=2 pid=3"
     phases = [
@@ -138,11 +155,8 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         outcome_mutation: str | None = None,
         start_returncode: int = 0,
         stop_returncode: int = 0,
-        default_environment: bytes = (
-            b"PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
-            b"TERM=linux\nHOME=/nonexistent\nUSER=nobody\nLOGNAME=nobody\n"
-            b"SHLVL=1\nnvx_workload_uid=65534\nnvx_hostname=nvx\n"
-        ),
+        default_environment: bytes = WORKLOAD_DEFAULT_ENVIRONMENT,
+        layered_environment: bytes | None = None,
         evidence_failure: bool = False,
         command_log: list[list[str]] | None = None,
     ) -> tuple[list[list[str]], list[dict[str, object]]]:
@@ -241,23 +255,30 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     else f"{cwd}\n".encode()
                 )
             elif entrypoint == "/usr/bin/env":
+                entries: list[str] | None = None
                 if "--environment-file" in command:
                     environment_file = Path(
                         command[command.index("--environment-file") + 1]
                     )
                     entries = json.loads(environment_file.read_text(encoding="utf-8"))
-                    stdout = (
-                        b"" if not entries else ("\n".join(entries) + "\n").encode()
-                    )
                 elif "--environment" in command:
                     entries = [
                         command[index + 1]
                         for index, value in enumerate(command)
                         if value == "--environment"
                     ]
-                    stdout = ("\n".join(entries) + "\n").encode()
-                else:
+                if entries is None:
                     stdout = default_environment
+                elif "--inherit-default-environment" in command:
+                    stdout = (
+                        layered_environment
+                        if layered_environment is not None
+                        else _layered(WORKLOAD_DEFAULT_ENVIRONMENT, entries)
+                    )
+                else:
+                    stdout = (
+                        b"" if not entries else ("\n".join(entries) + "\n").encode()
+                    )
             elif entrypoint == "/usr/bin/getent":
                 stdout = b"nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
             elif entrypoint == "/bin/sleep":
@@ -375,6 +396,9 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                 )
             )
         self.assertTrue(any("--outcome-report" in command for command in exec_commands))
+        self.assertTrue(
+            any("--inherit-default-environment" in command for command in exec_commands)
+        )
         self.assertEqual(
             [record["operation"] for record in records[:2]], ["provision", "start"]
         )
@@ -385,6 +409,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         recorded_argv = [value for record in records for value in record["argv"]]
         self.assertIn("<redacted>", recorded_argv)
         self.assertNotIn("SECOND=inline value", recorded_argv)
+        self.assertNotIn("LAYERED=layered value", recorded_argv)
         self.assertEqual(exit_outcome["outcome"]["category"], "exit")
         self.assertEqual(exit_outcome["outcome"]["status_code"], 7)
         self.assertEqual(timeout_outcome["outcome"]["category"], "timeout")
@@ -478,6 +503,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     "COMPLEX",
                     "SECOND",
                     "ORDER",
+                    "LAYERED",
                     "NVX_EXEC_CONFIG_FD",
                 )
             ],
@@ -504,6 +530,34 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temporary:
             self._run_acceptance(Path(temporary), default_environment=environment)
+
+    def test_public_acceptance_rejects_layered_environment_mutations(self):
+        entries = ["LAYERED=layered value", "TERM=layered"]
+        layered = _layered(WORKLOAD_DEFAULT_ENVIRONMENT, entries)
+        mutations = {
+            "replaced-defaults": ("\n".join(entries) + "\n").encode(),
+            "kept-replaced-default": _layered(
+                WORKLOAD_DEFAULT_ENVIRONMENT, entries[:1]
+            ),
+            "missing-entry": _layered(WORKLOAD_DEFAULT_ENVIRONMENT, entries[1:]),
+            "wrong-entry": _layered(
+                WORKLOAD_DEFAULT_ENVIRONMENT, ["LAYERED=other", "TERM=layered"]
+            ),
+            "leaked-earlier-entry": layered + b"SECOND=leaked\n",
+        }
+        for mutation, environment in mutations.items():
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "did not layer entries over workload defaults"
+                ):
+                    self._run_acceptance(
+                        Path(temporary), layered_environment=environment
+                    )
+        with tempfile.TemporaryDirectory() as temporary:
+            self._run_acceptance(Path(temporary), layered_environment=layered)
 
     def test_evidence_failure_still_deprovisions_stopped_sandbox(self):
         with tempfile.TemporaryDirectory() as temporary:

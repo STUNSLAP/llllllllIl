@@ -487,7 +487,10 @@ UTF-8 JSON-array environment file. The two environment forms are mutually
 exclusive. Omission inherits the guest bootstrap environment, not the host
 environment: `PATH=/usr/sbin:/usr/bin:/sbin:/bin`, `TERM=linux`, and `HOME`,
 `USER`, and `LOGNAME` resolved from the fixed workload identity. An empty file
-array requests an empty environment. Inline values are visible in host process arguments
+array requests an empty environment. `--inherit-default-environment` layers
+the supplied entries over that default environment instead of replacing it,
+each entry replacing the default variable of the same name; without supplied
+entries it has no effect. Inline values are visible in host process arguments
 and should not be used for secrets. These options apply only to managed
 `sandbox exec`; one-shot execution rejects them. The workload sees one machine
 ID for the life of the VM. On `stop`, the guest agent unmounts the live share,
@@ -505,11 +508,12 @@ The explicit `test-microvm --scenario managed-exec-config --backend BACKEND`
 scenario is the authoritative acceptance for these public options. It invokes
 `scripts/nvx.py sandbox provision`, `start`, `exec`, `stop`, and `deprovision`
 as subprocesses with an Alpine control guest and an Ubuntu workload layer. It
-checks sequential distinct CWD and exact-environment requests followed by
-omitted defaults. It resolves the selected UID 65534 account from the Ubuntu
-workload's own passwd database through a public managed `getent` execution,
-then requires exactly the documented `PATH`, `TERM`, `HOME`, `USER`, and
-`LOGNAME` values. Unrelated guest bootstrap and shell-provided entries are
+checks sequential distinct CWD and exact-environment requests, an environment
+layered over the defaults, and then omitted defaults. It resolves the selected
+UID 65534 account from the Ubuntu workload's own passwd database through a
+public managed `getent` execution, then requires exactly the documented `PATH`,
+`TERM`, `HOME`, `USER`, and `LOGNAME` values, which a layered entry replaces
+only in its own execution. Unrelated guest bootstrap and shell-provided entries are
 permitted because omission inherits the guest bootstrap environment; prior
 request entries and the internal execution-config descriptor must not leak.
 It also checks public

@@ -213,9 +213,16 @@ int main(int argc, char **argv) {
             timeout=30,
         )
 
-    def decode(self, environment: tuple[bytes, ...], *, timeout: int = 0) -> int:
+    def decode(
+        self,
+        environment: tuple[bytes, ...],
+        *,
+        timeout: int = 0,
+        inherit: bool = False,
+    ) -> int:
         argument = b"/bin/true"
-        payload = struct.pack("<IHHHHI", timeout, 1, 1, 2, len(environment), 0)
+        flags = 2 | (4 if inherit else 0)
+        payload = struct.pack("<IHHHHI", timeout, 1, 1, flags, len(environment), 0)
         payload += struct.pack("<I", len(argument)) + argument
         payload += b"".join(
             struct.pack("<I", len(entry)) + entry for entry in environment
@@ -230,6 +237,7 @@ int main(int argc, char **argv) {
     def test_accepts_empty_and_exact_environment(self):
         self.assertEqual(self.decode(()), 0)
         self.assertEqual(self.decode((b"EMPTY=", b"VALUE=space = value")), 0)
+        self.assertEqual(self.decode((b"VALUE=layered",), inherit=True), 0)
 
     def test_rejects_duplicate_environment_names(self):
         self.assertEqual(self.decode((b"VALUE=one", b"VALUE=two")), 1)
@@ -249,9 +257,11 @@ int main(int argc, char **argv) {
         arguments: tuple[bytes, ...],
         environment: tuple[bytes, ...] | None,
         cwd: bytes = b"/",
+        *,
+        inherit: bool = False,
     ) -> subprocess.CompletedProcess[bytes]:
         entries = () if environment is None else environment
-        flags = 1 | (2 if environment is not None else 0)
+        flags = 1 | (2 if environment is not None else 0) | (4 if inherit else 0)
         payload = struct.pack(
             "<IHHHHI", 0, len(arguments), 1, flags, len(entries), len(cwd)
         )
@@ -282,6 +292,19 @@ int main(int argc, char **argv) {
         self.assertEqual(
             (result.returncode, result.stdout, result.stderr),
             (0, b"BASE=inherited\n", b""),
+        )
+
+    def test_helper_layers_explicit_environment_over_defaults(self):
+        result = self.launch(
+            (b"/usr/bin/env",),
+            (b"VALUE=layered",),
+            inherit=True,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            set(result.stdout.splitlines()),
+            {b"BASE=inherited", b"VALUE=layered"},
         )
 
     def test_helper_roundtrip_large_exact_environment(self):

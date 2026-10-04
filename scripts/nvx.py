@@ -418,7 +418,10 @@ def command_sandbox(args: argparse.Namespace) -> None:
     if args.environment and args.environment_file is not None:
         raise ScriptError("--environment and --environment-file are mutually exclusive")
     if operation != "exec" and (
-        args.cwd is not None or args.environment or args.environment_file is not None
+        args.cwd is not None
+        or args.environment
+        or args.environment_file is not None
+        or args.inherit_default_environment
     ):
         raise ScriptError(
             "managed execution options require the sandbox exec operation"
@@ -550,6 +553,7 @@ def command_sandbox(args: argparse.Namespace) -> None:
             response_timeout=args.timeout,
             cwd=args.cwd,
             environment=exec_environment,
+            inherit_default_environment=args.inherit_default_environment,
         )
         sys.stdout.buffer.write(result.stdout)
         sys.stdout.buffer.flush()
@@ -940,6 +944,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         metavar="PATH",
         help="read the exact managed exec environment from a JSON string array",
+    )
+    sandbox.add_argument(
+        "--inherit-default-environment",
+        action="store_true",
+        help=(
+            "layer the managed exec environment over the guest default "
+            "environment instead of replacing it"
+        ),
     )
     sandbox.add_argument("--hypervisor", choices=HYPERVISORS, default="auto")
     sandbox.add_argument(

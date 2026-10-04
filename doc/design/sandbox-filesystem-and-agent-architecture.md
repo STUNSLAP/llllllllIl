@@ -23,10 +23,11 @@ or snapshot-tier metadata alone.
 The public `nvx sandbox` command accepts one to three role-bearing EROFS lower
 images, a preformatted ext4 scratch image, an absolute entrypoint, and
 individual argument tokens. It supplies non-secret kernel-command-line
-configuration; environment variables, secrets, arguments containing
-whitespace, and sandbox snapshot orchestration are not supported by this
-command. Lower-level OpenVMM capture and restore do support sandbox blocks.
-See [Run](../run.md#experimental-single-workload-sandbox).
+configuration for one-shot runs. Managed execution carries bounded arguments
+and a per-execution environment over the authenticated control channel;
+one-shot environment variables, secrets, and sandbox snapshot orchestration
+are not supported by this command. Lower-level OpenVMM capture and restore do
+support sandbox blocks. See [Run](../run.md#experimental-single-workload-sandbox).
 
 The required kernel facilities are already enabled in the NVX microVM kernel
 configuration: virtio-blk, EROFS with compression and xattrs, overlayfs,
@@ -263,9 +264,10 @@ existing consoles; framed control traffic does not share an unstructured byte
 stream with them. OpenVMM owns the bounded outer framing, same-user local
 endpoint authorization, capability authentication, reconnect epochs, and
 receive-credit backpressure. The current guest protocol provides readiness,
-sequential command execution with bounded arguments and output, separate
-stdout/stderr, timeout and exit categories, cancellation, and graceful VM
-shutdown. The control device is never exposed inside the workload namespaces.
+sequential command execution with bounded arguments, per-execution
+environments and output, separate stdout/stderr, timeout and exit categories,
+cancellation, and graceful VM shutdown. The control device is never exposed
+inside the workload namespaces.
 
 While a workload runs, the agent keeps reading the control console. A `CANCEL`
 request that carries the workload's request ID kills the workload, and the exit
@@ -304,14 +306,16 @@ the behaviors it depends on: an older guest boots and answers, but ignores
 payload, therefore asks which control behaviors the image provides. The agent
 answers `READY` with a four-byte little-endian bit mask: `CANCEL` (bit 0),
 `HOST_MAPPINGS` (bit 1), `WORKLOAD_ACCOUNT` (bit 2, provided by the managed
-init and reported by the agent, because both ship in one initramfs), and
-`EXEC_CGROUP` (bit 3). Without sandbox layers all four are provided; with them,
-only `CANCEL` and `WORKLOAD_ACCOUNT`. An agent that predates the request
-refuses it as `unsupported-operation`, which a host reads as no features, so a
-host terminates a guest that lacks a feature it needs instead of running
-workloads without the policy it asked for. During an execution the request is
-refused as `busy`. A feature bit is added together with the behavior it names;
-hosts ignore bits they do not know and trailing bytes of the answer.
+init and reported by the agent, because both ship in one initramfs),
+`EXEC_CGROUP` (bit 3), and `EXEC_ENVIRONMENT` (bit 4, which applies an explicit
+environment to each execution, either replacing or layering over the bootstrap
+environment). Without sandbox layers all five are provided; with them, only
+`CANCEL`, `WORKLOAD_ACCOUNT`, and `EXEC_ENVIRONMENT`. An agent that predates the
+request refuses it as `unsupported-operation`, which a host reads as no
+features, so a host terminates a guest that lacks a feature it needs instead of
+running workloads without the policy it asked for. During an execution the
+request is refused as `busy`. A feature bit is added together with the behavior
+it names; hosts ignore bits they do not know and trailing bytes of the answer.
 
 The remaining production operation families are:
 
