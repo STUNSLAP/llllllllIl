@@ -83,6 +83,25 @@ class ManagedExecResult:
     stderr: bytes
 
 
+class ManagedExecRefused(ScriptError):
+    """The managed guest refused an exec request instead of reporting an exit.
+
+    It keeps the refusal's status and category, and any output that the guest
+    sent first, such as the diagnostic of a ``cwd-failed`` refusal.
+    """
+
+    def __init__(
+        self, status: int, category: str, stdout: bytes, stderr: bytes
+    ) -> None:
+        super().__init__(
+            f"managed guest rejected exec (status={status}, category={category})"
+        )
+        self.status = status
+        self.category = category
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 class _SocketStream:
     def __init__(self, connection: socket.socket) -> None:
         self._connection = connection
@@ -485,9 +504,11 @@ class ControlSession:
                     )
                 return ManagedExecResult(status, category, bytes(stdout), bytes(stderr))
             elif kind == APP_ERROR:
-                raise ScriptError(
-                    "managed guest rejected exec "
-                    f"(status={status}, category={response.decode('ascii', 'replace')})"
+                raise ManagedExecRefused(
+                    status,
+                    response.decode("ascii", "replace"),
+                    bytes(stdout),
+                    bytes(stderr),
                 )
             else:
                 raise ScriptError("managed guest returned an invalid exec response")

@@ -283,6 +283,34 @@ reports `containment-failed` instead. Every subsequent direct execution also
 requires verified emptiness, so a control-session reset cannot bypass a failed
 containment check.
 
+An `EXEC` payload holds a 32-bit timeout, a 16-bit argument count, a reserved
+16-bit field, and the length-prefixed arguments. A reserved field of 1
+announces an extended header: a 16-bit flag field, a 16-bit environment entry
+count, and a 32-bit working-directory length. With flag bit 0, an absolute
+working directory of at most 4096 bytes follows the arguments. With flag bit 1,
+up to 256 environment entries come last, each a 32-bit length and a
+`KEY=VALUE` string of at most 4096 bytes with a distinct, non-empty key, and
+replace the workload's environment; flag bit 2, which requires bit 1, layers
+them over the default environment instead, each entry replacing the default
+variable of the same name. Without bit 1, the entry count must be zero. The
+agent passes these fields through a sealed anonymous file to a launch
+helper, a copy of the agent that runs once `setpriv` has applied the workload's
+identity, inside the container root with sandbox layers. The helper applies
+any environment, enters the working directory, or `/` without one, and executes
+the workload; if it cannot enter the directory, it writes a diagnostic to the
+workload's standard error and exits with status 125. Without sandbox layers,
+the workload's child process enters the directory itself, under the workload's
+user and group IDs with no supplementary groups or effective capabilities,
+before `setpriv` makes that identity permanent. `setpriv` and the helper keep
+that directory instead of looking its path up again, so the workload starts in
+the directory that was checked even if the path is renamed, replaced, or
+retargeted in the meantime. Unless the request replaces the environment, which
+controls `PWD` itself, the child also points `PWD` at the directory, and the
+agent refuses the request as `launch-failed` if it cannot. If the workload
+cannot enter the directory, the agent writes a diagnostic to the workload's
+standard error and refuses the request with the `cwd-failed` category and the
+error number as status, so nothing runs in another directory.
+
 Without sandbox layers, host directories reach workloads through OpenVMM's
 single virtio-fs export. The host exports the deepest directory that contains
 every mapped path to `/run/nvx/hostfs/root`; before it accepts control traffic,
@@ -307,15 +335,17 @@ payload, therefore asks which control behaviors the image provides. The agent
 answers `READY` with a four-byte little-endian bit mask: `CANCEL` (bit 0),
 `HOST_MAPPINGS` (bit 1), `WORKLOAD_ACCOUNT` (bit 2, provided by the managed
 init and reported by the agent, because both ship in one initramfs),
-`EXEC_CGROUP` (bit 3), and `EXEC_ENVIRONMENT` (bit 4, which applies an explicit
+`EXEC_CGROUP` (bit 3), `EXEC_ENVIRONMENT` (bit 4, which applies an explicit
 environment to each execution, either replacing or layering over the bootstrap
-environment). Without sandbox layers all five are provided; with them, only
-`CANCEL`, `WORKLOAD_ACCOUNT`, and `EXEC_ENVIRONMENT`. An agent that predates the
-request refuses it as `unsupported-operation`, which a host reads as no
-features, so a host terminates a guest that lacks a feature it needs instead of
-running workloads without the policy it asked for. During an execution the
-request is refused as `busy`. A feature bit is added together with the behavior
-it names; hosts ignore bits they do not know and trailing bytes of the answer.
+environment), and `EXEC_CWD` (bit 5, the `cwd-failed` refusal of a working
+directory that the workload cannot enter). Without sandbox layers all six are
+provided; with them, only `CANCEL`, `WORKLOAD_ACCOUNT`, and `EXEC_ENVIRONMENT`.
+An agent that predates the request refuses it as `unsupported-operation`, which
+a host reads as no features, so a host terminates a guest that lacks a feature
+it needs instead of running workloads without the policy it asked for. During
+an execution the request is refused as `busy`. A feature bit is added together
+with the behavior it names; hosts ignore bits they do not know and trailing
+bytes of the answer.
 
 The remaining production operation families are:
 

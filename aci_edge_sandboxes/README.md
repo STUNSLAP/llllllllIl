@@ -54,8 +54,10 @@ command-line arguments.
 | `AciEdgeSandbox::deprovision` | provisioned → (none) | optional metadata; the ID becomes stale |
 
 `ExecOutcome` distinguishes `Exited(code)`, `Signaled(signal)`, `TimedOut`,
-`Cancelled`, and `Failed(reason)`. An `Err` from `Execution::wait` means the
-outcome could not be determined, for example because the VM stopped.
+`Cancelled`, and `Failed(reason)`. `Failed(WorkingDirectory)` means that the
+workload never ran because it could not enter its working directory. An `Err`
+from `Execution::wait` means the outcome could not be determined, for example
+because the VM stopped.
 
 Request types serialize with the contract's JSON field names (`readonlyPaths`,
 `memoryMib`, `commandLine`, and so on) and reject unknown fields. Every
@@ -208,8 +210,8 @@ Windows and `$XDG_STATE_HOME/nvx/sandboxes` (default
 - **Exec** connects to the control console, authenticates, and streams the
   workload's output live. The agent runs the workload through `setpriv` as the
   workload identity, with no capabilities and `no_new_privs`, in a cgroup of
-  its own. Each execution gets its own working directory and environment; see
-  [Environment](#environment). When the workload's first process exits, the
+  its own. Each execution gets its own [working directory](#working-directories)
+  and [environment](#environment). When the workload's first process exits, the
   agent kills whatever it left behind, including processes in other sessions,
   so no workload process outlives its exec.
 - **Stop** asks the guest to shut down. If the guest does not finish within
@@ -237,13 +239,35 @@ terminate the VM when the caller exits.
 | `microvm.provision.memoryMib` | applied | n/a |
 | `process.commandLine` | n/a | run as `/bin/sh -c <commandLine>`; at most 4096 bytes |
 | `process.argv` (ACI Edge Sandboxes extension) | n/a | applied; absolute program, up to 64 arguments of 4096 bytes |
-| `process.cwd` | n/a | an absolute guest path, which the guest agent enters before the workload starts; a missing directory, or one that the workload identity cannot enter, ends the workload with status 125 |
+| `process.cwd` | n/a | applied; an absolute guest path of at most 4095 bytes, `/` when omitted; see [Working directories](#working-directories) |
 | `process.timeout` | n/a | applied, up to 3,600,000 ms |
 | `process.env`, `inheritDefaultEnv` | n/a | applied per execution; see [Environment](#environment) |
 | Piped standard input | n/a | rejected; the workload reads end-of-file |
 
 Workloads run as the configured non-root identity and may write at most 1 MiB
 of combined output. Larger output ends with `Failed(OutputLimitExceeded)`.
+
+### Working directories
+
+Each execution starts in the working directory that it requests, and nothing
+carries over from an earlier execution.
+
+- Without `process.cwd`, the workload starts in the guest's root directory,
+  `/`.
+- `process.cwd` must be an absolute guest path of at most 4095 bytes. A
+  relative path is rejected with `policy_validation` before anything runs;
+  `openvmm::resolve_guest_path` turns a mapped host path into a guest path.
+- The guest agent enters the directory with the workload's own identity,
+  before the workload starts, and, unless `process.env` replaces the
+  environment, points `PWD` at it. For a path with empty, `.`, or `..`
+  components, `PWD` names the directory's physical path instead.
+- A directory that does not exist, is not a directory, or that the workload
+  cannot search fails the launch, and the backend never falls back to another
+  directory. Nothing runs, the workload's standard error receives a diagnostic
+  such as `nvx-managed-agent: cannot enter working directory /work: No such
+  file or directory`, and the execution ends with `Failed(WorkingDirectory)`.
+- Start refuses a guest image whose agent cannot refuse an unusable working
+  directory this way with `backend_unavailable`.
 
 ### Environment
 
@@ -259,10 +283,11 @@ earlier one. `process.env` and `process.inheritDefaultEnv` follow MXC's schema:
 | `["FOO=bar"]` | `true` | the default environment plus `FOO`; an entry replaces the default of the same name |
 
 The default environment is the guest's own and never holds host variables:
-`PATH=/usr/sbin:/usr/bin:/sbin:/bin`, `TERM=linux`, and the `HOME`, `USER`, and
-`LOGNAME` of the workload identity, plus a few variables that the guest's boot
-leaves behind (`SHLVL`, `PWD`, and kernel parameters such as `nvx_lifecycle`),
-which workloads should not rely on.
+`PATH=/usr/sbin:/usr/bin:/sbin:/bin`, `TERM=linux`, the `HOME`, `USER`, and
+`LOGNAME` of the workload identity, and `PWD`, which names the working
+directory, plus a few variables that the guest's boot leaves behind (`SHLVL`
+and kernel parameters such as `nvx_lifecycle`), which workloads should not
+rely on.
 
 In Rust, `ProcessSpec::env` is `None` when `process.env` is omitted and `Some`
 of an empty list for `[]`; `"env": null` does not deserialize, because MXC's
@@ -279,11 +304,12 @@ schema allows only an array. `ExecRequest::with_env` adds an entry,
   untouched. It takes at most 256 entries with unique names, each at most 4096
   bytes, in a request of at most 64 KiB. A repeated name, or more or longer
   entries, is `policy_validation`, before anything runs.
-- The guest agent applies the entries and enters the working directory after it
-  has dropped the workload's privileges, just before it starts the program. The
-  workload therefore keeps its identity, no capabilities, and `no_new_privs`,
-  and a `process.argv` program receives exactly the requested environment, also
-  in a working directory. Run `/usr/bin/env` through `process.argv` to see it.
+- The guest agent enters the working directory with the workload's identity
+  and applies the entries after it has dropped the workload's privileges, just
+  before it starts the program. The workload therefore keeps its identity, no
+  capabilities, and `no_new_privs`, and a `process.argv` program receives
+  exactly the requested environment, also in a working directory. Run
+  `/usr/bin/env` through `process.argv` to see it.
 - A `process.commandLine` runs in `/bin/sh`, and that shell is the workload, so
   it exports variables of its own: BusyBox's `sh` sets `SHLVL` and `PWD`,
   replacing entries with those names, as it does for any script.
@@ -379,7 +405,7 @@ behind the profile's NAT gateway `10.0.0.1`, which also serves DNS.
 | `exec` on a stopped sandbox, or a VM that died | `NotStarted` | `not_started` |
 | `start` or `deprovision` on a running sandbox | `AlreadyStarted` | `already_started` |
 | `stop` on a stopped sandbox | `AlreadyStopped` | `already_stopped` |
-| Unsupported policy or exec feature, oversized command | `PolicyValidation` | `policy_validation` |
+| Unsupported policy or exec feature, oversized command, relative or oversized `process.cwd` | `PolicyValidation` | `policy_validation` |
 | Missing OpenVMM artifacts, inaccessible hypervisor, incompatible release or guest image, unsupported host | `BackendUnavailable` | `backend_unavailable` |
 | OpenVMM launch failure, boot timeout, control-session failure, I/O errors | `BackendError` | `backend_error` |
 
@@ -424,12 +450,14 @@ python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm   # real VM (reposi
   control console. It lets the real OpenVMM backend run end to end on hosts
   without a hypervisor: detached launch, reconnection from a new process,
   crash recovery, interrupted-start recovery, forced stop, cancellation,
-  refusal of guest images that lack required features, and failure injection.
+  working directories, refusal of guest images that lack required features,
+  and failure injection.
 - `cargo run --example lifecycle -- <command>` runs one command with
   discovered artifacts.
 - `nvx.py test-aci-edge-sandboxes` runs the ignored `openvmm_e2e` tests against a real
   hypervisor with the repository's kernel and Alpine initramfs: the lifecycle,
-  host path mapping, network rules, and exec environments. CI runs them on
+  working directories, host path mapping, network rules, and exec environments.
+  CI runs them on
   Linux/KVM, Linux/MSHV, and Windows/WHP.
 
 ## MXC integration
@@ -448,7 +476,7 @@ An MXC `StatefulSandboxBackend` adapter maps onto this crate as follows:
 | Backend construction | `Artifacts::discover` and `OpenVmmConfig::from_artifacts` |
 | `policy.readonly_paths`, `readwrite_paths`, `denied_paths` | `FilesystemPolicy` with the same host paths |
 | `policy.network_egress` rules | `EgressPolicy` rules, field for field |
-| `working_directory` | `ExecRequest::with_cwd(guest_path(...))` |
+| `working_directory` | `ExecRequest::with_cwd(guest_path(...))`; a directory that the workload cannot enter ends with `Failed(WorkingDirectory)` |
 | `process.env`, `process.inheritDefaultEnv` | `ProcessSpec::env`, `None` when omitted, and `inherit_default_env`, or `ExecRequest::with_envs` and `with_inherit_default_env`; see [Environment](#environment) |
 
 A proof-of-concept MXC adapter, `nvx_backend`, implements this mapping. It

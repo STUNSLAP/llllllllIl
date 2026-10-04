@@ -493,6 +493,62 @@ class ControlSessionTests(unittest.TestCase):
         worker.join(timeout=5)
         session.close()
 
+    def test_exec_refusal_keeps_status_category_and_diagnostic(self):
+        client, server = socket.socketpair()
+        instance = bytes.fromhex("33" * 16)
+        session = control_session.ControlSession(control_session._SocketStream(client))
+        session._instance_id = instance
+        session._epoch = 1
+        diagnostic = (
+            b"nvx-managed-agent: cannot enter working directory /missing: "
+            b"No such file or directory\n"
+        )
+
+        def serve() -> None:
+            *_, frame = _read_outer(server)
+            request_id = control_session.APP_HEADER.unpack(
+                frame[: control_session.APP_HEADER.size]
+            )[4]
+            _write_app(
+                server,
+                instance_id=instance,
+                sequence=0,
+                kind=control_session.APP_STDERR,
+                request_id=request_id,
+                status=0,
+                payload=diagnostic,
+            )
+            _write_app(
+                server,
+                instance_id=instance,
+                sequence=1,
+                kind=control_session.APP_ERROR,
+                request_id=request_id,
+                status=2,
+                payload=b"cwd-failed",
+            )
+            server.close()
+
+        worker = threading.Thread(target=serve)
+        worker.start()
+        with self.assertRaises(control_session.ManagedExecRefused) as raised:
+            session.exec(
+                ("/bin/true",), timeout_ms=0, response_timeout=5, cwd="/missing"
+            )
+        worker.join(timeout=5)
+        session.close()
+
+        refusal = raised.exception
+        self.assertIsInstance(refusal, control_session.ScriptError)
+        self.assertEqual(
+            (refusal.status, refusal.category, refusal.stdout, refusal.stderr),
+            (2, "cwd-failed", b"", diagnostic),
+        )
+        self.assertEqual(
+            str(refusal),
+            "managed guest rejected exec (status=2, category=cwd-failed)",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

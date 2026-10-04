@@ -5,29 +5,33 @@
 //! input, serves the authenticated control console on the requested Unix socket or named pipe,
 //! and runs scripted workloads. Integration tests point `OpenVmmConfig::openvmm` at it.
 //!
-//! Workloads are `/bin/sh -c SCRIPT`, `/bin/echo ARGS...`, or a program named `env` or
-//! `printenv` in any directory, which prints its environment. A script is a `;`-separated list of
-//! commands: `echo TEXT`, `echoerr TEXT`, `sleep MS`, `exit CODE`, `signal NUMBER`,
-//! `flood BYTES`, `write KEY VALUE`, `read KEY`, `env`, `printenv NAME`, `pwd`, `fail`, and
-//! `launchfail`. Values written with `write` live in memory until the VM stops, like files in the
-//! guest's RAM root file system.
+//! Workloads are `/bin/sh -c SCRIPT`, `/bin/echo ARGS...`, `/bin/pwd`, or a program named `env`
+//! or `printenv` in any directory, which prints its environment. A script is a `;`-separated
+//! list of commands: `echo TEXT`, `echoerr TEXT`, `sleep MS`, `exit CODE`, `signal NUMBER`,
+//! `flood BYTES`, `write KEY VALUE`, `read KEY`, `mkdir DIRECTORY`, `env`, `printenv NAME`,
+//! `pwd`, `fail`, and `launchfail`. Values written with `write` and directories made with
+//! `mkdir` live in memory until the VM stops, like files in the guest's RAM root file system.
 //! A `CANCEL` request ends a sleeping workload with the cancelled outcome, and a client that
 //! disconnects during an exec abandons it, as the real guest agent does. `pwd` prints the
-//! working directory of the exec request.
+//! working directory of the exec request. Like the guest agent, the fake refuses a working
+//! directory that does not exist (any but `/`, `/tmp`, `/work`, a mapped directory, or a
+//! directory made with `mkdir`), or that is a mapped regular file, with a diagnostic and the
+//! `cwd-failed` category.
 //!
 //! Each workload gets the environment that its exec request selects, in the order in which the
 //! guest agent builds it. The default environment is the documented guest bootstrap environment:
 //! `PATH`, `TERM`, and the `HOME`, `USER`, and `LOGNAME` of the workload account. The guest's
-//! boot leaves a few more variables behind, which the fake omits. Like BusyBox's `sh`, a script
-//! exports `SHLVL`, one higher than the value that it received, and its working directory as
-//! `PWD`, replacing entries with these names.
+//! boot leaves a few more variables behind, and the guest agent points `PWD` at the working
+//! directory; the fake omits both. Like BusyBox's `sh`, a script exports `SHLVL`, one higher
+//! than the value that it received, and its working directory as `PWD`, replacing entries with
+//! these names.
 //!
 //! Kernel command-line tokens adjust the emulation: `fake_exit_on_start=CODE` fails the launch,
 //! `fake_boot_delay_ms=MS` delays the control endpoint, `fake_crash_after_ms=MS` makes the VM
 //! die, `fake_ignore_stop=1` ignores stop requests, `fake_ignore_cancel=1` ignores cancellation,
-//! and `fake_legacy_guest=1` refuses the
-//! features request like a guest agent that predates it. The command line is recorded in
-//! `fake-openvmm-<token>.json` next to the kernel.
+//! `fake_guest_features=MASK` advertises the decimal feature mask `MASK` instead of the current
+//! guest's, and `fake_legacy_guest=1` refuses the features request like a guest agent that
+//! predates it. The command line is recorded in `fake-openvmm-<token>.json` next to the kernel.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -61,8 +65,8 @@ const APP_STOPPED: u8 = 0x85;
 const APP_ERROR: u8 = 0xff;
 
 /// Control features of the current guest: cancellation, host path mappings, workload accounts,
-/// workload containment, and per-execution environments.
-const GUEST_FEATURES: u32 = 0b1_1111;
+/// workload containment, per-execution environments, and working directories.
+const GUEST_FEATURES: u32 = 0b11_1111;
 
 const EXEC_EXTENDED: u16 = 1;
 const EXEC_CWD_PRESENT: u16 = 1 << 0;
@@ -110,6 +114,17 @@ struct Options {
     ignore_cancel: bool,
     legacy_guest: bool,
     workload_uid: u32,
+    guest_features: u32,
+    /// Host paths mapped into the guest.
+    mapped: Vec<Mapped>,
+}
+
+/// A host path mapped into the guest.
+struct Mapped {
+    /// Guest path at which the host path appears.
+    target: String,
+    /// Whether the host path is a directory rather than a regular file.
+    directory: bool,
 }
 
 fn main() -> ExitCode {
@@ -254,8 +269,8 @@ fn parse(arguments: &[String]) -> Result<Options, String> {
         .iter()
         .filter(|token| token.starts_with("nvx_map="))
         .count();
-    match values.get("--mount").map(Vec::as_slice) {
-        None if maps == 0 && !values.contains_key("--mount-deny") => {}
+    let export = match values.get("--mount").map(Vec::as_slice) {
+        None if maps == 0 && !values.contains_key("--mount-deny") => None,
         Some([mount]) if maps > 0 => {
             let mut fields = mount.splitn(3, ',');
             let (Some(target), Some(host), Some(mode)) =
@@ -275,9 +290,10 @@ fn parse(arguments: &[String]) -> Result<Options, String> {
                     return Err(format!("invalid --mount-deny {}", denied.display()));
                 }
             }
+            Some(PathBuf::from(host))
         }
         _ => return Err("--mount, --mount-deny, and nvx_map tokens must agree".to_owned()),
-    }
+    };
     if (values.contains_key("--network-egress-allow")
         || values.contains_key("--network-egress-deny"))
         && !values.contains_key("--network-egress")
@@ -305,6 +321,22 @@ fn parse(arguments: &[String]) -> Result<Options, String> {
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // The guest bind-mounts each mapped host path, relative to the export, at its target, so a
+    // target is a directory exactly when its host path is one.
+    let mapped = tokens
+        .iter()
+        .filter_map(|token| token.strip_prefix("nvx_map="))
+        .map(|fields| {
+            let mut parts = fields.split(',').map(percent_decode);
+            match (parts.next().flatten(), parts.next().flatten(), &export) {
+                (Some(source), Some(target), Some(export)) => Ok(Mapped {
+                    directory: export.join(source).is_dir(),
+                    target,
+                }),
+                _ => Err(format!("invalid nvx_map={fields}")),
+            }
+        })
+        .collect::<Result<_, _>>()?;
     Ok(Options {
         endpoint,
         args_dump: kernel.with_file_name(format!("fake-openvmm-{token}.json")),
@@ -317,7 +349,28 @@ fn parse(arguments: &[String]) -> Result<Options, String> {
         ignore_cancel: knob("fake_ignore_cancel") == Some("1"),
         legacy_guest: knob("fake_legacy_guest") == Some("1"),
         workload_uid,
+        guest_features: knob("fake_guest_features")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(GUEST_FEATURES),
+        mapped,
     })
+}
+
+/// Decodes a percent-encoded `nvx_map=` field.
+fn percent_decode(field: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(field.len());
+    let mut rest = field.as_bytes();
+    while let [first, tail @ ..] = rest {
+        if *first == b'%' {
+            let digits = std::str::from_utf8(tail.get(..2)?).ok()?;
+            bytes.push(u8::from_str_radix(digits, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(*first);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn read_capability() -> Result<[u8; CAPABILITY_LEN], String> {
@@ -341,6 +394,10 @@ struct Guest {
     values: BTreeMap<String, String>,
     /// Environment that workloads inherit unless they replace it.
     default_environment: Environment,
+    /// Directories a workload can enter.
+    directories: BTreeSet<String>,
+    /// Mapped regular files, which a workload cannot enter either.
+    files: BTreeSet<String>,
 }
 
 impl Guest {
@@ -362,9 +419,21 @@ impl Guest {
         .into_iter()
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
+        let mut directories: BTreeSet<String> = ["/", "/tmp", "/work"].map(str::to_owned).into();
+        let mut files = BTreeSet::new();
+        for mapped in &options.mapped {
+            let paths = if mapped.directory {
+                &mut directories
+            } else {
+                &mut files
+            };
+            paths.insert(mapped.target.clone());
+        }
         Self {
             values: BTreeMap::new(),
             default_environment,
+            directories,
+            files,
         }
     }
 }
@@ -549,7 +618,12 @@ impl<S: Read + Write + Pending> Session<'_, S> {
             match kind {
                 APP_PING => self.send(APP_READY, request_id, 0, &[])?,
                 APP_FEATURES if !options.legacy_guest => {
-                    self.send(APP_READY, request_id, 0, &GUEST_FEATURES.to_le_bytes())?;
+                    self.send(
+                        APP_READY,
+                        request_id,
+                        0,
+                        &options.guest_features.to_le_bytes(),
+                    )?;
                 }
                 APP_EXEC => {
                     if !self.exec(request_id, &payload, guest)? {
@@ -608,6 +682,19 @@ impl<S: Read + Write + Pending> Session<'_, S> {
             set_variable(&mut environment, name, value);
         }
         let cwd = exec.cwd.as_deref().unwrap_or("/");
+        if !guest.directories.contains(cwd) {
+            // The guest agent's refusal: a diagnostic, then the error number, before anything
+            // runs.
+            let (error, reason) = if guest.files.contains(cwd) {
+                (20, "Not a directory") // ENOTDIR
+            } else {
+                (2, "No such file or directory") // ENOENT
+            };
+            let message =
+                format!("nvx-managed-agent: cannot enter working directory {cwd}: {reason}\n");
+            self.send(APP_STDERR, request_id, 0, message.as_bytes())?;
+            return self.send_some(APP_ERROR, request_id, error, b"cwd-failed");
+        }
         let timeout_ms = u32_at(payload, 0);
         let program_name =
             |program: &str| program.rsplit('/').next().unwrap_or_default().to_owned();
@@ -617,6 +704,7 @@ impl<S: Read + Write + Pending> Session<'_, S> {
                 script.clone()
             }
             [program, words @ ..] if program == "/bin/echo" => format!("echo {}", words.join(" ")),
+            [program] if program == "/bin/pwd" => "pwd".to_owned(),
             [program] if ["env", "printenv"].contains(&program_name(program).as_str()) => {
                 "env".to_owned()
             }
@@ -697,6 +785,9 @@ impl<S: Read + Write + Pending> Session<'_, S> {
                     if let Some(value) = guest.values.get(argument).cloned() {
                         self.send(APP_STDOUT, request_id, 0, value.as_bytes())?;
                     }
+                }
+                "mkdir" => {
+                    guest.directories.insert(argument.to_owned());
                 }
                 "env" => {
                     for (name, value) in &environment {

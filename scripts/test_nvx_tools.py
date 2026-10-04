@@ -14,6 +14,7 @@ import os
 import queue
 import re
 import select
+import shlex
 import shutil
 import signal
 import struct
@@ -6488,11 +6489,18 @@ class ManagedAgentStopTests(unittest.TestCase):
             8,
             16,
         )
+        exec_cwd = 32
         for rootfs, expected in (
-            # Only the direct agent maps host paths and gives each workload a cgroup.
+            # Only the direct agent maps host paths, gives each workload a cgroup, and
+            # refuses a working directory that the workload cannot enter.
             (
                 "-",
-                cancel | host_mappings | workload_account | exec_cgroup | environment,
+                cancel
+                | host_mappings
+                | workload_account
+                | exec_cgroup
+                | environment
+                | exec_cwd,
             ),
             ("/run/nvx/rootfs", cancel | workload_account | environment),
         ):
@@ -6505,6 +6513,375 @@ class ManagedAgentStopTests(unittest.TestCase):
         kind, request_id, status, body = self._request("-", 5, b"abc")
         self.assertEqual((kind, request_id, status), (0xFF, 42, 22))
         self.assertEqual(body, b"invalid-request")
+
+    def test_agent_refuses_malformed_working_directories(self):
+        argument = struct.pack("<I", 9) + b"/bin/true"
+        cases = {
+            "unknown payload revision": struct.pack("<IHH", 0, 1, 2) + argument,
+            "truncated extended header": struct.pack("<IHHH", 0, 1, 1, 1),
+            "unknown flag": _managed_exec_payload(b"/work", flags=1 | 8),
+            # Only the agent tells its launch helper that it entered the directory.
+            "launch helper flag": _managed_exec_payload(b"/work", flags=1 | 0x8000),
+            "layering without an environment": _managed_exec_payload(
+                b"/work", flags=1 | 4
+            ),
+            "environment entries without the flag": _managed_exec_payload(
+                b"/work", entries=1
+            ),
+            "flag without a directory": _managed_exec_payload(b"", flags=1),
+            "directory without the flag": _managed_exec_payload(b"/work", flags=0),
+            "directory beyond 4096 bytes": _managed_exec_payload(b"/" + b"d" * 4096),
+            "relative directory": _managed_exec_payload(b"work"),
+            "NUL in the directory": _managed_exec_payload(b"/wo\0rk"),
+            "truncated directory": _managed_exec_payload(b"/work")[:-1],
+            "trailing bytes": _managed_exec_payload(b"/work") + b"x",
+        }
+        for name, payload in cases.items():
+            with self.subTest(name):
+                kind, request_id, status, body = self._request("-", 2, payload)
+                self.assertEqual((kind, request_id, status), (0xFF, 42, 22))
+                self.assertEqual(body, b"invalid-request")
+
+
+def _managed_exec_payload(
+    cwd: bytes,
+    *,
+    argv: tuple[bytes, ...] = (b"/bin/true",),
+    flags: int = 1,
+    entries: int = 0,
+) -> bytes:
+    """Encodes an extended EXEC payload that carries `cwd` after the arguments."""
+    arguments = b"".join(struct.pack("<I", len(value)) + value for value in argv)
+    header = struct.pack("<IHHHHI", 0, len(argv), 1, flags, entries, len(cwd))
+    return header + arguments + cwd
+
+
+class ManagedAgentWorkingDirectoryTests(unittest.TestCase):
+    """Runs direct-mode workloads through `run_exec` with an unprivileged harness.
+
+    The harness records identity changes instead of making them, so the working
+    directory is entered with the test user's credentials, and a `setpriv` shim
+    runs the harness in place of the agent's launch helper without changing its
+    identity. The shim first runs `HARNESS_BEFORE_LAUNCH`, which can change the
+    file system after the agent checked the directory, as another process could.
+    """
+
+    SOURCE = Path(__file__).parents[1] / "guest" / "common" / "nvx-managed-agent.c"
+    OUTER = ManagedAgentStopTests.OUTER
+    APP = ManagedAgentStopTests.APP
+
+    def setUp(self):
+        if sys.platform != "linux":
+            self.skipTest("the managed agent requires Linux")
+        compiler = shutil.which("cc") or shutil.which("gcc")
+        if compiler is None:
+            self.skipTest("C compiler is unavailable")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        # PWD and /bin/pwd -P agree only for a physical path.
+        self.root = Path(temporary.name).resolve()
+        cgroup = self.root / "cgroup"
+        execution = cgroup / "nvx-exec"
+        execution.mkdir(parents=True)
+        (cgroup / "cgroup.procs").touch()
+        (execution / "cgroup.procs").touch()
+        (execution / "cgroup.kill").touch()
+        (execution / "cgroup.events").write_text("populated 0\nfrozen 0\n")
+        tools = self.root / "bin"
+        tools.mkdir()
+        self.harness = self.root / "working-directory-test"
+        setpriv = tools / "setpriv"
+        setpriv.write_text(
+            "#!/bin/sh\n"
+            "while :; do\n"
+            '    case "$1" in\n'
+            "    --reuid | --regid) shift 2 ;;\n"
+            "    --*) shift ;;\n"
+            "    *) break ;;\n"
+            "    esac\n"
+            "done\n"
+            'if [ "$1" = /sbin/nvx-managed-agent ]; then\n'
+            "    shift\n"
+            f'    set -- {shlex.quote(str(self.harness))} "$@"\n'
+            "fi\n"
+            'if [ -n "${HARNESS_BEFORE_LAUNCH:-}" ]; then\n'
+            '    eval "$HARNESS_BEFORE_LAUNCH"\n'
+            "fi\n"
+            'exec "$@"\n'
+        )
+        setpriv.chmod(0o755)
+        source = self.root / "working-directory-test.c"
+        source.write_text(
+            f"""#define _GNU_SOURCE
+#include <stdlib.h>
+int harness_setenv(const char *name, const char *value, int overwrite);
+#define setenv(name, value, overwrite) harness_setenv(name, value, overwrite)
+#define CGROUP_ROOT {json.dumps(str(cgroup))}
+#define setgroups(size, list) harness_setgroups(size, list)
+#define setegid(gid) harness_setegid(gid)
+#define seteuid(uid) harness_seteuid(uid)
+#define main managed_agent_main
+#include {json.dumps(str(self.SOURCE))}
+#undef main
+
+int harness_setenv(const char *name, const char *value, int overwrite)
+{{
+    if (strcmp(name, "PWD") == 0 && getenv("HARNESS_FAIL_PWD") != NULL) {{
+        errno = ENOMEM;
+        return -1;
+    }}
+    return (setenv)(name, value, overwrite);
+}}
+
+int harness_setgroups(size_t size, const gid_t *list)
+{{
+    (void)size;
+    (void)list;
+    if (getenv("HARNESS_FAIL_SETGROUPS") != NULL) {{
+        errno = EPERM;
+        return -1;
+    }}
+    return 0;
+}}
+
+int harness_setegid(gid_t gid)
+{{
+    (void)gid;
+    return 0;
+}}
+
+int harness_seteuid(uid_t uid)
+{{
+    (void)uid;
+    return 0;
+}}
+
+int main(int argc, char **argv)
+{{
+    if (argc >= 2 && strcmp(argv[1], "--exec-config-fd") == 0) {{
+        return launch_workload(argc, argv);
+    }}
+
+    struct control_session session = {{.fd = STDOUT_FILENO}};
+    struct agent_config config = {{
+        .direct = 1,
+        .uid = "65534",
+        .gid = "65534",
+        .user = "nobody",
+        .home = "/",
+    }};
+    char *environment[] = {{getenv("HARNESS_ENVIRONMENT"), NULL}};
+    struct exec_config exec_config = {{
+        .cwd = argc == 3 ? argv[2] : NULL,
+        .environment = environment[0] == NULL ? NULL : environment,
+        .environment_count = environment[0] == NULL ? 0 : 1,
+        .environment_present = environment[0] != NULL,
+        .inherit_default_env =
+            environment[0] != NULL && getenv("HARNESS_LAYER_ENVIRONMENT") != NULL,
+    }};
+    char *command[] = {{"/bin/sh", "-c", argv[1], NULL}};
+
+    if (argc != 2 && argc != 3) {{
+        return 2;
+    }}
+    return run_exec(&session, &config, 42, 0, command, &exec_config) == 0 ? 0 : 1;
+}}
+""",
+            encoding="utf-8",
+        )
+        flags = [
+            flag
+            for flag in InitramfsBuildConstants.STATIC_HELPER_CFLAGS
+            if flag != "-static"
+        ]
+        result = subprocess.run(
+            [compiler, *flags, "-o", str(self.harness), str(source)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.environment = {
+            **os.environ,
+            "PATH": f"{tools}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
+        }
+        for name in (
+            "HARNESS_BEFORE_LAUNCH",
+            "HARNESS_ENVIRONMENT",
+            "HARNESS_FAIL_PWD",
+            "HARNESS_FAIL_SETGROUPS",
+            "HARNESS_LAYER_ENVIRONMENT",
+        ):
+            self.environment.pop(name, None)
+
+    def _exec(
+        self,
+        script: str,
+        cwd: str | None = None,
+        environment: dict[str, str] | None = None,
+    ) -> list[tuple[int, int, int, bytes]]:
+        """Runs one workload; returns the kind, request ID, status, and payload of each frame."""
+        arguments = [str(self.harness), script]
+        if cwd is not None:
+            arguments.append(cwd)
+        result = subprocess.run(
+            arguments,
+            capture_output=True,
+            timeout=30,
+            env=environment or self.environment,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        frames: list[tuple[int, int, int, bytes]] = []
+        rest = result.stdout
+        while rest:
+            _, _, record_type, _, _, _, _, length = self.OUTER.unpack(
+                rest[: self.OUTER.size]
+            )
+            payload = rest[self.OUTER.size : self.OUTER.size + length]
+            rest = rest[self.OUTER.size + length :]
+            self.assertEqual(record_type, 5)
+            _, _, kind, _, request_id, status, payload_len = self.APP.unpack(
+                payload[: self.APP.size]
+            )
+            body = payload[self.APP.size :]
+            self.assertEqual(payload_len, len(body))
+            frames.append((kind, request_id, status, body))
+        return frames
+
+    def _completed(self, frames: list[tuple[int, int, int, bytes]]) -> bytes:
+        """Returns the standard output of a workload that exited with status zero."""
+        self.assertEqual(frames[-1], (0x84, 42, 0, b"exit"), frames)
+        self.assertTrue(all(kind == 0x82 for kind, *_ in frames[:-1]), frames)
+        return b"".join(body for *_, body in frames[:-1])
+
+    def _refused(
+        self, frames: list[tuple[int, int, int, bytes]], cwd: str, error: int
+    ) -> None:
+        diagnostic = (
+            f"nvx-managed-agent: cannot enter working directory {cwd}: "
+            f"{os.strerror(error)}\n"
+        ).encode()
+        self.assertEqual(
+            frames,
+            [(0x83, 42, 0, diagnostic), (0xFF, 42, error, b"cwd-failed")],
+        )
+
+    def test_workloads_start_in_the_root_directory_by_default(self):
+        output = self._completed(self._exec('pwd; printf "%s\\n" "$PWD"'))
+        self.assertEqual(output, b"/\n/\n")
+
+    def test_workloads_start_in_the_requested_directory(self):
+        for name in ("a", "b"):
+            directory = self.root / "work" / name
+            directory.mkdir(parents=True)
+            with self.subTest(directory=directory):
+                output = self._completed(
+                    self._exec('pwd; printf "%s\\n" "$PWD"', str(directory))
+                )
+                self.assertEqual(output, f"{directory}\n{directory}\n".encode())
+
+    def test_pwd_keeps_the_requested_name_of_a_canonical_path(self):
+        target = self.root / "target"
+        target.mkdir()
+        link = self.root / "link"
+        link.symlink_to(target)
+        output = self._completed(self._exec("pwd; /bin/pwd -P", str(link)))
+        self.assertEqual(output, f"{link}\n{target}\n".encode())
+        # Without a canonical name, PWD names the directory itself.
+        output = self._completed(self._exec('printf "%s\\n" "$PWD"', f"{link}/."))
+        self.assertEqual(output, f"{target}\n".encode())
+
+    def test_unusable_directories_refuse_the_launch(self):
+        marker = self.root / "ran"
+        regular = self.root / "file"
+        regular.touch()
+        cases = [
+            (self.root / "missing", errno.ENOENT),
+            (regular, errno.ENOTDIR),
+        ]
+        # Root may search any directory, so only an unprivileged user observes EACCES.
+        if sys.platform == "linux" and os.geteuid() != 0:
+            locked = self.root / "locked"
+            locked.mkdir(mode=0)
+            self.addCleanup(locked.chmod, 0o755)
+            cases.append((locked, errno.EACCES))
+        for directory, error in cases:
+            with self.subTest(directory=directory):
+                frames = self._exec(f"touch {marker}", str(directory))
+                self._refused(frames, str(directory), error)
+                self.assertFalse(marker.exists())
+
+    def test_identity_failures_refuse_the_launch(self):
+        environment = {**self.environment, "HARNESS_FAIL_SETGROUPS": "1"}
+        frames = self._exec(f"touch {self.root / 'ran'}", None, environment)
+        self.assertEqual(frames, [(0xFF, 42, 125, b"launch-failed")])
+        self.assertFalse((self.root / "ran").exists())
+
+    def test_workloads_start_in_the_directory_that_was_checked(self):
+        checked = self.root / "checked"
+        retarget = self.root / "retarget"
+        renamed = self.root / "renamed"
+        checked.mkdir()
+        retarget.mkdir()
+        link = self.root / "link"
+        link.symlink_to(checked)
+        # Neither a retargeted link nor a renamed directory may fail the
+        # launch or move the workload to a directory that was not checked.
+        quote = shlex.quote
+        for cwd, change, expected in (
+            (link, f"ln -sfn {quote(str(retarget))} {quote(str(link))}", checked),
+            (retarget, f"mv {quote(str(retarget))} {quote(str(renamed))}", renamed),
+        ):
+            with self.subTest(cwd=cwd):
+                environment = {**self.environment, "HARNESS_BEFORE_LAUNCH": change}
+                frames = self._exec("/bin/pwd -P", str(cwd), environment)
+                self.assertEqual(self._completed(frames), f"{expected}\n".encode())
+
+    def test_pwd_failures_refuse_the_launch(self):
+        marker = self.root / "ran"
+        environment = {**self.environment, "HARNESS_FAIL_PWD": "1"}
+        for cwd in (None, str(self.root)):
+            with self.subTest(cwd=cwd):
+                frames = self._exec(f"touch {marker}", cwd, environment)
+                self.assertEqual(frames, [(0xFF, 42, 125, b"launch-failed")])
+                self.assertFalse(marker.exists())
+
+    def test_exact_environments_control_pwd(self):
+        # The agent leaves PWD to a request that replaces the environment, so
+        # it does not try to set PWD, and cannot fail to.
+        environment = {
+            **self.environment,
+            "HARNESS_ENVIRONMENT": "MODE=exact",
+            "HARNESS_FAIL_PWD": "1",
+        }
+        output = self._completed(
+            self._exec(
+                'printf "%s\\n" "$MODE"; /bin/pwd -P', str(self.root), environment
+            )
+        )
+        self.assertEqual(output, f"exact\n{self.root}\n".encode())
+
+    def test_layered_environments_keep_the_agents_pwd(self):
+        # Entries layered over the default environment keep the PWD that the
+        # agent points at the directory, which, unlike a PWD that the shell
+        # computes, names a link as the request did.
+        target = self.root / "target"
+        target.mkdir()
+        link = self.root / "link"
+        link.symlink_to(target)
+        layered = {
+            **self.environment,
+            "HARNESS_ENVIRONMENT": "MODE=layered",
+            "HARNESS_LAYER_ENVIRONMENT": "1",
+        }
+        output = self._completed(
+            self._exec('printf "%s %s\\n" "$MODE" "$PWD"', str(link), layered)
+        )
+        self.assertEqual(output, f"layered {link}\n".encode())
+        frames = self._exec("true", str(link), {**layered, "HARNESS_FAIL_PWD": "1"})
+        self.assertEqual(frames, [(0xFF, 42, 125, b"launch-failed")])
 
 
 class AciSandboxRunnerTests(unittest.TestCase):

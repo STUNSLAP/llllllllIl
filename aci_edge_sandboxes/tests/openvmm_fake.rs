@@ -652,6 +652,87 @@ fn workload_outcomes_are_distinguished() {
 }
 
 #[test]
+fn working_directories_apply_to_each_execution() {
+    let fixture = Fixture::new();
+    let nvx = fixture.nvx();
+    let sandbox_id = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
+    nvx.start(&sandbox_id).unwrap();
+    let pwd = |cwd: Option<&str>| {
+        let request = ExecRequest::argv(["/bin/pwd"]);
+        let request = match cwd {
+            Some(cwd) => request.with_cwd(cwd),
+            None => request,
+        };
+        nvx.exec(&sandbox_id, &request)
+            .unwrap()
+            .wait_with_output()
+            .unwrap()
+    };
+
+    // Without a working directory, a workload starts in the guest's root directory.
+    assert_eq!(pwd(None).stdout, b"/\n");
+    assert!(
+        run(&nvx, &sandbox_id, "mkdir /work/a; mkdir /work/b")
+            .outcome
+            .success()
+    );
+    // Each execution starts in its own directory, and none carries over to the next.
+    for (cwd, expected) in [
+        (Some("/work/a"), "/work/a\n"),
+        (Some("/work/b"), "/work/b\n"),
+        (None, "/\n"),
+        (Some("/work/a"), "/work/a\n"),
+    ] {
+        let output = pwd(cwd);
+        assert_eq!(
+            output.outcome,
+            ExecOutcome::Exited(0),
+            "{cwd:?}: {output:?}"
+        );
+        assert_eq!(output.stdout, expected.as_bytes(), "{cwd:?}");
+    }
+    let shell = nvx
+        .exec(
+            &sandbox_id,
+            &ExecRequest::command_line("pwd").with_cwd("/work/b"),
+        )
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(shell.stdout, b"/work/b\n");
+
+    // A missing directory fails the launch with a diagnostic instead of running elsewhere.
+    let missing = nvx
+        .exec(
+            &sandbox_id,
+            &ExecRequest::command_line("write ran yes").with_cwd("/work/missing"),
+        )
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(
+        missing.outcome,
+        ExecOutcome::Failed(ExecFailure::WorkingDirectory)
+    );
+    assert!(
+        missing.outcome.to_string().contains("working directory"),
+        "{}",
+        missing.outcome
+    );
+    assert!(missing.stdout.is_empty());
+    let diagnostic = String::from_utf8(missing.stderr).unwrap();
+    assert!(
+        diagnostic.contains("/work/missing") && diagnostic.contains("No such file or directory"),
+        "{diagnostic}"
+    );
+    assert!(run(&nvx, &sandbox_id, "read ran").stdout.is_empty());
+    assert_eq!(pwd(Some("/work/b")).stdout, b"/work/b\n");
+
+    nvx.stop(&sandbox_id).unwrap();
+    nvx.deprovision(&sandbox_id).unwrap();
+}
+
+#[test]
 fn unsupported_requests_are_rejected_before_anything_runs() {
     let fixture = Fixture::new();
     let nvx = fixture.nvx();
@@ -706,6 +787,7 @@ fn unsupported_requests_are_rejected_before_anything_runs() {
     for request in [
         write().with_cwd("relative"),
         write().with_envs(["KEY=one", "KEY=two"]),
+        write().with_cwd(format!("/{}", "d".repeat(4095))),
         write().with_stdin(StdinMode::Piped),
         write().with_timeout(Duration::from_secs(2 * 60 * 60)),
         write().with_env(format!("BIG={}", "x".repeat(5000))),
@@ -849,6 +931,7 @@ fn guests_without_the_required_features_are_refused() {
         "workload accounts",
         "workload containment",
         "per-execution environments",
+        "working directories",
     ] {
         assert!(error.message().contains(feature), "{error}");
     }
@@ -867,6 +950,20 @@ fn guests_without_the_required_features_are_refused() {
             .unwrap_err()
             .code(),
         ErrorCode::NotStarted
+    );
+
+    // This guest agent predates working directories, so it would start workloads elsewhere. It
+    // provides every other required feature.
+    let without_cwd = fixture.nvx_with(|config| {
+        config.kernel_command_line = "fake_guest_features=31".to_owned();
+    });
+    let error = without_cwd.start(&sandbox_id).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::BackendUnavailable, "{error}");
+    assert!(
+        error
+            .message()
+            .contains("the openvmm backend needs (working directories)"),
+        "{error}"
     );
 
     let current = fixture.nvx();
@@ -1186,6 +1283,58 @@ fn filesystem_and_network_policies_reach_openvmm() {
         .wait_with_output()
         .unwrap();
     assert_eq!(pwd.stdout, format!("{guest}\n").into_bytes());
+    nvx.stop(&sandbox_id).unwrap();
+    nvx.deprovision(&sandbox_id).unwrap();
+}
+
+#[test]
+fn mapped_files_are_not_working_directories() {
+    let fixture = Fixture::new();
+    let nvx = fixture.nvx();
+    let work = fixture.directory.path().join("work");
+    fs::create_dir_all(work.join("out")).unwrap();
+    fs::write(work.join("notes.txt"), b"notes").unwrap();
+    let request = ProvisionRequest::new().with_filesystem(FilesystemPolicy {
+        readonly_paths: vec![work.join("notes.txt")],
+        readwrite_paths: vec![work.join("out")],
+        denied_paths: Vec::new(),
+    });
+    let sandbox_id = nvx.provision(&request).unwrap().sandbox_id;
+    nvx.start(&sandbox_id).unwrap();
+    let guest = |name: &str| aci_edge_sandboxes::openvmm::resolve_guest_path(&work.join(name));
+
+    let out = guest("out").unwrap();
+    let directory = nvx
+        .exec(
+            &sandbox_id,
+            &ExecRequest::command_line("pwd").with_cwd(out.clone()),
+        )
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(directory.stdout, format!("{out}\n").into_bytes());
+
+    // As in the guest, a mapped regular file is no working directory, and nothing runs.
+    let notes = guest("notes.txt").unwrap();
+    let file = nvx
+        .exec(
+            &sandbox_id,
+            &ExecRequest::command_line("write ran yes").with_cwd(notes.clone()),
+        )
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(
+        file.outcome,
+        ExecOutcome::Failed(ExecFailure::WorkingDirectory)
+    );
+    let diagnostic = String::from_utf8(file.stderr).unwrap();
+    assert!(
+        diagnostic.contains(&format!("working directory {notes}: Not a directory")),
+        "{diagnostic}"
+    );
+    assert!(run(&nvx, &sandbox_id, "read ran").stdout.is_empty());
+
     nvx.stop(&sandbox_id).unwrap();
     nvx.deprovision(&sandbox_id).unwrap();
 }
