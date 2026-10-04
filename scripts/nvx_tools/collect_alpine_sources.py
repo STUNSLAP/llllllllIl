@@ -9,6 +9,7 @@ import re
 import subprocess
 import tarfile
 from pathlib import Path
+from typing import cast
 
 from .build_constants import (
     AlpineBuildConstants,
@@ -55,7 +56,15 @@ def _load_packages(paths: list[Path]) -> tuple[str, str, list[dict[str, object]]
     architecture = None
     packages: dict[tuple[str, str], dict[str, object]] = {}
     for path in paths:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise SourceError(f"cannot read Alpine package manifest {path}") from error
+        if not isinstance(document, dict):
+            raise SourceError(
+                f"Alpine package manifest {path} must contain a JSON object"
+            )
+        document = cast(dict[str, object], document)
         guest = document.get("guest", AlpineBuildConstants.GUEST_NAME)
         if guest != AlpineBuildConstants.GUEST_NAME:
             raise SourceError(
@@ -72,7 +81,8 @@ def _load_packages(paths: list[Path]) -> tuple[str, str, list[dict[str, object]]
             raise SourceError("package manifests use different architectures")
         branch = str(current_branch)
         architecture = str(current_architecture)
-        for package in document["packages"]:
+        for raw_package in cast(list[object], document["packages"]):
+            package = cast(dict[str, object], raw_package)
             key = (str(package["name"]), str(package["version"]))
             packages[key] = package
     if not packages:
