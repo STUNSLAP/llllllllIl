@@ -3789,6 +3789,22 @@ class UbuntuSourceCollectionTests(unittest.TestCase):
         self.assertIn("cannot read Ubuntu package manifest", str(context.exception))
 
 
+class AlpineSourceCollectionTests(unittest.TestCase):
+    def test_malformed_package_manifest_is_reported_as_source_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for contents in ("{", "[]"):
+                manifest = Path(temporary) / "packages.json"
+                manifest.write_text(contents, encoding="utf-8")
+
+                with (
+                    self.subTest(contents=contents),
+                    self.assertRaises(collect_alpine_sources.SourceError) as context,
+                ):
+                    collect_alpine_sources._load_packages([manifest])
+
+                self.assertIn("package manifest", str(context.exception))
+
+
 class BuildTests(unittest.TestCase):
     def test_build_config_owns_standard_runtime_paths(self):
         config = build_config.BuildConfig()
