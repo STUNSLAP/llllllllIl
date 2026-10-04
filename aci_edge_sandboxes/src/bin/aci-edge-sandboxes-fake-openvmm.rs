@@ -9,7 +9,8 @@
 //! or `printenv` in any directory, which prints its environment. A script is a `;`-separated
 //! list of commands: `echo TEXT`, `echoerr TEXT`, `sleep MS`, `exit CODE`, `signal NUMBER`,
 //! `flood BYTES`, `write KEY VALUE`, `read KEY`, `mkdir DIRECTORY`, `env`, `printenv NAME`,
-//! `pwd`, `fail`, and `launchfail`. Values written with `write` and directories made with
+//! `pwd`, `fail`, and `launchfail`. Like `sh`, a script exits with the status of its last
+//! command; `printenv NAME` prints nothing and fails with status 1 when `NAME` is unset. Values written with `write` and directories made with
 //! `mkdir` live in memory until the VM stops, like files in the guest's RAM root file system.
 //! A `CANCEL` request ends a sleeping workload with the cancelled outcome, and a client that
 //! disconnects during an exec abandons it, as the real guest agent does. `pwd` prints the
@@ -719,6 +720,7 @@ impl<S: Read + Write + Pending> Session<'_, S> {
         let started = Instant::now();
         let limit = (timeout_ms > 0).then(|| started + Duration::from_millis(timeout_ms.into()));
         let mut output = 0usize;
+        let mut status = 0;
         for command in script
             .split(';')
             .map(str::trim)
@@ -727,6 +729,7 @@ impl<S: Read + Write + Pending> Session<'_, S> {
             let (name, argument) = command
                 .split_once(' ')
                 .map_or((command, ""), |(name, argument)| (name, argument.trim()));
+            status = 0;
             match name {
                 "echo" | "echoerr" => {
                     let line = format!("{argument}\n");
@@ -802,10 +805,18 @@ impl<S: Read + Write + Pending> Session<'_, S> {
                         .iter()
                         .find(|(variable, _)| variable == argument)
                         .map(|(_, value)| format!("{value}\n"));
-                    if let Some(line) = value
-                        && !self.forward(APP_STDOUT, request_id, &mut output, line.as_bytes())?
-                    {
-                        return self.send_some(APP_EXIT, request_id, 125, b"output-limit");
+                    match value {
+                        Some(line) => {
+                            if !self.forward(
+                                APP_STDOUT,
+                                request_id,
+                                &mut output,
+                                line.as_bytes(),
+                            )? {
+                                return self.send_some(APP_EXIT, request_id, 125, b"output-limit");
+                            }
+                        }
+                        None => status = 1,
                     }
                 }
                 "pwd" => {
@@ -824,7 +835,7 @@ impl<S: Read + Write + Pending> Session<'_, S> {
                 }
             }
         }
-        self.send_some(APP_EXIT, request_id, 0, b"exit")
+        self.send_some(APP_EXIT, request_id, status, b"exit")
     }
 
     fn send_some(
