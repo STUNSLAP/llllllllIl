@@ -11,8 +11,9 @@
 //! - **start** launches a detached OpenVMM process with the managed lifecycle, passes it a fresh
 //!   32-byte capability through standard input, and waits until the guest agent answers on the
 //!   authenticated control console. The agent must also advertise the control features this
-//!   backend depends on (cancellation, host path mappings, workload accounts, and workload
-//!   containment). A guest image that lacks one is terminated and start fails with
+//!   backend depends on (cancellation, host path mappings, workload accounts, workload
+//!   containment, and per-execution environments). A guest image that lacks one is terminated and
+//!   start fails with
 //!   [`ErrorCode::BackendUnavailable`](crate::ErrorCode::BackendUnavailable), because such an
 //!   image would silently ignore the policy or request that needs the feature.
 //! - **exec** runs the workload through the control console and streams its output live.
@@ -33,9 +34,9 @@
 //! | `network.ingress`, `hostLoopback` | `deny` only | n/a |
 //! | `microvm.provision.memoryMib` | applied | n/a |
 //! | `process.commandLine` | n/a | run as `/bin/sh -c <commandLine>`, at most 4096 bytes |
-//! | `process.cwd` | n/a | an absolute guest path, entered before the workload runs |
+//! | `process.cwd` | n/a | an absolute guest path that the guest agent enters before the workload starts |
 //! | `process.timeout` | n/a | up to one hour |
-//! | `process.env` | n/a | rejected; `inheritDefaultEnv` without `env` is ignored |
+//! | `process.env`, `inheritDefaultEnv` | n/a | applied per execution; see [Environment](#environment) |
 //! | piped stdin | n/a | rejected |
 //!
 //! Host paths share OpenVMM's single virtio-fs export: the backend exports the deepest directory
@@ -46,7 +47,27 @@
 //! attaches no network device. Workloads run as the fixed non-root identity of
 //! [`OpenVmmConfig::workload_uid`] and [`OpenVmmConfig::workload_gid`] (see
 //! [`OpenVmmConfig::map_host_identity`] for Linux hosts) with no capabilities, read end-of-file on
-//! standard input, and may produce at most 1 MiB of combined output.
+//! standard input, and may produce at most 1 MiB of combined output. A working directory that is
+//! missing, or that the workload identity cannot enter, ends the workload with status 125 before
+//! it runs.
+//!
+//! # Environment
+//!
+//! Each execution starts from its own environment, so nothing carries over from an earlier one.
+//! Without `process.env`, the workload gets the guest's default environment: `PATH`, `TERM`, and
+//! the `HOME`, `USER`, and `LOGNAME` of the workload identity, plus a few variables that the
+//! guest's boot leaves behind. It never holds the host's variables. Supplied entries, even an
+//! empty list, are the complete environment, unless `inheritDefaultEnv` is true, which layers
+//! them over the default one, each entry replacing the default variable of the same name.
+//! Without `process.env`, `inheritDefaultEnv` has no effect.
+//!
+//! The exec request carries the entries, at most 256 with unique names, in a field of their own,
+//! next to the working directory and the arguments. The guest agent applies them and enters the
+//! working directory after it has dropped the workload's privileges, just before it starts the
+//! program, so a `process.argv` program receives exactly the requested environment. A
+//! `process.commandLine` runs in `/bin/sh`, and that shell is the workload, so it exports
+//! variables of its own: BusyBox's `sh` sets `SHLVL` and `PWD`, also when an entry has one of
+//! those names.
 //!
 //! # Concurrency and cancellation
 //!
@@ -87,7 +108,7 @@ pub use self::config::{Hypervisor, OpenVmmConfig};
 pub use self::filesystem::{guest_path, resolve_guest_path};
 use self::protocol::{
     CAPABILITY_LEN, ExitCategory, GuestFeatures, MAX_ARGUMENT_BYTES, MAX_OUTPUT_BYTES,
-    MAX_TIMEOUT_MS,
+    MAX_TIMEOUT_MS, Workload, WorkloadEnvironment,
 };
 use self::session::{ControlSession, ExecEvent, SessionError};
 use self::state::{
@@ -292,54 +313,23 @@ impl OpenVmmBackend {
     }
 }
 
-/// Shell prelude that enters the working directory passed as `$1`. A missing directory ends the
-/// workload with status 125 before it runs.
-const CWD_PRELUDE: &str = "cd -- \"$1\" || exit 125\nshift\n";
-
 fn workload_argv(process: &ProcessSpec) -> Result<Vec<String>> {
-    let too_long = || {
-        Error::policy_validation(format!(
-            "process.commandLine exceeds the {MAX_ARGUMENT_BYTES}-byte limit of the openvmm \
-             backend"
-        ))
-    };
-    let Some(cwd) = &process.cwd else {
-        return Ok(match &process.command {
-            Command::CommandLine(command_line) => {
-                if command_line.len() > MAX_ARGUMENT_BYTES {
-                    return Err(too_long());
-                }
-                vec![SHELL.to_owned(), "-c".to_owned(), command_line.clone()]
-            }
-            Command::Argv(argv) => argv.clone(),
-        });
-    };
-    if !cwd.starts_with('/') {
-        return Err(Error::policy_validation(format!(
-            "process.cwd {cwd:?} must be an absolute guest path; map host paths with \
-             openvmm::guest_path"
-        )));
-    }
-    // The guest agent has no working-directory field, so a shell enters the directory first.
-    let mut argv = vec![SHELL.to_owned(), "-c".to_owned()];
     match &process.command {
         Command::CommandLine(command_line) => {
-            let script = format!("{CWD_PRELUDE}{command_line}");
-            if script.len() > MAX_ARGUMENT_BYTES {
-                return Err(too_long());
+            if command_line.len() > MAX_ARGUMENT_BYTES {
+                return Err(Error::policy_validation(format!(
+                    "process.commandLine exceeds the {MAX_ARGUMENT_BYTES}-byte limit of the \
+                     openvmm backend"
+                )));
             }
-            argv.extend([script, SHELL.to_owned(), cwd.clone()]);
-        }
-        Command::Argv(command) => {
-            argv.extend([
-                format!("{CWD_PRELUDE}exec \"$@\""),
+            Ok(vec![
                 SHELL.to_owned(),
-                cwd.clone(),
-            ]);
-            argv.extend(command.iter().cloned());
+                "-c".to_owned(),
+                command_line.clone(),
+            ])
         }
+        Command::Argv(argv) => Ok(argv.clone()),
     }
-    Ok(argv)
 }
 
 fn exec_timeout_ms(process: &ProcessSpec) -> Result<u32> {
@@ -354,20 +344,34 @@ fn exec_timeout_ms(process: &ProcessSpec) -> Result<u32> {
         })
 }
 
-fn prepare_exec(process: &ProcessSpec) -> Result<(Vec<String>, u32)> {
-    let argv = workload_argv(process)?;
-    let timeout_ms = exec_timeout_ms(process)?;
-    let validate = |arguments: &[String]| {
-        protocol::encode_exec_payload(arguments, timeout_ms)
-            .map(|_| ())
-            .map_err(|error| Error::policy_validation(error.0))
-    };
-    // The cwd wrapper's /bin/sh must not hide an invalid program in the original argv.
-    if let Command::Argv(arguments) = &process.command {
-        validate(arguments)?;
+/// Returns the workload that the guest agent runs for `process`, after checking it against the
+/// limits of the agent's exec request.
+///
+/// The working directory and the environment travel in fields of their own, which the agent
+/// applies just before it starts the program, so no shell runs in front of a `process.argv`
+/// program.
+fn prepare_exec(process: &ProcessSpec) -> Result<Workload<'_>> {
+    if let Some(cwd) = &process.cwd
+        && !cwd.starts_with('/')
+    {
+        return Err(Error::policy_validation(format!(
+            "process.cwd {cwd:?} must be an absolute guest path; map host paths with \
+             openvmm::guest_path"
+        )));
     }
-    validate(&argv)?;
-    Ok((argv, timeout_ms))
+    let environment = match (&process.env, process.inherit_default_env) {
+        (None, _) => WorkloadEnvironment::Default,
+        (Some(entries), Some(true)) => WorkloadEnvironment::Layered(entries),
+        (Some(entries), _) => WorkloadEnvironment::Replaced(entries),
+    };
+    let workload = Workload {
+        argv: workload_argv(process)?,
+        timeout_ms: exec_timeout_ms(process)?,
+        cwd: process.cwd.as_deref(),
+        environment,
+    };
+    protocol::encode_exec_payload(&workload).map_err(|error| Error::policy_validation(error.0))?;
+    Ok(workload)
 }
 
 /// Returns the calling user's IDs when workloads that map host paths should use them; see
@@ -431,6 +435,8 @@ impl Backend for OpenVmmBackend {
         capabilities.exec.command_line = true;
         capabilities.exec.argv = true;
         capabilities.exec.cancel = true;
+        capabilities.exec.env = true;
+        capabilities.exec.clear_default_env = true;
         capabilities.exec.max_timeout_ms = Some(MAX_TIMEOUT_MS.into());
         capabilities.exec.max_output_bytes = Some(MAX_OUTPUT_BYTES as u64);
         capabilities.network.egress_allow = true;
@@ -654,7 +660,7 @@ impl Backend for OpenVmmBackend {
         request: &ExecRequest,
         io: ExecIo,
     ) -> Result<Box<dyn ExecControl>> {
-        let (argv, timeout_ms) = prepare_exec(&request.process)?;
+        let workload = prepare_exec(&request.process)?;
         let (runtime, capability) = {
             let _guard = self.store.lock(sandbox_id)?;
             self.store.load(sandbox_id)?;
@@ -676,8 +682,9 @@ impl Backend for OpenVmmBackend {
                 .and_then(|transport| ControlSession::attach(transport, &capability, deadline))
                 .map_err(|error| self.session_error(sandbox_id, error))?;
         let request_id = session
-            .start_exec(&argv, timeout_ms, deadline)
+            .start_exec(&workload, deadline)
             .map_err(|error| self.session_error(sandbox_id, error))?;
+        let timeout_ms = workload.timeout_ms;
         let response_deadline = (timeout_ms > 0).then(|| {
             Instant::now()
                 + Duration::from_millis(timeout_ms.into())
@@ -914,35 +921,72 @@ mod tests {
     }
 
     #[test]
-    fn working_directories_are_entered_by_a_shell() {
+    fn working_directories_are_entered_by_the_guest_agent() {
+        // No shell runs in front of the workload, so a program keeps its exact environment.
+        let request = ExecRequest::argv(["/bin/ls", "-l"])
+            .with_cwd("/tmp")
+            .with_envs(["FOO=bar"]);
+        let workload = prepare_exec(&request.process).unwrap();
+        assert_eq!(workload.argv, ["/bin/ls", "-l"]);
+        assert_eq!(workload.cwd, Some("/tmp"));
         let request = ExecRequest::command_line("pwd").with_cwd("/mnt/c/work");
+        let workload = prepare_exec(&request.process).unwrap();
+        assert_eq!(workload.argv, ["/bin/sh", "-c", "pwd"]);
+        assert_eq!(workload.cwd, Some("/mnt/c/work"));
         assert_eq!(
-            workload_argv(&request.process).unwrap(),
-            [
-                "/bin/sh",
-                "-c",
-                "cd -- \"$1\" || exit 125\nshift\npwd",
-                "/bin/sh",
-                "/mnt/c/work",
-            ]
+            prepare_exec(&ExecRequest::command_line("pwd").process)
+                .unwrap()
+                .cwd,
+            None
         );
-        let request = ExecRequest::argv(["/bin/ls", "-l"]).with_cwd("/tmp");
+        for relative in [r"C:\work", "work"] {
+            let request = ExecRequest::command_line("pwd").with_cwd(relative);
+            let error = prepare_exec(&request.process).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::PolicyValidation);
+            assert!(error.message().contains("openvmm::guest_path"), "{error}");
+        }
+    }
+
+    #[test]
+    fn environments_select_their_mode_from_inherit_default_env() {
+        let entries = vec!["FOO=bar".to_owned()];
+        let environment = |request: ExecRequest| {
+            let workload = prepare_exec(&request.process).unwrap();
+            match workload.environment {
+                WorkloadEnvironment::Default => "default",
+                WorkloadEnvironment::Replaced(replaced) if replaced == entries => "replaced",
+                WorkloadEnvironment::Layered(layered) if layered == entries => "layered",
+                other => panic!("unexpected environment {other:?}"),
+            }
+        };
+        let env = || ExecRequest::argv(["/usr/bin/env"]);
+        assert_eq!(environment(env()), "default");
+        assert_eq!(environment(env().with_inherit_default_env(true)), "default");
         assert_eq!(
-            workload_argv(&request.process).unwrap(),
-            [
-                "/bin/sh",
-                "-c",
-                "cd -- \"$1\" || exit 125\nshift\nexec \"$@\"",
-                "/bin/sh",
-                "/tmp",
-                "/bin/ls",
-                "-l",
-            ]
+            environment(env().with_inherit_default_env(false)),
+            "default"
         );
-        let relative = ExecRequest::command_line("pwd").with_cwd(r"C:\work");
+        assert_eq!(environment(env().with_envs(entries.clone())), "replaced");
         assert_eq!(
-            workload_argv(&relative.process).unwrap_err().code(),
-            ErrorCode::PolicyValidation
+            environment(
+                env()
+                    .with_envs(entries.clone())
+                    .with_inherit_default_env(false)
+            ),
+            "replaced"
+        );
+        assert_eq!(
+            environment(
+                env()
+                    .with_envs(entries.clone())
+                    .with_inherit_default_env(true)
+            ),
+            "layered"
+        );
+        let empty = env().with_envs(Vec::<String>::new());
+        assert_eq!(
+            prepare_exec(&empty.process).unwrap().environment,
+            WorkloadEnvironment::Replaced(&[])
         );
     }
 

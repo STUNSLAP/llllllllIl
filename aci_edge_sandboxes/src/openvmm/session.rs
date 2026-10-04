@@ -10,7 +10,7 @@ use super::protocol::{
     self, APP_CANCEL, APP_ERROR, APP_EXEC, APP_EXIT, APP_FEATURES, APP_PING, APP_READY, APP_STDERR,
     APP_STDOUT, APP_STOP, APP_STOPPED, CAPABILITY_LEN, ExitCategory, GuestFeatures, OUTER_DATA,
     OUTER_ERROR, OUTER_HEADER_LEN, OUTER_HOST_ATTACH, OUTER_READY, OUTER_RESET, OUTER_WAIT,
-    OuterHeader, ProtocolError, UNSUPPORTED_OPERATION,
+    OuterHeader, ProtocolError, UNSUPPORTED_OPERATION, Workload,
 };
 
 /// Failure of a control session.
@@ -207,11 +207,10 @@ impl ControlSession {
     /// Starts a workload and returns the request ID that identifies its events.
     pub(crate) fn start_exec(
         &mut self,
-        argv: &[String],
-        timeout_ms: u32,
+        workload: &Workload<'_>,
         deadline: Instant,
     ) -> Result<u64, SessionError> {
-        let payload = protocol::encode_exec_payload(argv, timeout_ms)?;
+        let payload = protocol::encode_exec_payload(workload)?;
         let request_id = request_id()?;
         self.send_app(APP_EXEC, request_id, &payload, Some(deadline))?;
         Ok(request_id)
@@ -387,7 +386,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::openvmm::protocol::{decode_app, decode_outer_header, encode_app, encode_outer};
+    use crate::openvmm::protocol::{
+        WorkloadEnvironment, decode_app, decode_outer_header, encode_app, encode_outer,
+    };
 
     const INSTANCE: [u8; 16] = [7; 16];
 
@@ -519,8 +520,13 @@ mod tests {
         let (transport, output) = scripted(&[outer(OUTER_READY, 1, 0, &[])]);
         let mut session =
             ControlSession::attach(transport, &[1; CAPABILITY_LEN], deadline()).unwrap();
-        let argv = ["/bin/sh".to_owned(), "-c".to_owned(), "echo hi".to_owned()];
-        let request_id = session.start_exec(&argv, 1000, deadline()).unwrap();
+        let workload = Workload {
+            argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
+            timeout_ms: 1000,
+            cwd: None,
+            environment: WorkloadEnvironment::Default,
+        };
+        let request_id = session.start_exec(&workload, deadline()).unwrap();
         let records = host_records(&output.lock().unwrap());
         let (record_type, sequence, frame) = &records[1];
         assert_eq!((*record_type, *sequence), (OUTER_DATA, 0));

@@ -9,7 +9,7 @@ use std::time::Duration;
 use aci_edge_sandboxes::openvmm::{Hypervisor, OpenVmmConfig};
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, ErrorCode, ExecIo, ExecRequest, FilesystemPolicy, NetworkPolicy,
-    NetworkPort, NetworkRule, OutputSink, Protocol, ProvisionRequest, SandboxId,
+    NetworkPort, NetworkRule, OutputSink, Protocol, ProvisionRequest, SandboxId, StdinMode,
 };
 
 fn config(directory: &tempfile::TempDir) -> OpenVmmConfig {
@@ -75,6 +75,18 @@ fn assert_exec_rejected(client: &AciEdgeSandbox, request: &ExecRequest) {
     assert_eq!(error.code(), ErrorCode::PolicyValidation);
 }
 
+/// `count` entries with unique names.
+fn entries(count: usize) -> Vec<String> {
+    (0..count).map(|index| format!("V{index}=x")).collect()
+}
+
+/// `count` entries with unique names of about 4 KiB each.
+fn large_entries(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("V{index:02}={}", "x".repeat(4000)))
+        .collect()
+}
+
 #[test]
 fn exec_validation_and_execution_share_guest_policy_checks() {
     let (directory, client) = client();
@@ -82,14 +94,24 @@ fn exec_validation_and_execution_share_guest_policy_checks() {
     for request in [
         ExecRequest::argv(["relative-program"]),
         ExecRequest::argv(["relative-program"]).with_cwd("/tmp"),
+        ExecRequest::argv(["relative-program"]).with_env("KEY=value"),
         ExecRequest::command_line("pwd").with_cwd("relative"),
         ExecRequest::command_line("x".repeat(4097)),
+        ExecRequest::command_line("x".repeat(4097)).with_cwd("/tmp"),
         ExecRequest::argv(["/bin/echo".to_owned(), "x".repeat(4097)]),
         ExecRequest::argv(vec!["/bin/true"; 65]),
-        ExecRequest::argv(vec!["/bin/true"; 60]).with_cwd("/tmp"),
+        ExecRequest::argv(vec!["/bin/true"; 65]).with_cwd("/tmp"),
         ExecRequest::argv(["/bin/echo".to_owned(), "x".repeat(4097)]).with_cwd("/tmp"),
         ExecRequest::command_line("true").with_cwd(format!("/{}", "x".repeat(4096))),
         ExecRequest::command_line("true").with_timeout(Duration::from_millis(3_600_001)),
+        ExecRequest::command_line("true").with_envs(entries(257)),
+        ExecRequest::command_line("true")
+            .with_envs(entries(257))
+            .with_inherit_default_env(true),
+        ExecRequest::command_line("true").with_envs(["KEY=one", "KEY=two"]),
+        ExecRequest::command_line("true").with_env(format!("A={}", "x".repeat(4095))),
+        // The whole request shares one 64 KiB control record.
+        ExecRequest::command_line("true").with_envs(large_entries(17)),
     ] {
         assert_exec_rejected(&client, &request);
     }
@@ -100,23 +122,36 @@ fn exec_validation_and_execution_share_guest_policy_checks() {
 fn exec_validation_accepts_the_exact_guest_limits() {
     let (directory, client) = client();
     let before = state_entries(&directory);
-    let cwd_prelude = "cd -- \"$1\" || exit 125\nshift\n";
+    // The working directory and the environment travel in fields of their own, so neither takes
+    // anything from the limits of the arguments.
     for request in [
         ExecRequest::command_line("x".repeat(4096)),
         ExecRequest::argv(["/bin/echo".to_owned(), "x".repeat(4096)]),
         ExecRequest::argv(vec!["/bin/true"; 64]),
-        ExecRequest::argv(vec!["/bin/true"; 59]).with_cwd("/tmp"),
-        ExecRequest::command_line("x".repeat(4096 - cwd_prelude.len())).with_cwd("/tmp"),
+        ExecRequest::argv(vec!["/bin/true"; 64]).with_cwd("/tmp"),
+        ExecRequest::command_line("x".repeat(4096)).with_cwd("/tmp"),
         ExecRequest::command_line("true").with_cwd(format!("/{}", "x".repeat(4095))),
         ExecRequest::command_line("true").with_timeout(Duration::from_millis(3_600_000)),
+        ExecRequest::command_line("true").with_envs(entries(256)),
+        ExecRequest::command_line("true")
+            .with_envs(entries(256))
+            .with_inherit_default_env(true),
+        ExecRequest::argv(vec!["/bin/true"; 64])
+            .with_cwd(format!("/{}", "x".repeat(4095)))
+            .with_envs(entries(256)),
+        ExecRequest::command_line("x".repeat(4096))
+            .with_cwd("/tmp")
+            .with_env("A=b"),
+        ExecRequest::command_line("true").with_env(format!("A={}", "x".repeat(4094))),
+        ExecRequest::command_line("true").with_envs(large_entries(15)),
+        ExecRequest::command_line("true").with_envs(Vec::<String>::new()),
+        ExecRequest::command_line("true")
+            .with_envs(Vec::<String>::new())
+            .with_inherit_default_env(true),
     ] {
         client.validate_exec(&request).unwrap();
         client.backend().validate_exec(&request).unwrap();
     }
-    assert_exec_rejected(
-        &client,
-        &ExecRequest::command_line("x".repeat(4097 - cwd_prelude.len())).with_cwd("/tmp"),
-    );
     assert_eq!(state_entries(&directory), before);
 }
 
@@ -219,7 +254,18 @@ fn structural_and_capability_errors_precede_backend_policy_checks() {
     let request = ExecRequest::argv(["relative-program"]).with_env("KEY=value");
     let error = client.validate_exec(&request).unwrap_err();
     assert_eq!(error.code(), ErrorCode::PolicyValidation);
-    assert!(error.message().contains("process.env"));
+    assert!(error.message().contains("absolute guest path"));
+    // An unsupported feature is a capability error, which precedes the program check.
+    let request = ExecRequest::argv(["relative-program"]).with_stdin(StdinMode::Piped);
+    let error = client.validate_exec(&request).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::PolicyValidation);
+    assert!(error.message().contains("standard input"), "{error}");
+    // A malformed entry is a structural error, which precedes the program check too.
+    let request = ExecRequest::argv(["relative-program"]).with_env("KEY");
+    assert_eq!(
+        client.validate_exec(&request).unwrap_err().code(),
+        ErrorCode::MalformedRequest
+    );
     assert_eq!(
         client
             .validate_provision(&ProvisionRequest::new().with_memory_mib(0))

@@ -4,6 +4,7 @@
 //! client and the guest agent. Data records carry application frames (magic `NVXC`) that belong
 //! to the guest agent in `guest/common/nvx-managed-agent.c`. All integers are little-endian.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 pub(crate) const OUTER_MAGIC: [u8; 4] = *b"NVXS";
@@ -43,10 +44,17 @@ pub(crate) const CAPABILITY_LEN: usize = 32;
 pub(crate) const MAX_ARGUMENTS: usize = 64;
 /// Largest encoded size of one workload argument.
 pub(crate) const MAX_ARGUMENT_BYTES: usize = 4096;
+/// Largest number of workload environment entries.
+pub(crate) const MAX_ENVIRONMENT: usize = 256;
 /// Largest workload timeout the guest agent accepts.
 pub(crate) const MAX_TIMEOUT_MS: u32 = 60 * 60 * 1000;
 /// Largest combined stdout and stderr volume the guest agent forwards for one execution.
 pub(crate) const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+
+const EXEC_EXTENDED: u16 = 1;
+const EXEC_CWD_PRESENT: u16 = 1 << 0;
+const EXEC_ENVIRONMENT_PRESENT: u16 = 1 << 1;
+const EXEC_INHERIT_DEFAULT_ENV: u16 = 1 << 2;
 
 /// Protocol violation detected while encoding or decoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,15 +178,42 @@ pub(crate) fn decode_app(frame: &[u8]) -> Result<AppFrame<'_>, ProtocolError> {
     })
 }
 
+/// The environment that the guest agent gives a workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkloadEnvironment<'a> {
+    /// The guest's default environment.
+    Default,
+    /// Exactly these `KEY=VALUE` entries; an empty slice is an empty environment.
+    Replaced(&'a [String]),
+    /// These entries layered over the default environment, each replacing the default variable
+    /// of the same name.
+    Layered(&'a [String]),
+}
+
+/// A workload that an `EXEC` request asks the guest agent to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Workload<'a> {
+    /// The program, an absolute guest path, followed by its arguments.
+    pub(crate) argv: Vec<String>,
+    /// Timeout in milliseconds; zero disables it.
+    pub(crate) timeout_ms: u32,
+    /// Absolute guest directory that the guest agent enters before it starts the program;
+    /// `None` selects `/`.
+    pub(crate) cwd: Option<&'a str>,
+    /// The program's environment.
+    pub(crate) environment: WorkloadEnvironment<'a>,
+}
+
 /// Encodes the payload of an `EXEC` request.
 ///
 /// The guest agent requires 1 to [`MAX_ARGUMENTS`] non-empty arguments without NUL bytes, each
-/// at most [`MAX_ARGUMENT_BYTES`] long, an absolute program path, and a timeout of at most
-/// [`MAX_TIMEOUT_MS`] (zero disables it).
-pub(crate) fn encode_exec_payload(
-    argv: &[String],
-    timeout_ms: u32,
-) -> Result<Vec<u8>, ProtocolError> {
+/// at most [`MAX_ARGUMENT_BYTES`] long, an absolute program path, an absolute working directory
+/// of at most [`MAX_ARGUMENT_BYTES`] without NUL bytes, at most [`MAX_ENVIRONMENT`] `KEY=VALUE`
+/// environment entries with unique names, and a timeout of at most [`MAX_TIMEOUT_MS`] (zero
+/// disables it). A workload without a working directory or an explicit environment keeps the
+/// legacy payload.
+pub(crate) fn encode_exec_payload(workload: &Workload<'_>) -> Result<Vec<u8>, ProtocolError> {
+    let argv = &workload.argv;
     if argv.is_empty() || argv.len() > MAX_ARGUMENTS {
         return Err(violation(format!(
             "exec requires 1 to {MAX_ARGUMENTS} arguments"
@@ -187,21 +222,79 @@ pub(crate) fn encode_exec_payload(
     if !argv[0].starts_with('/') {
         return Err(violation("exec program must be an absolute guest path"));
     }
-    if timeout_ms > MAX_TIMEOUT_MS {
+    if workload.timeout_ms > MAX_TIMEOUT_MS {
         return Err(violation(format!(
             "exec timeout must not exceed {MAX_TIMEOUT_MS} ms"
         )));
     }
+    let cwd = workload.cwd.map(str::as_bytes);
+    if let Some(cwd) = cwd
+        && (!cwd.starts_with(b"/") || cwd.len() > MAX_ARGUMENT_BYTES || cwd.contains(&0))
+    {
+        return Err(violation(format!(
+            "exec working directory must be an absolute guest path of at most \
+             {MAX_ARGUMENT_BYTES} bytes without NUL characters"
+        )));
+    }
+    let (environment, mut flags) = match workload.environment {
+        WorkloadEnvironment::Default => (&[][..], 0),
+        WorkloadEnvironment::Replaced(entries) => (entries, EXEC_ENVIRONMENT_PRESENT),
+        WorkloadEnvironment::Layered(entries) => {
+            (entries, EXEC_ENVIRONMENT_PRESENT | EXEC_INHERIT_DEFAULT_ENV)
+        }
+    };
+    if environment.len() > MAX_ENVIRONMENT {
+        return Err(violation(format!(
+            "exec environment must not exceed {MAX_ENVIRONMENT} entries"
+        )));
+    }
+    if cwd.is_some() {
+        flags |= EXEC_CWD_PRESENT;
+    }
     let count = u16::try_from(argv.len()).unwrap_or(u16::MAX);
     let mut payload = Vec::new();
-    payload.extend_from_slice(&timeout_ms.to_le_bytes());
+    payload.extend_from_slice(&workload.timeout_ms.to_le_bytes());
     payload.extend_from_slice(&count.to_le_bytes());
-    payload.extend_from_slice(&0u16.to_le_bytes());
+    if flags == 0 {
+        payload.extend_from_slice(&0u16.to_le_bytes());
+    } else {
+        let environment_count = u16::try_from(environment.len()).unwrap_or(u16::MAX);
+        let cwd_len = u32::try_from(cwd.map_or(0, <[u8]>::len)).unwrap_or(u32::MAX);
+        payload.extend_from_slice(&EXEC_EXTENDED.to_le_bytes());
+        payload.extend_from_slice(&flags.to_le_bytes());
+        payload.extend_from_slice(&environment_count.to_le_bytes());
+        payload.extend_from_slice(&cwd_len.to_le_bytes());
+    }
     for argument in argv {
         let bytes = argument.as_bytes();
         if bytes.is_empty() || bytes.len() > MAX_ARGUMENT_BYTES || bytes.contains(&0) {
             return Err(violation(format!(
                 "exec arguments must be 1 to {MAX_ARGUMENT_BYTES} bytes without NUL characters"
+            )));
+        }
+        let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        payload.extend_from_slice(&length.to_le_bytes());
+        payload.extend_from_slice(bytes);
+    }
+    payload.extend_from_slice(cwd.unwrap_or_default());
+    let mut names = BTreeSet::new();
+    for entry in environment {
+        let bytes = entry.as_bytes();
+        let name = entry
+            .split_once('=')
+            .map(|(name, _)| name)
+            .filter(|name| !name.is_empty());
+        let Some(name) = name.filter(|_| bytes.len() <= MAX_ARGUMENT_BYTES && !bytes.contains(&0))
+        else {
+            return Err(violation(format!(
+                "exec environment entries must be KEY=VALUE strings of at most \
+                 {MAX_ARGUMENT_BYTES} bytes without NUL characters"
+            )));
+        };
+        // The guest agent refuses a request that names a variable twice.
+        if !names.insert(name) {
+            return Err(violation(format!(
+                "exec environment names must be unique, but {name:?} repeats"
             )));
         }
         let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
@@ -234,16 +327,24 @@ impl GuestFeatures {
     pub(crate) const WORKLOAD_ACCOUNT: Self = Self(1 << 2);
     /// Runs each workload in a cgroup of its own and kills whatever it leaves behind.
     pub(crate) const EXEC_CGROUP: Self = Self(1 << 3);
+    /// Applies the working directory and the explicit environment of an extended `EXEC` request
+    /// to that execution alone, and layers the environment over the default one on request.
+    pub(crate) const EXEC_ENVIRONMENT: Self = Self(1 << 4);
     /// The features that the openvmm backend depends on.
     pub(crate) const REQUIRED: Self = Self(
-        Self::CANCEL.0 | Self::HOST_MAPPINGS.0 | Self::WORKLOAD_ACCOUNT.0 | Self::EXEC_CGROUP.0,
+        Self::CANCEL.0
+            | Self::HOST_MAPPINGS.0
+            | Self::WORKLOAD_ACCOUNT.0
+            | Self::EXEC_CGROUP.0
+            | Self::EXEC_ENVIRONMENT.0,
     );
 
-    const NAMES: [(Self, &'static str); 4] = [
+    const NAMES: [(Self, &'static str); 5] = [
         (Self::CANCEL, "cancellation"),
         (Self::HOST_MAPPINGS, "host path mappings"),
         (Self::WORKLOAD_ACCOUNT, "workload accounts"),
         (Self::EXEC_CGROUP, "workload containment"),
+        (Self::EXEC_ENVIRONMENT, "per-execution environments"),
     ];
 
     /// Decodes the payload of a features response.
@@ -313,8 +414,18 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    /// A workload that runs `argv` without a timeout in `/` with the default environment.
+    fn program<'a>(argv: &[&str]) -> Workload<'a> {
+        Workload {
+            argv: argv.iter().map(|argument| (*argument).to_owned()).collect(),
+            timeout_ms: 0,
+            cwd: None,
+            environment: WorkloadEnvironment::Default,
+        }
+    }
+
     // Golden vectors produced with Python's struct module using the formats of
-    // scripts/nvx_tools/control_session.py: "<4sHBB16sQQI", "<4sBBHQiI", and "<IHH".
+    // scripts/nvx_tools/control_session.py: "<4sHBB16sQQI", "<4sBBHQiI", "<IHH", and "<IHHHHI".
     #[test]
     fn host_attach_matches_the_python_client() {
         let capability: Vec<u8> = (1..=32).collect();
@@ -365,8 +476,11 @@ mod tests {
 
     #[test]
     fn exec_payload_matches_the_python_client() {
-        let argv = ["/bin/sh", "-c", "echo hi"].map(String::from);
-        let payload = encode_exec_payload(&argv, 5000).unwrap();
+        let workload = Workload {
+            timeout_ms: 5000,
+            ..program(&["/bin/sh", "-c", "echo hi"])
+        };
+        let payload = encode_exec_payload(&workload).unwrap();
         assert_eq!(
             hex(&payload),
             concat!(
@@ -379,15 +493,126 @@ mod tests {
     }
 
     #[test]
+    fn exec_payload_carries_the_working_directory_natively() {
+        let workload = Workload {
+            cwd: Some("/tmp"),
+            ..program(&["/bin/pwd"])
+        };
+        assert_eq!(
+            hex(&encode_exec_payload(&workload).unwrap()),
+            concat!(
+                "0000000001000100",
+                "0100000004000000",
+                "080000002f62696e2f707764",
+                "2f746d70",
+            )
+        );
+        let environment = ["FOO=a b".to_owned(), "EMPTY=".to_owned()];
+        let layered = Workload {
+            cwd: Some("/tmp"),
+            environment: WorkloadEnvironment::Layered(&environment),
+            ..program(&["/bin/env"])
+        };
+        assert_eq!(
+            hex(&encode_exec_payload(&layered).unwrap()),
+            concat!(
+                "0000000001000100",
+                "0700020004000000",
+                "080000002f62696e2f656e76",
+                "2f746d70",
+                "07000000464f4f3d612062",
+                "06000000454d5054593d",
+            )
+        );
+        for cwd in ["", "tmp", &format!("/{}", "a".repeat(4096)), "/t\0mp"] {
+            let workload = Workload {
+                cwd: Some(cwd),
+                ..program(&["/bin/pwd"])
+            };
+            assert!(encode_exec_payload(&workload).is_err(), "{cwd:?}");
+        }
+        let longest = format!("/{}", "a".repeat(4095));
+        let workload = Workload {
+            cwd: Some(&longest),
+            ..program(&["/bin/pwd"])
+        };
+        assert!(encode_exec_payload(&workload).is_ok());
+    }
+
+    #[test]
+    fn exec_payload_distinguishes_explicit_environments() {
+        let environment = ["FOO=a b".to_owned(), "EMPTY=".to_owned()];
+        let replaced = Workload {
+            environment: WorkloadEnvironment::Replaced(&environment),
+            ..program(&["/bin/env"])
+        };
+        assert_eq!(
+            hex(&encode_exec_payload(&replaced).unwrap()),
+            concat!(
+                "0000000001000100",
+                "0200020000000000",
+                "080000002f62696e2f656e76",
+                "07000000464f4f3d612062",
+                "06000000454d5054593d",
+            )
+        );
+        let empty = Workload {
+            environment: WorkloadEnvironment::Replaced(&[]),
+            ..program(&["/bin/env"])
+        };
+        let empty = encode_exec_payload(&empty).unwrap();
+        assert_eq!(&empty[6..16], &[1, 0, 2, 0, 0, 0, 0, 0, 0, 0]);
+        let layered = Workload {
+            environment: WorkloadEnvironment::Layered(&environment),
+            ..program(&["/bin/env"])
+        };
+        let layered = encode_exec_payload(&layered).unwrap();
+        assert_eq!(&layered[8..10], &6u16.to_le_bytes());
+        let default = encode_exec_payload(&program(&["/bin/env"])).unwrap();
+        assert_eq!(&default[6..8], &[0, 0]);
+    }
+
+    #[test]
     fn exec_payload_enforces_agent_limits() {
+        let encode = |argv: Vec<String>, timeout_ms| {
+            encode_exec_payload(&Workload {
+                argv,
+                timeout_ms,
+                ..program(&[])
+            })
+        };
         let argument = |value: &str| vec![value.to_owned()];
-        assert!(encode_exec_payload(&argument("bin/sh"), 0).is_err());
-        assert!(encode_exec_payload(&[], 0).is_err());
-        assert!(encode_exec_payload(&argument("/bin/sh"), MAX_TIMEOUT_MS + 1).is_err());
-        assert!(encode_exec_payload(&argument(&format!("/{}", "a".repeat(4096))), 0).is_err());
-        assert!(encode_exec_payload(&vec!["/bin/true".to_owned(); 65], 0).is_err());
-        assert!(encode_exec_payload(&["/bin/echo".to_owned(), String::new()], 0).is_err());
-        assert!(encode_exec_payload(&vec!["/bin/true".to_owned(); 64], MAX_TIMEOUT_MS).is_ok());
+        assert!(encode(argument("bin/sh"), 0).is_err());
+        assert!(encode(Vec::new(), 0).is_err());
+        assert!(encode(argument("/bin/sh"), MAX_TIMEOUT_MS + 1).is_err());
+        assert!(encode(argument(&format!("/{}", "a".repeat(4096))), 0).is_err());
+        assert!(encode(vec!["/bin/true".to_owned(); 65], 0).is_err());
+        assert!(encode(vec!["/bin/echo".to_owned(), String::new()], 0).is_err());
+        assert!(encode(vec!["/bin/true".to_owned(); 64], MAX_TIMEOUT_MS).is_ok());
+        let unique = |count: usize| -> Vec<String> {
+            (0..count).map(|index| format!("KEY{index}=")).collect()
+        };
+        let encode_environment = |environment: &[String]| {
+            encode_exec_payload(&Workload {
+                environment: WorkloadEnvironment::Replaced(environment),
+                ..program(&["/bin/env"])
+            })
+        };
+        assert!(encode_environment(&unique(MAX_ENVIRONMENT)).is_ok());
+        assert!(encode_environment(&unique(MAX_ENVIRONMENT + 1)).is_err());
+        assert!(encode_environment(&["A=1".to_owned(), "A=2".to_owned()]).is_err());
+        assert!(encode_environment(&["A=1".to_owned(), "AB=2".to_owned()]).is_ok());
+        for entry in ["NOVALUE", "=value", &format!("A={}", "x".repeat(4096))] {
+            assert!(encode_environment(&[entry.to_owned()]).is_err());
+        }
+        // Everything shares the 64 KiB control record.
+        let large = |count: usize| -> Vec<String> {
+            (0..count)
+                .map(|index| format!("KEY{index:02}={}", "x".repeat(4000)))
+                .collect()
+        };
+        assert!(encode_environment(&large(15)).is_ok());
+        assert!(encode_environment(&large(17)).is_err());
     }
 
     #[test]
@@ -446,7 +671,8 @@ mod tests {
             [
                 "host path mappings",
                 "workload accounts",
-                "workload containment"
+                "workload containment",
+                "per-execution environments",
             ]
         );
         assert!(GuestFeatures::decode(&[1, 0, 0]).is_err());
@@ -475,6 +701,7 @@ mod tests {
             ("HOST_MAPPINGS", GuestFeatures::HOST_MAPPINGS),
             ("WORKLOAD_ACCOUNT", GuestFeatures::WORKLOAD_ACCOUNT),
             ("EXEC_CGROUP", GuestFeatures::EXEC_CGROUP),
+            ("EXEC_ENVIRONMENT", GuestFeatures::EXEC_ENVIRONMENT),
         ] {
             let bit = feature.0.trailing_zeros();
             definitions.push(format!("#define FEATURE_{name} (1U << {bit})"));
