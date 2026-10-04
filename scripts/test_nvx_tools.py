@@ -161,10 +161,10 @@ def _yaml_scalar(configuration: str, field: str) -> str:
         if not stripped.startswith(f"{field}: "):
             continue
         value = stripped[len(field) + 2 :].rstrip()
-        if value not in {">", ">-", "|", "|-"}:
-            return value
         indent = len(line) - len(line.lstrip())
-        values: list[str] = []
+        if line.lstrip().startswith("- "):
+            indent += 2
+        values: list[str] = [] if value in {">", ">-", "|", "|-"} else [value]
         for block_line in lines[index + 1 :]:
             block_value = block_line.strip()
             if block_value and len(block_line) - len(block_line.lstrip()) <= indent:
