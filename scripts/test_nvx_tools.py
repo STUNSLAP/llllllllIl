@@ -106,6 +106,42 @@ def _composite_action_script(action: str, step_name: str) -> str:
     return "\n".join(line[8:] for line in lines[start:end])
 
 
+def _workflow_step(workflow: str, job_name: str, step_name: str) -> str:
+    lines = _workflow_job(workflow, job_name).splitlines()
+    start = lines.index(f"      - name: {step_name}")
+    end = next(
+        (
+            index
+            for index, line in enumerate(lines[start + 1 :], start + 1)
+            if line.startswith("      - ")
+        ),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def _yaml_field(configuration: str, field: str) -> list[str]:
+    """Return the first value of a field, with one entry per literal block line."""
+    lines = configuration.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped.startswith(f"{field}: "):
+            continue
+        value = stripped[len(field) + 2 :].rstrip()
+        if value != "|":
+            return [value]
+        indent = len(line) - len(stripped)
+        values: list[str] = []
+        for block_line in lines[index + 1 :]:
+            block_value = block_line.strip()
+            if block_value and len(block_line) - len(block_line.lstrip()) <= indent:
+                break
+            if block_value:
+                values.append(block_value)
+        return values
+    raise AssertionError(f"configuration has no {field} field")
+
+
 def _write_release_fixture(
     root: Path,
 ) -> tuple[dict[str, Path], dict[str, object], str]:
@@ -2461,6 +2497,88 @@ class CiConfigurationTests(unittest.TestCase):
         for job_name in ("platform-kvm", "platform-mshv", "platform-whp"):
             self.assertIn(job_name, performance_gate_job)
             self.assertIn(f"needs.{job_name}.result", performance_gate_job)
+
+    def test_copilot_setup_restores_ci_cache_entries(self):
+        github = BuildConstants.REPO_ROOT / ".github"
+        setup = (github / "workflows" / "copilot-setup-steps.yml").read_text(
+            encoding="utf-8"
+        )
+        workflow = (github / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        build_workflow = (github / "workflows" / "build-openvmm-binary.yml").read_text(
+            encoding="utf-8"
+        )
+        build_action = (github / "actions" / "build-openvmm" / "action.yml").read_text(
+            encoding="utf-8"
+        )
+        checkout_action = (
+            github / "actions" / "checkout-openvmm" / "action.yml"
+        ).read_text(encoding="utf-8")
+
+        # Guest artifact keys stay in sync because both sides use one action.
+        guest_artifacts = _workflow_step(
+            setup, "copilot-setup-steps", "Restore guest artifacts built by CI"
+        )
+        self.assertEqual(
+            _yaml_field(guest_artifacts, "uses"),
+            ["./.github/actions/build-guest-artifacts"],
+        )
+        self.assertEqual(_yaml_field(guest_artifacts, "restore-only"), ['"true"'])
+
+        # The OpenVMM binary restore repeats the cache entry that the Linux GNU
+        # producer saves. A different key, path list, or compression method
+        # would make every session miss it without failing setup.
+        producer = _workflow_job(workflow, "build-openvmm-linux-gnu")
+        [backend] = _yaml_field(producer, "backend")
+        [binary] = _yaml_field(producer, "binary")
+        self.assertIn("binary-path: ${{ inputs.binary }}", build_workflow)
+        saved = _composite_action_step(build_action, "Save OpenVMM binary on Linux")
+        restored = _workflow_step(
+            setup, "copilot-setup-steps", "Restore the OpenVMM binary built by CI"
+        )
+        self.assertEqual(
+            _yaml_field(restored, "key"),
+            [
+                key.replace("${{ inputs.backend }}", backend).replace(
+                    "steps.openvmm.outputs.sha", "steps.openvmm-cache.outputs.sha"
+                )
+                for key in _yaml_field(saved, "key")
+            ],
+        )
+        self.assertEqual(
+            _yaml_field(restored, "path"),
+            [
+                path.replace("${{ inputs.binary-path }}", binary)
+                for path in _yaml_field(saved, "path")
+            ],
+        )
+
+        prepare = _workflow_step(
+            setup, "copilot-setup-steps", "Prepare OpenVMM cache restore"
+        )
+        for revision_source in (checkout_action, prepare):
+            self.assertIn("sha=$(git rev-parse :openvmm)", revision_source)
+
+        def tool_links(configuration: str) -> list[str]:
+            return [
+                line.strip()
+                for line in configuration.splitlines()
+                if line.strip().startswith("ln -sf ")
+            ]
+
+        self.assertEqual(
+            _yaml_field(saved, "PATH"),
+            ["${{ steps.cache-tools-linux.outputs.path }}"],
+        )
+        self.assertEqual(
+            _yaml_field(restored, "PATH"),
+            ["${{ steps.openvmm-cache.outputs.path }}"],
+        )
+        self.assertEqual(
+            tool_links(prepare),
+            tool_links(
+                _composite_action_step(build_action, "Prepare Linux cache tools")
+            ),
+        )
 
     def test_ci_runs_openvmm_tests_and_unit_tests_on_each_backend(self):
         workflow = (

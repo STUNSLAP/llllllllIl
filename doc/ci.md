@@ -214,16 +214,20 @@ pin. It restores the shared guest artifacts
 through the `restore-only` input of
 [`build-guest-artifacts`](../.github/actions/build-guest-artifacts/action.yml)
 and the KVM OpenVMM binary that `build-openvmm` caches for the pinned revision,
-so agents can run microVM tests without rebuilding either. Because the agent
-firewall blocks `cdn.kernel.org` and `cdimage.ubuntu.com`, even inside
-containers, the workflow also installs the native guest build prerequisites,
-allows the unprivileged user namespaces that Alpine's `apk` uses for package
-triggers, and stages the pinned Linux and Ubuntu Base archives, so agents can
-rebuild guest artifacts with `build-guest --native`. When a runner has a
-separate `/mnt` disk with more free space than `/`, it mounts the workspace
-there. A failed step would make Copilot skip every later setup step, so each
-step after checkout continues on error. The last step sets `NVX_COPILOT_SETUP`
-to `complete` or `incomplete`, lists failed step IDs in
+so agents can run microVM tests without rebuilding either. The guest artifact
+restore computes its keys with the same action that saves them. The binary
+restore repeats the key, paths, and gzip compression of the cache entry that
+`build-openvmm` saves, and a test in `scripts/test_nvx_tools.py` fails when
+they differ, because a mismatch would otherwise only cause a silent cache miss.
+Because the agent firewall blocks `cdn.kernel.org` and `cdimage.ubuntu.com`,
+even inside containers, the workflow also installs the native guest build
+prerequisites, allows the unprivileged user namespaces that Alpine's `apk` uses
+for package triggers, and stages the pinned Linux and Ubuntu Base archives, so
+agents can rebuild guest artifacts with `build-guest --native`. When a runner
+has a separate `/mnt` disk with more free space than `/`, it mounts the
+workspace there. A failed step would make Copilot skip every later setup step,
+so each step after checkout continues on error. The last step sets
+`NVX_COPILOT_SETUP` to `complete` or `incomplete`, lists failed step IDs in
 `NVX_COPILOT_SETUP_FAILED`, and fails the run when setup is incomplete.
 Copilot always runs the version on `dev`, even for sessions based on other
 branches, so changes reach agent sessions only after they merge. Pushes run it

@@ -209,7 +209,9 @@ jobs:
             echo "sha=$(git rev-parse :openvmm)"
           } >> "${GITHUB_OUTPUT}"
 
-      # The key and paths must match the build-openvmm action's KVM binary cache.
+      # The key, paths, and compression must match the KVM binary cache entry
+      # that the build-openvmm action saves; scripts/test_nvx_tools.py checks
+      # that they do.
       - name: Restore the OpenVMM binary built by CI
         id: openvmm-binary
         continue-on-error: true
