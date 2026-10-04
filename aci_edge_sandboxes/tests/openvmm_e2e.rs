@@ -492,6 +492,18 @@ fn exec_environments_follow_the_mxc_schema() {
         ),
         sorted(["FOO=bar", "PWD=/tmp", "SHLVL=8"])
     );
+    // BusyBox reads `SHLVL` with `atoi` and exports one more as an unsigned integer.
+    for (received, exported) in [
+        ("SHLVL=4294967295", "SHLVL=0"),
+        ("SHLVL=-3", "SHLVL=4294967294"),
+        ("SHLVL=7x", "SHLVL=8"),
+        ("SHLVL=abc", "SHLVL=1"),
+    ] {
+        assert_eq!(
+            listing(shell().with_env(received)),
+            sorted(["PWD=/", exported])
+        );
+    }
 
     // Each execution has its own environment: nothing carries over to the next one.
     let foo = |entry: Option<&str>| {
