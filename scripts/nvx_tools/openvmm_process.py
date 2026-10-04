@@ -8,7 +8,7 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import NamedTuple
@@ -34,6 +34,15 @@ def _line_marker_end(
         if bytes(output[offset:newline]).removesuffix(b"\r") == marker:
             return newline + 1
         offset = newline + 1
+
+
+def _substring_marker_end(
+    output: bytearray,
+    marker: bytes,
+    offset: int,
+) -> int | None:
+    index = output.find(marker, offset)
+    return None if index < 0 else index + len(marker)
 
 
 class OpenvmmProcessResult(NamedTuple):
@@ -93,37 +102,26 @@ class OpenvmmProcess:
     def wait_for(self, marker: bytes, timeout: float) -> None:
         if not marker:
             raise ValueError("OpenVMM process marker cannot be empty")
-        deadline = time.monotonic() + timeout
-        while True:
-            index = self._output.find(marker, self._search_offset)
-            if index >= 0:
-                self._search_offset = index + len(marker)
-                return
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self._fail(
-                    TimeoutError(
-                        f"marker {marker!r} was not observed within {timeout:g}s"
-                    )
-                )
-            try:
-                chunk = self._chunks.get(timeout=min(remaining, 0.1))
-            except queue.Empty:
-                continue
-            if chunk is None:
-                self._fail(
-                    RuntimeError(
-                        f"OpenVMM exited with status {self.process.poll()} before {marker!r}"
-                    )
-                )
-            self._output.extend(chunk)
+        self._wait_for_marker(marker, timeout, _substring_marker_end, "marker", "")
 
     def wait_for_line(self, marker: bytes, timeout: float) -> None:
         if not marker or b"\n" in marker or b"\r" in marker:
             raise ValueError("OpenVMM process line marker must be one non-empty line")
+        self._wait_for_marker(
+            marker, timeout, _line_marker_end, "line marker", "line marker"
+        )
+
+    def _wait_for_marker(
+        self,
+        marker: bytes,
+        timeout: float,
+        finder: Callable[[bytearray, bytes, int], int | None],
+        label: str,
+        exit_label: str,
+    ) -> None:
         deadline = time.monotonic() + timeout
         while True:
-            marker_end = _line_marker_end(self._output, marker, self._search_offset)
+            marker_end = finder(self._output, marker, self._search_offset)
             if marker_end is not None:
                 self._search_offset = marker_end
                 return
@@ -131,7 +129,7 @@ class OpenvmmProcess:
             if remaining <= 0:
                 self._fail(
                     TimeoutError(
-                        f"line marker {marker!r} was not observed within {timeout:g}s"
+                        f"{label} {marker!r} was not observed within {timeout:g}s"
                     )
                 )
             try:
@@ -142,7 +140,8 @@ class OpenvmmProcess:
                 self._fail(
                     RuntimeError(
                         "OpenVMM exited with status "
-                        f"{self.process.poll()} before line marker {marker!r}"
+                        f"{self.process.poll()} before "
+                        f"{exit_label + ' ' if exit_label else ''}{marker!r}"
                     )
                 )
             self._output.extend(chunk)
