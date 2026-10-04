@@ -2822,6 +2822,72 @@ class CiConfigurationTests(unittest.TestCase):
             ),
         )
 
+    def test_guest_artifact_restore_only_guards_builds_and_cache_saves(self):
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "build-guest-artifacts"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        steps = re.split(r"(?=^    - name: )", action, flags=re.MULTILINE)[1:]
+        guarded_steps = [
+            step
+            for step in steps
+            if "docker build" in step or "uses: actions/cache/save@" in step
+        ]
+
+        self.assertTrue(guarded_steps)
+        for step in guarded_steps:
+            name = step.splitlines()[0].removeprefix("    - name: ")
+            with self.subTest(step=name):
+                condition_match = re.search(
+                    r"^      if: (?P<condition>.*(?:\n        .*)*)",
+                    step,
+                    flags=re.MULTILINE,
+                )
+                self.assertIsNotNone(condition_match)
+                assert condition_match is not None
+                condition = " ".join(
+                    line.strip()
+                    for line in condition_match.group("condition").splitlines()
+                    if line.strip() != ">-"
+                )
+                guard = "inputs.restore-only != 'true' && "
+                self.assertTrue(condition.startswith(guard), condition)
+                cache_condition = condition.removeprefix(guard)
+                self.assertIn("cache-hit != 'true'", cache_condition)
+                if "||" in cache_condition:
+                    self.assertTrue(
+                        cache_condition.startswith("(")
+                        and cache_condition.endswith(")"),
+                        cache_condition,
+                    )
+
+    def test_guest_artifact_restore_only_leaves_restore_and_scratch_steps_active(self):
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "build-guest-artifacts"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        steps = re.split(r"(?=^    - name: )", action, flags=re.MULTILINE)[1:]
+        restore_steps = [
+            step for step in steps if "uses: actions/cache/restore@" in step
+        ]
+
+        self.assertTrue(restore_steps)
+        for step in restore_steps:
+            name = step.splitlines()[0].removeprefix("    - name: ")
+            with self.subTest(step=name):
+                self.assertNotIn("\n      if:", step)
+
+        scratch = _composite_action_step(
+            action, "Prepare Ubuntu sandbox scratch template"
+        )
+        self.assertNotIn("\n      if:", scratch)
+
     def test_ci_runs_openvmm_tests_and_unit_tests_on_each_backend(self):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
