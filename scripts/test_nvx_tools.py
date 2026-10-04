@@ -8390,6 +8390,19 @@ class BenchmarkTests(unittest.TestCase):
 
             benchmark.warm_snapshot_artifacts(snapshot)
 
+    def test_snapshot_artifact_validation_preserves_error_prefix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary)
+            for prefix in ("snapshot", "console/active snapshot"):
+                with self.subTest(prefix=prefix):
+                    with self.assertRaises(RuntimeError) as context:
+                        benchmark._require_snapshot_artifacts(snapshot, prefix)
+
+                    self.assertEqual(
+                        str(context.exception),
+                        f"{prefix} did not publish {snapshot / 'manifest.bin'}",
+                    )
+
     def test_measure_once_does_not_resend_prequeued_guest_exit(self):
         class FakeProcess:
             pid = 123

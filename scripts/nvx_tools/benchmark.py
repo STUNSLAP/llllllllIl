@@ -2561,11 +2561,7 @@ def capture_automatic_snapshot(
                 raise RuntimeError(
                     f"snapshot source did not emit required marker {marker.decode()!r}"
                 )
-        for filename in SNAPSHOT_FILENAMES:
-            if not (snapshot_path / filename).is_file():
-                raise RuntimeError(
-                    f"snapshot did not publish {snapshot_path / filename}"
-                )
+        _require_snapshot_artifacts(snapshot_path, "snapshot")
     except Exception as error:
         terminate(process)
         tail = output[-4096:].decode("utf-8", "replace")
@@ -2593,6 +2589,14 @@ def _device_restore_markers(
             )
         markers.append(marker)
     return markers
+
+
+def _require_snapshot_artifacts(snapshot_path: Path, error_prefix: str) -> None:
+    for filename in SNAPSHOT_FILENAMES:
+        if not (snapshot_path / filename).is_file():
+            raise RuntimeError(
+                f"{error_prefix} did not publish {snapshot_path / filename}"
+            )
 
 
 def capture_device_restore_snapshot(
@@ -2649,12 +2653,7 @@ def capture_device_restore_snapshot(
             raise RuntimeError(
                 f"{device}/{mode} snapshot source is missing markers {sorted(missing)}"
             )
-        for filename in SNAPSHOT_FILENAMES:
-            if not (snapshot_path / filename).is_file():
-                raise RuntimeError(
-                    f"{device}/{mode} snapshot did not publish "
-                    f"{snapshot_path / filename}"
-                )
+        _require_snapshot_artifacts(snapshot_path, f"{device}/{mode} snapshot")
         return markers
     except Exception as error:
         terminate(process)
