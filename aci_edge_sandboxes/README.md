@@ -117,7 +117,7 @@ enforce, and report state-machine violations with the codes listed in the
 | `OpenVmmConfig::new` | Explicit paths |
 
 The release and repository constructors require the `SOURCE-MANIFEST.json`
-control contract `nvx-microvm-v2-control-v1`. The initramfs is the Alpine
+control contract `nvx-microvm-v2-control-v2`. The initramfs is the Alpine
 image: its userland is the workloads' environment, and its managed agent
 serves the control console.
 

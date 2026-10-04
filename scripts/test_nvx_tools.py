@@ -196,7 +196,7 @@ def _write_release_fixture(
         "openvmm": {
             "microvm_abi_version": 2,
             "control_session_protocol_version": 1,
-            "control_contract_revision": "nvx-microvm-v2-control-v1",
+            "control_contract_revision": "nvx-microvm-v2-control-v2",
         },
         "linux": {
             "version": "6.18.38",
@@ -4545,7 +4545,7 @@ class BuildTests(unittest.TestCase):
             {
                 "microvm_abi_version": 2,
                 "control_session_protocol_version": 1,
-                "control_contract_revision": "nvx-microvm-v2-control-v1",
+                "control_contract_revision": "nvx-microvm-v2-control-v2",
             },
         )
 
@@ -10925,7 +10925,7 @@ class ReleaseTests(unittest.TestCase):
             )
             self.assertEqual(
                 manifest["openvmm"]["control_contract_revision"],
-                "nvx-microvm-v2-control-v1",
+                "nvx-microvm-v2-control-v2",
             )
             self.assertEqual(
                 manifest["linux"]["kernel_sha256"],
