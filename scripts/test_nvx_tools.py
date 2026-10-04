@@ -15,6 +15,7 @@ import queue
 import re
 import select
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -7865,6 +7866,89 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(profiles, [])
         terminate.assert_called_once()
         self.assertIn("phase=guest_repair_gate", str(raised.exception))
+
+    def test_measure_once_returns_when_a_descendant_keeps_the_output_open(self):
+        # The descendant inherits the console output and stderr and outlives
+        # the launched process, so neither stream reaches EOF.
+        child = (
+            "import subprocess, sys\n"
+            "holder = subprocess.Popen(\n"
+            "    [sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+            "    stdin=subprocess.DEVNULL,\n"
+            ")\n"
+            "with open(sys.argv[1], 'w') as stream:\n"
+            "    stream.write(str(holder.pid))\n"
+            "print('NVX-OUTPUT-HOLDER-READY', flush=True)\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            holder_pid = Path(temporary) / "holder.pid"
+
+            def kill_holder() -> None:
+                try:
+                    os.kill(int(holder_pid.read_text()), signal.SIGTERM)
+                except (OSError, ValueError):
+                    pass
+
+            started = time.monotonic()
+            try:
+                with (
+                    patch.object(benchmark, "OUTPUT_DRAIN_TIMEOUT_SECONDS", 0.05),
+                    self.assertRaisesRegex(
+                        RuntimeError, r"did not reach EOF within 3s of its exit"
+                    ),
+                ):
+                    benchmark.measure_once(
+                        [sys.executable, "-I", "-c", child, str(holder_pid)],
+                        environment=dict(os.environ),
+                        timeout=3,
+                        marker=b"NVX-OUTPUT-HOLDER-READY",
+                        marker_must_be_line=True,
+                        guest_exit_prequeued=True,
+                        log_path=Path(temporary) / "launch.log",
+                    )
+                elapsed = time.monotonic() - started
+            finally:
+                kill_holder()
+
+        # Closing a pipe that a reader is blocked on would wait for the
+        # descendant to exit.
+        self.assertLess(elapsed, 20)
+
+    def test_output_reader_reads_and_stops_above_fd_setsize(self):
+        if sys.platform != "linux":
+            self.skipTest("select() limits descriptors to FD_SETSIZE on POSIX")
+        import fcntl
+        import resource
+
+        floor = 1100
+        limit = floor + 64
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < limit:
+            if hard != resource.RLIM_INFINITY and hard < limit:
+                self.skipTest(f"the RLIMIT_NOFILE hard limit {hard} is too low")
+            resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
+            self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, write_fd)
+        # F_DUPFD takes the lowest free descriptor at or above the floor, so it
+        # cannot replace a descriptor that something else owns.
+        high = fcntl.fcntl(read_fd, fcntl.F_DUPFD, floor)
+        os.close(read_fd)
+        os.set_inheritable(high, False)
+        self.addCleanup(os.close, high)
+        self.assertGreaterEqual(high, floor)
+
+        reader = benchmark._OutputReader(high)
+        chunks: queue.Queue[bytes | None] = queue.Queue()
+        thread = threading.Thread(target=reader.run, args=(chunks,), daemon=True)
+        thread.start()
+        os.write(write_fd, b"console output")
+        self.assertEqual(chunks.get(timeout=5), b"console output")
+        # The write end stays open, so only stop() can end the read.
+        self.assertTrue(reader.stop(5))
+        self.assertIsNone(chunks.get(timeout=5))
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
 
     def test_guest_failure_report_includes_stderr_written_after_the_marker(self):
         terminated = threading.Event()

@@ -12,13 +12,13 @@ import contextlib
 import ctypes
 import datetime as dt
 import errno
-import io
 import ipaddress
 import json
 import os
 import queue
 import re
 import select
+import selectors
 import shutil
 import socket
 import statistics
@@ -30,7 +30,7 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
 from string import Template
-from typing import Literal, Protocol, TextIO, TypedDict, cast
+from typing import IO, Literal, Protocol, TextIO, TypedDict, cast
 
 from . import common
 from .adversarial_oracles import ProcessTreeContainment
@@ -46,6 +46,7 @@ BOOT_MARKER = b"ALPINE-MICROVM-BOOT-OK"
 RESTORE_MARKER = b"OPENVMM-SNAPSHOT-RESTORE-OK"
 TEARDOWN_TIMEOUT_SECONDS = 15.0
 OUTPUT_DRAIN_TIMEOUT_SECONDS = 1.0
+OUTPUT_READER_STOP_TIMEOUT_SECONDS = 5.0
 OUTPUT_BUFFER_LIMIT_BYTES = 1024 * 1024
 PEAK_RSS_SAMPLE_ATTEMPTS = 3
 BASE_TUNING = (
@@ -1326,6 +1327,100 @@ class ChunkSink(Protocol):
     def put(self, item: bytes | None, /) -> None: ...
 
 
+def _cancel_blocked_read(fd: int) -> None:
+    """Cancels a Windows read of ``fd`` that another thread is blocked in."""
+    if os.name != "nt":
+        return
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CancelIoEx.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    kernel32.CancelIoEx.restype = ctypes.c_int
+    # This fails with ERROR_NOT_FOUND when no read is pending, which the
+    # caller handles by repeating the cancellation until the reader stops.
+    kernel32.CancelIoEx(msvcrt.get_osfhandle(fd), None)
+
+
+class _OutputReader:
+    """Forwards one OpenVMM output descriptor until it ends or is stopped.
+
+    Closing a descriptor while another thread is reading it waits for that
+    read, which does not return while a descendant of OpenVMM keeps the other
+    end open. ``stop()`` therefore ends the read first. POSIX hosts wake the
+    reader's selector through a pipe. Windows cannot select pipes, so there
+    ``stop()`` cancels the blocked read.
+    """
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._lock = threading.Lock()
+        self._started = False
+        self._stopping = False
+        self._finished = threading.Event()
+        self._wake: tuple[int, int] | None = None
+
+    def run(self, chunks: ChunkSink) -> None:
+        try:
+            with self._lock:
+                self._started = not self._stopping
+                if self._started and os.name != "nt":
+                    self._wake = os.pipe()
+            if self._started:
+                self._forward(chunks)
+        finally:
+            with self._lock:
+                wake, self._wake = self._wake, None
+                self._finished.set()
+            for fd in wake or ():
+                os.close(fd)
+            chunks.put(None)
+
+    def _forward(self, chunks: ChunkSink) -> None:
+        with contextlib.ExitStack() as stack:
+            selector: selectors.BaseSelector | None = None
+            if self._wake is not None:
+                # Unlike select(), the default selector also waits on
+                # descriptors above FD_SETSIZE.
+                selector = stack.enter_context(selectors.DefaultSelector())
+                selector.register(self._fd, selectors.EVENT_READ)
+                selector.register(self._wake[0], selectors.EVENT_READ, self)
+            while not self._stopping:
+                try:
+                    if selector is not None and any(
+                        key.data is self for key, _ in selector.select()
+                    ):
+                        return
+                    chunk = os.read(self._fd, 4096)
+                except OSError as error:
+                    # A pseudo-terminal reports EIO once every process has
+                    # closed its other end.
+                    if self._stopping or error.errno in (errno.EBADF, errno.EIO):
+                        return
+                    raise
+                if not chunk:
+                    return
+                chunks.put(chunk)
+
+    def stop(self, timeout: float) -> bool:
+        """Stops the reader and returns whether it stopped within ``timeout``."""
+        with self._lock:
+            self._stopping = True
+            if not self._started or self._finished.is_set():
+                return True
+            if self._wake is not None:
+                os.write(self._wake[1], b"\0")
+        if os.name != "nt":
+            return self._finished.wait(timeout)
+        deadline = time.monotonic() + timeout
+        while True:
+            # A read can begin just after a cancellation, so repeat it.
+            _cancel_blocked_read(self._fd)
+            if self._finished.wait(0.01):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+
+
 class InteractiveProcess:
     """Runs OpenVMM with its console on stdin and stdout.
 
@@ -1391,6 +1486,17 @@ class InteractiveProcess:
                 if self.containment is not None:
                     self.containment.abort_spawn()
                 raise
+        console_fd = (
+            self.terminal_fd
+            if self.terminal_fd is not None
+            else cast(IO[bytes], self.process.stdout).fileno()
+        )
+        self._console_reader = _OutputReader(console_fd)
+        self._stderr_reader = (
+            _OutputReader(self.process.stderr.fileno())
+            if self.process.stderr is not None
+            else None
+        )
         try:
             if self.containment is not None:
                 self.containment.attach(self.process)
@@ -1428,43 +1534,15 @@ class InteractiveProcess:
             raise
 
     def read_output(self, chunks: ChunkSink) -> None:
-        try:
-            if self.terminal_fd is not None:
-                while True:
-                    try:
-                        chunk = os.read(self.terminal_fd, 4096)
-                    except OSError as error:
-                        if error.errno in (errno.EBADF, errno.EIO):
-                            break
-                        raise
-                    if not chunk:
-                        break
-                    chunks.put(chunk)
-            else:
-                assert self.process.stdout is not None
-                stream = cast(io.BufferedReader, self.process.stdout)
-                while chunk := stream.read1(4096):
-                    chunks.put(chunk)
-        finally:
-            chunks.put(None)
+        """Forwards the console output until it ends or ``close()`` stops it."""
+        self._console_reader.run(chunks)
 
     def read_stderr(self, chunks: ChunkSink) -> None:
-        """Forwards the separate stderr stream until it closes."""
-        try:
-            if self.process.stderr is None:
-                raise RuntimeError("OpenVMM stderr shares the console stream")
-            stream = cast(io.BufferedReader, self.process.stderr)
-            while True:
-                try:
-                    chunk = stream.read1(4096)
-                except ValueError:
-                    # close() released the stream, which ends it like EOF.
-                    break
-                if not chunk:
-                    break
-                chunks.put(chunk)
-        finally:
+        """Forwards the separate stderr until it ends or ``close()`` stops it."""
+        if self._stderr_reader is None:
             chunks.put(None)
+            raise RuntimeError("OpenVMM stderr shares the console stream")
+        self._stderr_reader.run(chunks)
 
     def write_input(self, data: bytes) -> None:
         if self.terminal_fd is not None:
@@ -1479,16 +1557,25 @@ class InteractiveProcess:
     def close(self) -> None:
         if self.containment is not None:
             self.containment.close(self.process)
+        # A reader that does not stop leaves its descriptor open, because
+        # closing that descriptor would wait for the reader's read.
+        console_stopped = self._console_reader.stop(OUTPUT_READER_STOP_TIMEOUT_SECONDS)
+        stderr_stopped = self._stderr_reader is None or self._stderr_reader.stop(
+            OUTPUT_READER_STOP_TIMEOUT_SECONDS
+        )
         if self.terminal_fd is not None:
-            os.close(self.terminal_fd)
-            self.terminal_fd = None
+            if console_stopped:
+                os.close(self.terminal_fd)
+                self.terminal_fd = None
         else:
             if self.process.stdin is not None:
                 self.process.stdin.close()
-            if self.process.stdout is not None:
+            if self.process.stdout is not None and console_stopped:
                 self.process.stdout.close()
-        if self.process.stderr is not None:
+        if self.process.stderr is not None and stderr_stopped:
             self.process.stderr.close()
+        if not (console_stopped and stderr_stopped):
+            raise RuntimeError("OpenVMM output reader did not stop")
 
 
 class _StreamChunks:
