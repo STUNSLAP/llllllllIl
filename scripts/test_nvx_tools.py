@@ -93,6 +93,15 @@ def _composite_action_step(action: str, step_name: str) -> str:
     return "\n".join(lines[start:end])
 
 
+def _composite_action_steps(action: str) -> list[str]:
+    lines = action.splitlines()
+    starts = [index for index, line in enumerate(lines) if line.startswith("    - ")]
+    return [
+        "\n".join(lines[start:end])
+        for start, end in zip(starts, starts[1:] + [len(lines)], strict=True)
+    ]
+
+
 def _composite_action_script(action: str, step_name: str) -> str:
     lines = _composite_action_step(action, step_name).splitlines()
     start = lines.index("      run: |") + 1
@@ -141,6 +150,53 @@ def _yaml_field(configuration: str, field: str) -> list[str]:
                 values.append(block_value)
         return values
     raise AssertionError(f"configuration has no {field} field")
+
+
+def _yaml_scalar(configuration: str, field: str) -> str:
+    lines = configuration.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("- "):
+            stripped = stripped[2:]
+        if not stripped.startswith(f"{field}: "):
+            continue
+        value = stripped[len(field) + 2 :].rstrip()
+        if value not in {">", ">-", "|", "|-"}:
+            return value
+        indent = len(line) - len(line.lstrip())
+        values: list[str] = []
+        for block_line in lines[index + 1 :]:
+            block_value = block_line.strip()
+            if block_value and len(block_line) - len(block_line.lstrip()) <= indent:
+                break
+            if block_value:
+                values.append(block_value)
+        return " ".join(values)
+    raise AssertionError(f"configuration has no {field} field")
+
+
+def _outer_parentheses_enclose(expression: str) -> bool:
+    expression = expression.strip()
+    if not expression.startswith("("):
+        return False
+    depth = 0
+    quote: str | None = None
+    for index, character in enumerate(expression):
+        if quote is not None:
+            if character == quote and (index == 0 or expression[index - 1] != "\\"):
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0 and index != len(expression) - 1:
+                return False
+            if depth < 0:
+                return False
+    return depth == 0 and quote is None
 
 
 def _write_release_fixture(
@@ -2830,7 +2886,7 @@ class CiConfigurationTests(unittest.TestCase):
             / "build-guest-artifacts"
             / "action.yml"
         ).read_text(encoding="utf-8")
-        steps = re.split(r"(?=^    - name: )", action, flags=re.MULTILINE)[1:]
+        steps = _composite_action_steps(action)
         guarded_steps = [
             step
             for step in steps
@@ -2839,28 +2895,19 @@ class CiConfigurationTests(unittest.TestCase):
 
         self.assertTrue(guarded_steps)
         for step in guarded_steps:
-            name = step.splitlines()[0].removeprefix("    - name: ")
+            try:
+                name = _yaml_scalar(step, "name")
+            except AssertionError:
+                name = "<unnamed>"
             with self.subTest(step=name):
-                condition_match = re.search(
-                    r"^      if: (?P<condition>.*(?:\n        .*)*)",
-                    step,
-                    flags=re.MULTILINE,
-                )
-                self.assertIsNotNone(condition_match)
-                assert condition_match is not None
-                condition = " ".join(
-                    line.strip()
-                    for line in condition_match.group("condition").splitlines()
-                    if line.strip() != ">-"
-                )
+                condition = _yaml_scalar(step, "if")
                 guard = "inputs.restore-only != 'true' && "
                 self.assertTrue(condition.startswith(guard), condition)
                 cache_condition = condition.removeprefix(guard)
                 self.assertIn("cache-hit != 'true'", cache_condition)
                 if "||" in cache_condition:
                     self.assertTrue(
-                        cache_condition.startswith("(")
-                        and cache_condition.endswith(")"),
+                        _outer_parentheses_enclose(cache_condition),
                         cache_condition,
                     )
 
@@ -2872,21 +2919,26 @@ class CiConfigurationTests(unittest.TestCase):
             / "build-guest-artifacts"
             / "action.yml"
         ).read_text(encoding="utf-8")
-        steps = re.split(r"(?=^    - name: )", action, flags=re.MULTILINE)[1:]
+        steps = _composite_action_steps(action)
         restore_steps = [
             step for step in steps if "uses: actions/cache/restore@" in step
         ]
 
         self.assertTrue(restore_steps)
         for step in restore_steps:
-            name = step.splitlines()[0].removeprefix("    - name: ")
+            try:
+                name = _yaml_scalar(step, "name")
+            except AssertionError:
+                name = "<unnamed>"
             with self.subTest(step=name):
-                self.assertNotIn("\n      if:", step)
+                with self.assertRaisesRegex(AssertionError, "has no if field"):
+                    _yaml_scalar(step, "if")
 
         scratch = _composite_action_step(
             action, "Prepare Ubuntu sandbox scratch template"
         )
-        self.assertNotIn("\n      if:", scratch)
+        with self.assertRaisesRegex(AssertionError, "has no if field"):
+            _yaml_scalar(scratch, "if")
 
     def test_ci_runs_openvmm_tests_and_unit_tests_on_each_backend(self):
         workflow = (
