@@ -510,10 +510,7 @@ def configure_parser(
 
 
 def positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 1:
-        raise argparse.ArgumentTypeError("must be at least 1")
-    return parsed
+    return common.positive_int(value, message="must be at least 1")
 
 
 def apply_benchmark_suite_defaults(args: argparse.Namespace) -> None:
