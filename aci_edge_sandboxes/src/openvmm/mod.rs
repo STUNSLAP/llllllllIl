@@ -35,7 +35,8 @@
 //! | `process.commandLine` | n/a | run as `/bin/sh -c <commandLine>`, at most 4096 bytes |
 //! | `process.cwd` | n/a | an absolute guest path, entered before the workload runs |
 //! | `process.timeout` | n/a | up to one hour |
-//! | `process.env`, `inheritDefaultEnv: false`, piped stdin | n/a | rejected |
+//! | `process.env` | n/a | rejected; `inheritDefaultEnv` without `env` is ignored |
+//! | piped stdin | n/a | rejected |
 //!
 //! Host paths share OpenVMM's single virtio-fs export: the backend exports the deepest directory
 //! that contains every mapped path to a guest directory that only the guest's root can enter, and

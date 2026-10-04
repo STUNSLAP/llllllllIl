@@ -238,7 +238,7 @@ terminate the VM when the caller exits.
 | `process.argv` (ACI Edge Sandboxes extension) | n/a | applied; absolute program, up to 64 arguments of 4096 bytes |
 | `process.cwd` | n/a | an absolute guest path; a missing directory ends the workload with status 125 |
 | `process.timeout` | n/a | applied, up to 3,600,000 ms |
-| `process.env`, `inheritDefaultEnv: false` | n/a | rejected |
+| `process.env` | n/a | rejected; `inheritDefaultEnv` without `env` is ignored |
 | Piped standard input | n/a | rejected; the workload reads end-of-file |
 
 Workloads run as the configured non-root identity and may write at most 1 MiB

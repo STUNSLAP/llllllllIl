@@ -391,7 +391,6 @@ fn unsupported_requests_are_rejected_before_anything_runs() {
     for request in [
         write().with_cwd("relative"),
         write().with_env("MODE=test"),
-        write().with_inherit_default_env(false),
         write().with_stdin(StdinMode::Piped),
         write().with_timeout(Duration::from_secs(2 * 60 * 60)),
         ExecRequest::argv(["relative/program"]),
