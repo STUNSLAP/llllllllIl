@@ -12,7 +12,6 @@ import contextlib
 import ctypes
 import datetime as dt
 import errno
-import io
 import ipaddress
 import json
 import math
@@ -20,6 +19,7 @@ import os
 import queue
 import re
 import select
+import selectors
 import shutil
 import socket
 import statistics
@@ -31,7 +31,7 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
 from string import Template
-from typing import TextIO, TypedDict, cast
+from typing import IO, Literal, Protocol, TextIO, TypedDict, cast
 
 from . import common
 from .adversarial_oracles import ProcessTreeContainment
@@ -46,6 +46,9 @@ from .common import bytes_to_mib, sha256_file
 BOOT_MARKER = b"ALPINE-MICROVM-BOOT-OK"
 RESTORE_MARKER = b"OPENVMM-SNAPSHOT-RESTORE-OK"
 TEARDOWN_TIMEOUT_SECONDS = 15.0
+OUTPUT_DRAIN_TIMEOUT_SECONDS = 1.0
+OUTPUT_READER_STOP_TIMEOUT_SECONDS = 5.0
+OUTPUT_BUFFER_LIMIT_BYTES = 1024 * 1024
 PEAK_RSS_SAMPLE_ATTEMPTS = 3
 BASE_TUNING = (
     "tsc=reliable no_timer_check random.trust_cpu=on "
@@ -1024,6 +1027,7 @@ class SnapshotProfileCollector:
         *,
         exclusive: bool,
         logical_bytes: int | None = None,
+        host_counters: dict[str, int] | None = None,
     ) -> dict[str, object]:
         record: dict[str, object] = {
             "operation": operation,
@@ -1037,12 +1041,26 @@ class SnapshotProfileCollector:
         if logical_bytes is not None:
             record["logical_bytes"] = logical_bytes
         if self.collect_host_counters:
-            counters = process_resource_counters(self.pid)
+            counters = (
+                process_resource_counters(self.pid)
+                if host_counters is None
+                else host_counters
+            )
             if counters:
                 record["host_counters"] = counters
         return record
 
-    def finish_restore(self, marker_reached_ns: int) -> dict[str, object]:
+    def finish_restore(
+        self,
+        marker_reached_ns: int,
+        readiness_counters: dict[str, int] | None = None,
+    ) -> dict[str, object]:
+        """Completes a launch profile once OpenVMM's stderr has ended.
+
+        ``readiness_counters`` are the host counters sampled when the readiness
+        marker was observed. The observer records that end there use them,
+        because the process may have exited since.
+        """
         self._finish_pending()
         if self.records:
             first = self.records[0]
@@ -1073,15 +1091,19 @@ class SnapshotProfileCollector:
             device_end_ns = self.process_started_ns + int(
                 _profile_int(device_start, "observer_elapsed_ns")
             )
-            self.records.append(
-                self._external_record(
-                    "restore",
-                    "resume_to_readiness",
-                    marker_reached_ns - device_end_ns,
-                    marker_reached_ns,
-                    exclusive=True,
+            # stderr and the console are read separately, so a record can be
+            # observed after the marker. Its observer time then bounds nothing.
+            if device_end_ns <= marker_reached_ns:
+                self.records.append(
+                    self._external_record(
+                        "restore",
+                        "resume_to_readiness",
+                        marker_reached_ns - device_end_ns,
+                        marker_reached_ns,
+                        exclusive=True,
+                        host_counters=readiness_counters,
+                    )
                 )
-            )
         self.records.append(
             self._external_record(
                 "restore",
@@ -1089,6 +1111,7 @@ class SnapshotProfileCollector:
                 marker_reached_ns - self.process_started_ns,
                 marker_reached_ns,
                 exclusive=False,
+                host_counters=readiness_counters,
             )
         )
         return {"records": self.records}
@@ -1296,13 +1319,124 @@ def parse_virtio_restore_event(line: str) -> dict[str, object] | None:
     return event
 
 
+OutputStream = Literal["console", "stderr"]
+
+
+class ChunkSink(Protocol):
+    """Receives the chunks of one output stream, then ``None`` at its end."""
+
+    def put(self, item: bytes | None, /) -> None: ...
+
+
+def _cancel_blocked_read(fd: int) -> None:
+    """Cancels a Windows read of ``fd`` that another thread is blocked in."""
+    if os.name != "nt":
+        return
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CancelIoEx.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    kernel32.CancelIoEx.restype = ctypes.c_int
+    # This fails with ERROR_NOT_FOUND when no read is pending, which the
+    # caller handles by repeating the cancellation until the reader stops.
+    kernel32.CancelIoEx(msvcrt.get_osfhandle(fd), None)
+
+
+class _OutputReader:
+    """Forwards one OpenVMM output descriptor until it ends or is stopped.
+
+    Closing a descriptor while another thread is reading it waits for that
+    read, which does not return while a descendant of OpenVMM keeps the other
+    end open. ``stop()`` therefore ends the read first. POSIX hosts wake the
+    reader's selector through a pipe. Windows cannot select pipes, so there
+    ``stop()`` cancels the blocked read.
+    """
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._lock = threading.Lock()
+        self._started = False
+        self._stopping = False
+        self._finished = threading.Event()
+        self._wake: tuple[int, int] | None = None
+
+    def run(self, chunks: ChunkSink) -> None:
+        try:
+            with self._lock:
+                self._started = not self._stopping
+                if self._started and os.name != "nt":
+                    self._wake = os.pipe()
+            if self._started:
+                self._forward(chunks)
+        finally:
+            with self._lock:
+                wake, self._wake = self._wake, None
+                self._finished.set()
+            for fd in wake or ():
+                os.close(fd)
+            chunks.put(None)
+
+    def _forward(self, chunks: ChunkSink) -> None:
+        with contextlib.ExitStack() as stack:
+            selector: selectors.BaseSelector | None = None
+            if self._wake is not None:
+                # Unlike select(), the default selector also waits on
+                # descriptors above FD_SETSIZE.
+                selector = stack.enter_context(selectors.DefaultSelector())
+                selector.register(self._fd, selectors.EVENT_READ)
+                selector.register(self._wake[0], selectors.EVENT_READ, self)
+            while not self._stopping:
+                try:
+                    if selector is not None and any(
+                        key.data is self for key, _ in selector.select()
+                    ):
+                        return
+                    chunk = os.read(self._fd, 4096)
+                except OSError as error:
+                    # A pseudo-terminal reports EIO once every process has
+                    # closed its other end.
+                    if self._stopping or error.errno in (errno.EBADF, errno.EIO):
+                        return
+                    raise
+                if not chunk:
+                    return
+                chunks.put(chunk)
+
+    def stop(self, timeout: float) -> bool:
+        """Stops the reader and returns whether it stopped within ``timeout``."""
+        with self._lock:
+            self._stopping = True
+            if not self._started or self._finished.is_set():
+                return True
+            if self._wake is not None:
+                os.write(self._wake[1], b"\0")
+        if os.name != "nt":
+            return self._finished.wait(timeout)
+        deadline = time.monotonic() + timeout
+        while True:
+            # A read can begin just after a cancellation, so repeat it.
+            _cancel_blocked_read(self._fd)
+            if self._finished.wait(0.01):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+
+
 class InteractiveProcess:
+    """Runs OpenVMM with its console on stdin and stdout.
+
+    Linux attaches the console to a pseudo-terminal, and other platforms use
+    pipes. stderr shares the console stream unless ``separate_stderr`` gives it
+    a pipe of its own, which the caller must drain with ``read_stderr``.
+    """
+
     def __init__(
         self,
         command: Sequence[str],
         environment: dict[str, str],
         *,
         contain_process_tree: bool = False,
+        separate_stderr: bool = False,
     ) -> None:
         self.terminal_fd: int | None = None
         self.containment = ProcessTreeContainment() if contain_process_tree else None
@@ -1327,7 +1461,7 @@ class InteractiveProcess:
                     process_command,
                     stdin=child_fd,
                     stdout=child_fd,
-                    stderr=child_fd,
+                    stderr=subprocess.PIPE if separate_stderr else child_fd,
                     env=environment,
                     creationflags=creationflags,
                 )
@@ -1345,7 +1479,7 @@ class InteractiveProcess:
                     process_command,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
+                    stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
                     env=environment,
                     creationflags=creationflags,
                 )
@@ -1353,6 +1487,17 @@ class InteractiveProcess:
                 if self.containment is not None:
                     self.containment.abort_spawn()
                 raise
+        console_fd = (
+            self.terminal_fd
+            if self.terminal_fd is not None
+            else cast(IO[bytes], self.process.stdout).fileno()
+        )
+        self._console_reader = _OutputReader(console_fd)
+        self._stderr_reader = (
+            _OutputReader(self.process.stderr.fileno())
+            if self.process.stderr is not None
+            else None
+        )
         try:
             if self.containment is not None:
                 self.containment.attach(self.process)
@@ -1389,26 +1534,16 @@ class InteractiveProcess:
                 raise primary_error from cleanup_error
             raise
 
-    def read_output(self, chunks: queue.Queue[bytes | None]) -> None:
-        try:
-            if self.terminal_fd is not None:
-                while True:
-                    try:
-                        chunk = os.read(self.terminal_fd, 4096)
-                    except OSError as error:
-                        if error.errno in (errno.EBADF, errno.EIO):
-                            break
-                        raise
-                    if not chunk:
-                        break
-                    chunks.put(chunk)
-            else:
-                assert self.process.stdout is not None
-                stream = cast(io.BufferedReader, self.process.stdout)
-                while chunk := stream.read1(4096):
-                    chunks.put(chunk)
-        finally:
+    def read_output(self, chunks: ChunkSink) -> None:
+        """Forwards the console output until it ends or ``close()`` stops it."""
+        self._console_reader.run(chunks)
+
+    def read_stderr(self, chunks: ChunkSink) -> None:
+        """Forwards the separate stderr until it ends or ``close()`` stops it."""
+        if self._stderr_reader is None:
             chunks.put(None)
+            raise RuntimeError("OpenVMM stderr shares the console stream")
+        self._stderr_reader.run(chunks)
 
     def write_input(self, data: bytes) -> None:
         if self.terminal_fd is not None:
@@ -1423,14 +1558,130 @@ class InteractiveProcess:
     def close(self) -> None:
         if self.containment is not None:
             self.containment.close(self.process)
+        # A reader that does not stop leaves its descriptor open, because
+        # closing that descriptor would wait for the reader's read.
+        console_stopped = self._console_reader.stop(OUTPUT_READER_STOP_TIMEOUT_SECONDS)
+        stderr_stopped = self._stderr_reader is None or self._stderr_reader.stop(
+            OUTPUT_READER_STOP_TIMEOUT_SECONDS
+        )
         if self.terminal_fd is not None:
-            os.close(self.terminal_fd)
-            self.terminal_fd = None
+            if console_stopped:
+                os.close(self.terminal_fd)
+                self.terminal_fd = None
         else:
             if self.process.stdin is not None:
                 self.process.stdin.close()
-            if self.process.stdout is not None:
+            if self.process.stdout is not None and console_stopped:
                 self.process.stdout.close()
+        if self.process.stderr is not None and stderr_stopped:
+            self.process.stderr.close()
+        if not (console_stopped and stderr_stopped):
+            raise RuntimeError("OpenVMM output reader did not stop")
+
+
+class _StreamChunks:
+    """Tags the chunks of one OpenVMM output stream for a shared queue."""
+
+    def __init__(
+        self,
+        stream: OutputStream,
+        chunks: queue.Queue[tuple[OutputStream, bytes | None]],
+    ) -> None:
+        self._stream: OutputStream = stream
+        self._chunks = chunks
+
+    def put(self, item: bytes | None, /) -> None:
+        self._chunks.put((self._stream, item))
+
+
+class SeparatedOutput:
+    """Reads OpenVMM's guest console and its stderr as separate streams.
+
+    OpenVMM relays the guest console to stdout from a dedicated thread, with no
+    ordering against the diagnostics that other threads write to stderr, such
+    as snapshot profile records and tracing. On a shared stream, either writer
+    can split a line of the other. Match guest markers only against
+    ``console`` and parse diagnostics only from stderr chunks. ``contents()``
+    keeps both streams for logs and error reports, interleaved by whole lines.
+    """
+
+    def __init__(self, interaction: InteractiveProcess) -> None:
+        self.console = bytearray()
+        self._transcript = bytearray()
+        self._partial_lines: dict[OutputStream, bytearray] = {
+            "console": bytearray(),
+            "stderr": bytearray(),
+        }
+        self._open_streams: set[OutputStream] = {"console", "stderr"}
+        self._chunks: queue.Queue[tuple[OutputStream, bytes | None]] = queue.Queue()
+        readers: tuple[tuple[OutputStream, Callable[[ChunkSink], None]], ...] = (
+            ("console", interaction.read_output),
+            ("stderr", interaction.read_stderr),
+        )
+        for stream, read in readers:
+            threading.Thread(
+                target=read,
+                args=(_StreamChunks(stream, self._chunks),),
+                daemon=True,
+            ).start()
+
+    @property
+    def closed(self) -> bool:
+        """Whether both streams have reached their end."""
+        return not self._open_streams
+
+    def get(self, timeout: float) -> tuple[OutputStream, bytes | None]:
+        """Records and returns the next chunk, or ``None`` when a stream ends.
+
+        Raises ``queue.Empty`` when no chunk arrives within ``timeout`` seconds.
+        """
+        stream, chunk = self._chunks.get(timeout=timeout)
+        if chunk is None:
+            self._open_streams.discard(stream)
+            return stream, None
+        if stream == "console":
+            self.console.extend(chunk)
+        partial = self._partial_lines[stream]
+        partial.extend(chunk)
+        complete = partial.rfind(b"\n") + 1
+        if complete:
+            self._transcript.extend(partial[:complete])
+            del partial[:complete]
+        for buffer in (self.console, self._transcript, partial):
+            if len(buffer) > OUTPUT_BUFFER_LIMIT_BYTES:
+                del buffer[: len(buffer) - OUTPUT_BUFFER_LIMIT_BYTES]
+        return stream, chunk
+
+    def drain(
+        self,
+        timeout: float,
+        on_stderr: Callable[[bytes], None] | None = None,
+    ) -> bool:
+        """Records output until both streams end or ``timeout`` expires.
+
+        ``on_stderr`` also receives each stderr chunk. Returns whether both
+        streams ended.
+        """
+        deadline = time.monotonic() + timeout
+        while self._open_streams:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                stream, chunk = self.get(remaining)
+            except queue.Empty:
+                return False
+            if stream == "stderr" and chunk is not None and on_stderr is not None:
+                on_stderr(chunk)
+        return True
+
+    def contents(self) -> bytes:
+        """Returns the whole-line transcript, then any unterminated lines."""
+        partial_lines = [bytes(line) for line in self._partial_lines.values() if line]
+        return bytes(self._transcript) + b"\n".join(partial_lines)
+
+    def tail(self, size: int = 4096) -> str:
+        return self.contents()[-size:].decode("utf-8", "replace")
 
 
 def record_adversarial_openvmm_pid(
@@ -1497,10 +1748,14 @@ def measure_once(
 
     Peak RSS is None when OpenVMM exited before it could be sampled at the
     marker, which a prequeued guest exit makes possible. A completed output
-    line starting with ``failure_marker`` stops the launch immediately.
+    line starting with ``failure_marker`` stops the launch immediately. Both
+    markers match only the guest console, and profile records come only from
+    OpenVMM's stderr. A launch that keeps a profile or a log reads both
+    streams to their end after teardown, within ``timeout``, and fails if they
+    do not end.
     """
     started = time.perf_counter_ns()
-    interaction = InteractiveProcess(command, environment)
+    interaction = InteractiveProcess(command, environment, separate_stderr=True)
     process = interaction.process
     profile = (
         SnapshotProfileCollector(process.pid, started) if snapshot_profile else None
@@ -1508,41 +1763,61 @@ def measure_once(
     if windows_cpus is not None:
         set_windows_affinity(process.pid, windows_cpus)
 
-    chunks: queue.Queue[bytes | None] = queue.Queue()
-    threading.Thread(
-        target=interaction.read_output, args=(chunks,), daemon=True
-    ).start()
+    output = SeparatedOutput(interaction)
     deadline = time.monotonic() + timeout
-    output = bytearray()
+
+    def finish_output(
+        marker_reached: int,
+        readiness_counters: dict[str, int] | None,
+    ) -> None:
+        if (profile is None or profile_sink is None) and log_path is None:
+            return
+        # OpenVMM writes some records after it resumes the guest, and the
+        # stderr reader can deliver earlier ones after the console marker.
+        # A profile or log completed before both streams end would silently
+        # omit records or parse an unterminated one.
+        if not output.drain(timeout, profile.feed if profile is not None else None):
+            raise RuntimeError(
+                f"OpenVMM output did not reach EOF within {timeout:g}s of its exit"
+            )
+        if profile is not None and profile_sink is not None:
+            profile_sink.append(
+                profile.finish_restore(marker_reached, readiness_counters)
+            )
+
     try:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"guest marker was not observed within {timeout:g}s")
             try:
-                chunk = chunks.get(timeout=min(remaining, 0.25))
+                stream, chunk = output.get(timeout=min(remaining, 0.25))
             except queue.Empty:
                 if process.poll() is not None:
                     raise RuntimeError(
                         f"OpenVMM exited with status {process.returncode}"
                     ) from None
                 continue
+            if stream == "stderr":
+                if profile is not None and chunk is not None:
+                    profile.feed(chunk)
+                continue
             if chunk is None:
                 raise RuntimeError(f"OpenVMM exited with status {process.poll()}")
-            if profile is not None:
-                profile.feed(chunk)
-            output.extend(chunk)
+            console = output.console
             if failure_marker is not None:
-                failure = completed_output_line_with_prefix(output, failure_marker)
+                failure = completed_output_line_with_prefix(console, failure_marker)
                 if failure is not None:
+                    terminate(process)
+                    output.drain(OUTPUT_DRAIN_TIMEOUT_SECONDS)
                     raise GuestFailureReported(
                         failure.decode("utf-8", "replace"),
-                        output[-4096:].decode("utf-8", "replace"),
+                        output.tail(),
                     )
             marker_seen = (
-                contains_output_line(output, marker)
+                contains_output_line(console, marker)
                 if marker_must_be_line
-                else marker in output
+                else marker in console
             )
             if marker_seen:
                 marker_reached = time.perf_counter_ns()
@@ -1550,8 +1825,13 @@ def measure_once(
                 # after writing the marker. Sample RSS before the more detailed
                 # opt-in profile counters.
                 peak_bytes = live_peak_rss_bytes(process)
-                if profile is not None and profile_sink is not None:
-                    profile_sink.append(profile.finish_restore(marker_reached))
+                readiness_counters = (
+                    process_resource_counters(process.pid)
+                    if profile is not None
+                    and profile_sink is not None
+                    and profile.collect_host_counters
+                    else None
+                )
                 elapsed_ms = (marker_reached - started) / 1_000_000
                 teardown_started = (
                     marker_reached
@@ -1572,30 +1852,31 @@ def measure_once(
                 except subprocess.TimeoutExpired:
                     terminate(process)
                     wall_ms = (time.perf_counter_ns() - started) / 1_000_000
+                    finish_output(marker_reached, readiness_counters)
                     return elapsed_ms, peak_bytes, None, wall_ms
                 process_exited = time.perf_counter_ns()
                 teardown_ms = (process_exited - teardown_started) / 1_000_000
                 wall_ms = (process_exited - started) / 1_000_000
+                finish_output(marker_reached, readiness_counters)
                 if teardown_mode == "guest-exit" and returncode != 0:
                     raise RuntimeError(
                         f"OpenVMM exited with status {returncode} during teardown"
                     )
                 return elapsed_ms, peak_bytes, teardown_ms, wall_ms
-            if len(output) > 1024 * 1024:
-                del output[: len(output) - 1024 * 1024]
     except GuestFailureReported:
-        terminate(process)
         raise
     except Exception as error:
         terminate(process)
-        tail = output[-4096:].decode("utf-8", "replace")
+        output.drain(OUTPUT_DRAIN_TIMEOUT_SECONDS)
+        tail = output.tail()
         if tail:
             raise RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}") from error
         raise
     finally:
         if log_path is not None:
+            output.drain(OUTPUT_DRAIN_TIMEOUT_SECONDS)
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_bytes(output)
+            log_path.write_bytes(output.contents())
         interaction.close()
         if cleanup_managed_network:
             cleanup_managed_tap(process.pid)
@@ -4377,13 +4658,18 @@ def capture_snapshot(
     log_path: Path | None = None,
     boot_marker: bytes = BOOT_MARKER,
 ) -> tuple[float, float, float, int]:
+    """Capture one guest-requested snapshot and time its generation.
+
+    Guest markers match only the guest console, and the profile records that
+    time generation come only from OpenVMM's stderr.
+    """
     if snapshot_path.exists():
         shutil.rmtree(snapshot_path)
     environment = os.environ.copy()
     environment["OPENVMM_LOG"] = "off,openvmm_entry::vm_controller=info"
     environment[SNAPSHOT_PROFILE_ENV] = "1"
     process_started_ns = time.perf_counter_ns()
-    interaction = InteractiveProcess(command, environment)
+    interaction = InteractiveProcess(command, environment, separate_stderr=True)
     process = interaction.process
     profile = SnapshotProfileCollector(
         process.pid,
@@ -4393,12 +4679,8 @@ def capture_snapshot(
     if windows_cpus is not None:
         set_windows_affinity(process.pid, windows_cpus)
 
-    chunks: queue.Queue[bytes | None] = queue.Queue()
-    threading.Thread(
-        target=interaction.read_output, args=(chunks,), daemon=True
-    ).start()
+    output = SeparatedOutput(interaction)
     deadline = time.monotonic() + timeout
-    output = bytearray()
     boot_seen = False
     snapshot_requested = False
     snapshot_started_ns = None
@@ -4440,7 +4722,7 @@ def capture_snapshot(
                 raise TimeoutError(f"snapshot was not captured within {timeout:g}s")
             try:
                 poll_interval = 0.001 if snapshot_requested else 0.25
-                chunk = chunks.get(timeout=min(remaining, poll_interval))
+                stream, chunk = output.get(timeout=min(remaining, poll_interval))
             except queue.Empty:
                 peak_bytes = _try_peak_rss(process, peak_bytes)
                 observe_snapshot_publication()
@@ -4450,18 +4732,22 @@ def capture_snapshot(
                     ) from None
                 continue
             if chunk is None:
-                observe_snapshot_publication()
-                break
-            profile.feed(chunk)
-            output.extend(chunk)
+                if output.closed:
+                    observe_snapshot_publication()
+                    break
+                continue
             peak_bytes = _try_peak_rss(process, peak_bytes)
+            if stream == "stderr":
+                profile.feed(chunk)
+                continue
+            console = output.console
             if (
                 snapshot_requested
                 and snapshot_guest_dispatched_ns is None
-                and contains_output_line(output, SNAPSHOT_GUEST_DISPATCH_MARKER)
+                and contains_output_line(console, SNAPSHOT_GUEST_DISPATCH_MARKER)
             ):
                 snapshot_guest_dispatched_ns = time.perf_counter_ns()
-            if not boot_seen and boot_marker in output:
+            if not boot_seen and boot_marker in console:
                 boot_seen = True
                 if processors is None:
                     request_snapshot()
@@ -4479,13 +4765,11 @@ def capture_snapshot(
             if (
                 boot_seen
                 and not snapshot_requested
-                and contains_output_line(output, SMP_PROBE_COMPLETION_MARKER)
+                and contains_output_line(console, SMP_PROBE_COMPLETION_MARKER)
             ):
                 request_snapshot()
-            if snapshot_requested and contains_output_line(output, RESTORE_MARKER):
+            if snapshot_requested and contains_output_line(console, RESTORE_MARKER):
                 raise RuntimeError("source guest continued past the snapshot boundary")
-            if len(output) > 1024 * 1024:
-                del output[: len(output) - 1024 * 1024]
 
         returncode = process.wait()
         source_exited_ns = time.perf_counter_ns()
@@ -4524,14 +4808,15 @@ def capture_snapshot(
         )
     except Exception as error:
         terminate(process)
-        tail = output[-4096:].decode("utf-8", "replace")
+        output.drain(OUTPUT_DRAIN_TIMEOUT_SECONDS)
+        tail = output.tail()
         if tail:
             raise RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}") from error
         raise
     finally:
         if log_path is not None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_bytes(output)
+            log_path.write_bytes(output.contents())
         interaction.close()
 
 
