@@ -283,6 +283,23 @@ reports `containment-failed` instead. Every subsequent direct execution also
 requires verified emptiness, so a control-session reset cannot bypass a failed
 containment check.
 
+An `EXEC` payload holds a 32-bit timeout, a 16-bit argument count, a reserved
+16-bit field, and the length-prefixed arguments. A reserved field of 1
+announces an extended header: a 16-bit flag field, a 16-bit environment entry
+count, and a 32-bit working-directory length. With flag bit 0, an absolute
+working directory of at most 4096 bytes follows the arguments. With flag bit 1,
+up to 256 environment entries come last, each a 32-bit length and a
+`KEY=VALUE` string of at most 4096 bytes with a distinct, non-empty key, and
+replace the workload's environment; flag bit 2, which requires bit 1, layers
+them over the default environment instead, each entry replacing the default
+variable of the same name. Without bit 1, the entry count must be zero. The
+agent passes these fields through a sealed anonymous file to a launch
+helper, a copy of the agent that runs once `setpriv` has applied the workload's
+identity, inside the container root with sandbox layers. The helper applies
+any environment, enters the working directory, or `/` without one, and executes
+the workload; if it cannot enter the directory, it writes a diagnostic to the
+workload's standard error and exits with status 125.
+
 Without sandbox layers, host directories reach workloads through OpenVMM's
 single virtio-fs export. The host exports the deepest directory that contains
 every mapped path to `/run/nvx/hostfs/root`; before it accepts control traffic,
