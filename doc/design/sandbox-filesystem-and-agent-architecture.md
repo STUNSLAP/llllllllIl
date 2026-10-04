@@ -277,11 +277,16 @@ inside the `nvx-exec` cgroup; termination writes that cgroup's `cgroup.kill`,
 which also reaches processes in other sessions or process groups. When the
 workload's first process exits, the agent kills what remains and reaps the
 orphans it inherits as PID 1, so no workload process outlives its exec.
-It reports the outcome only after `cgroup.events` verifies that the cgroup is
-empty. A failed kill, unreadable or malformed events file, or settlement timeout
-reports `containment-failed` instead. Every subsequent direct execution also
-requires verified emptiness, so a control-session reset cannot bypass a failed
-containment check.
+It reports the outcome only after the cgroup's `pids.current` reads zero, that
+is, once every process of the workload has exited and been reaped. The agent
+enables the `pids` controller for this check, because the controller charges a
+process until the process is reaped. `cgroup.events` would not do: it stops
+counting a killed process as populated before the process becomes a zombie, so
+the zombie could remain in `/proc` for the next workload to find. A failed
+kill, an unreadable or malformed `pids.current`, or a settlement timeout reports
+`containment-failed` instead. Every subsequent direct execution also reaps what
+an earlier workload left and then requires verified emptiness, so a
+control-session reset cannot bypass a failed containment check.
 
 An `EXEC` payload holds a 32-bit timeout, a 16-bit argument count, a reserved
 16-bit field, and the length-prefixed arguments. A reserved field of 1

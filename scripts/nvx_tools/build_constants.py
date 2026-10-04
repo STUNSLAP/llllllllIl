@@ -60,6 +60,7 @@ class KernelBuildConstants:
     REQUIRED_SANDBOX_CONFIG: Final = (
         "CONFIG_BPF_SYSCALL=y",
         "CONFIG_CGROUP_BPF=y",
+        "CONFIG_CGROUP_PIDS=y",
         "CONFIG_EROFS_FS=y",
         "CONFIG_EROFS_FS_ZIP=y",
         "CONFIG_EROFS_FS_ZIP_ZSTD=y",
