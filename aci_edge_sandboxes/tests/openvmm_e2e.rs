@@ -22,7 +22,7 @@ use aci_edge_sandboxes::openvmm::{
 };
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, ErrorCode, ExecOutcome, ExecOutput, ExecRequest,
-    FilesystemPolicy, NetworkPolicy, NetworkRule, Protocol, ProvisionRequest, SandboxId,
+    FilesystemPolicy, NetworkPolicy, NetworkRule, Protocol, ProvisionRequest, SandboxId, StdinMode,
 };
 
 mod support;
@@ -76,6 +76,10 @@ fn shell(nvx: &AciEdgeSandbox, sandbox_id: &SandboxId, command_line: &str) -> Ex
 }
 
 /// Creates a client over the artifacts named by the environment.
+///
+/// Keep `name` short: on Unix, each sandbox's control socket path,
+/// `<state root>/<name>/<32-character token>/control.sock`, must fit in 107 bytes, and the
+/// state root of `scripts/nvx.py test-aci-edge-sandboxes` takes 42 of them under `/tmp`.
 fn client(name: &str) -> (AciEdgeSandbox, Arc<OpenVmmBackend>) {
     let state_root = env::var("ACI_EDGE_SANDBOXES_E2E_STATE_ROOT")
         .map(PathBuf::from)
@@ -209,6 +213,358 @@ fn host_paths_are_mapped_into_the_guest() {
     assert_eq!(missing.outcome, ExecOutcome::Exited(125));
 }
 
+fn sorted<const N: usize>(lines: [&str; N]) -> Vec<String> {
+    let mut lines = lines.map(str::to_owned).to_vec();
+    lines.sort();
+    lines
+}
+
+/// Returns the sorted `NAME=VALUE` lines that the workload of `request` prints.
+fn environment(nvx: &AciEdgeSandbox, sandbox_id: &SandboxId, request: ExecRequest) -> Vec<String> {
+    let output = run(nvx, sandbox_id, request);
+    assert!(output.outcome.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let mut lines: Vec<String> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    lines
+}
+
+#[test]
+#[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
+fn exec_environments_follow_the_mxc_schema() {
+    let (nvx, backend) = client("environment");
+    let sandbox = started(&nvx, &backend, &ProvisionRequest::new());
+    let sandbox_id = id(&sandbox);
+    // Programs run directly, because a shell exports variables of its own.
+    let env = || ExecRequest::argv(["/usr/bin/env"]);
+    let listing = |request| environment(&nvx, sandbox_id, request);
+
+    // No environment supplied: the guest's default environment, which never holds host variables.
+    let default = listing(env());
+    for expected in [
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+        "TERM=linux",
+        "HOME=/",
+        "USER=nobody",
+        "LOGNAME=nobody",
+    ] {
+        assert!(default.iter().any(|line| line == expected), "{default:?}");
+    }
+    assert!(
+        !default
+            .iter()
+            .any(|line| line.starts_with("ACI_EDGE_SANDBOXES_") || line.starts_with("NVX_")),
+        "{default:?}"
+    );
+    // `inheritDefaultEnv` selects nothing without entries.
+    for inherit in [true, false] {
+        assert_eq!(listing(env().with_inherit_default_env(inherit)), default);
+    }
+
+    // An explicitly empty environment starts the workload without any variable.
+    for request in [
+        env().with_envs(Vec::<String>::new()),
+        env()
+            .with_envs(Vec::<String>::new())
+            .with_inherit_default_env(false),
+    ] {
+        let empty = run(&nvx, sandbox_id, request);
+        assert_eq!(empty.outcome, ExecOutcome::Exited(0), "{empty:?}");
+        assert!(
+            empty.stdout.is_empty() && empty.stderr.is_empty(),
+            "{empty:?}"
+        );
+    }
+    // Layering nothing over the default environment is the default environment.
+    assert_eq!(
+        listing(
+            env()
+                .with_envs(Vec::<String>::new())
+                .with_inherit_default_env(true)
+        ),
+        default
+    );
+
+    // Entries are the whole environment, and an empty value stays an empty value.
+    assert_eq!(
+        listing(env().with_envs(["FOO=bar", "EMPTY="])),
+        ["EMPTY=", "FOO=bar"]
+    );
+    assert_eq!(
+        listing(env().with_env("FOO=bar").with_inherit_default_env(false)),
+        ["FOO=bar"]
+    );
+    // The guest agent refuses a name that repeats, so the request fails before anything runs.
+    let repeated = nvx
+        .exec(sandbox_id, &env().with_envs(["A=1", "B=2", "A=3"]))
+        .unwrap_err();
+    assert_eq!(repeated.code(), ErrorCode::PolicyValidation, "{repeated}");
+    // A shell receives the entries too, and keeps none of the default environment.
+    let output = run(
+        &nvx,
+        sandbox_id,
+        ExecRequest::command_line(
+            "printf '%s|%s|%s' \"$FOO\" \"${EMPTY-unset}\" \"${HOME-unset}\"",
+        )
+        .with_envs(["FOO=bar", "EMPTY="]),
+    );
+    assert_eq!(output.stdout, b"bar||unset", "{output:?}");
+
+    // Layered entries come on top of the default environment, and an entry replaces a default.
+    let layered = |entries: &[&str]| -> Vec<String> {
+        let mut expected: Vec<String> = default
+            .iter()
+            .filter(|line| {
+                let name = line.split_once('=').unwrap().0;
+                !entries
+                    .iter()
+                    .any(|entry| entry.split_once('=').unwrap().0 == name)
+            })
+            .cloned()
+            .chain(entries.iter().map(|entry| (*entry).to_owned()))
+            .collect();
+        expected.sort();
+        expected
+    };
+    assert_eq!(
+        listing(
+            env()
+                .with_envs(["FOO=bar", "PATH=/custom"])
+                .with_inherit_default_env(true)
+        ),
+        layered(&["FOO=bar", "PATH=/custom"])
+    );
+
+    // The guest agent enters a working directory itself, so no shell adds `PWD`, `OLDPWD`, or
+    // `SHLVL` to the environment of a program or rewrites entries with these names.
+    let in_tmp = || env().with_cwd("/tmp");
+    assert_eq!(listing(in_tmp().with_env("FOO=bar")), ["FOO=bar"]);
+    assert_eq!(
+        listing(in_tmp().with_envs(Vec::<String>::new())),
+        Vec::<String>::new()
+    );
+    let shell_names = [
+        "PWD=/custom",
+        "SHLVL=7",
+        "OLDPWD=/keep",
+        "-DASHED=1",
+        "A.B=2",
+        "FOO=bar",
+    ];
+    assert_eq!(
+        listing(in_tmp().with_envs(shell_names)),
+        sorted(shell_names)
+    );
+    let layered_names = ["PWD=/custom", "SHLVL=7", "FOO=bar"];
+    assert_eq!(
+        listing(
+            in_tmp()
+                .with_envs(layered_names)
+                .with_inherit_default_env(true)
+        ),
+        layered(&layered_names)
+    );
+    // A command line runs in a shell, which is the workload, so it exports `SHLVL` and `PWD`
+    // of its own, replacing entries with these names.
+    let shell = || ExecRequest::command_line("env");
+    assert_eq!(
+        listing(shell().with_env("FOO=bar")),
+        sorted(["FOO=bar", "PWD=/", "SHLVL=1"])
+    );
+    assert_eq!(
+        listing(
+            shell()
+                .with_cwd("/tmp")
+                .with_envs(["FOO=bar", "SHLVL=7", "PWD=/custom"])
+        ),
+        sorted(["FOO=bar", "PWD=/tmp", "SHLVL=8"])
+    );
+
+    // Each execution has its own environment: nothing carries over to the next one.
+    let foo = |entry: Option<&str>| {
+        let request = ExecRequest::argv(["/bin/printenv", "FOO"]);
+        run(
+            &nvx,
+            sandbox_id,
+            match entry {
+                Some(entry) => request.with_env(entry),
+                None => request,
+            },
+        )
+    };
+    for (entry, stdout) in [
+        (Some("FOO=one"), "one\n"),
+        (Some("FOO=two"), "two\n"),
+        (Some("FOO="), "\n"),
+        (Some("FOO=one"), "one\n"),
+    ] {
+        let output = foo(entry);
+        assert_eq!(
+            output.outcome,
+            ExecOutcome::Exited(0),
+            "{entry:?}: {output:?}"
+        );
+        assert_eq!(output.stdout, stdout.as_bytes(), "{entry:?}");
+    }
+    let unset = foo(None);
+    assert_eq!(unset.outcome, ExecOutcome::Exited(1), "{unset:?}");
+    assert!(unset.stdout.is_empty());
+    assert_eq!(listing(env()), default);
+}
+
+#[test]
+#[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
+fn environment_values_reach_the_workload_exactly() {
+    let (nvx, backend) = client("env-values");
+    let sandbox = started(&nvx, &backend, &ProvisionRequest::new());
+    let sandbox_id = id(&sandbox);
+    let values = [
+        ("-DASHED", "1"),
+        ("GREETING", "hello big world"),
+        ("SPACED", "  leading and trailing  "),
+        ("QUOTED", "\"double\" 'single' $HOME `date` ; | & > < \\"),
+        ("MULTILINE", "first\nsecond"),
+        ("UNICODE", "héllo ☃"),
+        ("EQUALS", "a=b=c"),
+        ("EMPTY", ""),
+    ];
+    let entries = || values.map(|(name, value)| format!("{name}={value}"));
+
+    for (name, value) in values {
+        let program = run(
+            &nvx,
+            sandbox_id,
+            ExecRequest::argv(["/bin/printenv", "--", name]).with_envs(entries()),
+        );
+        assert_eq!(program.stdout, format!("{value}\n").as_bytes(), "{name}");
+        // The workload need not be a program: a shell reads the same values.
+        if !name.starts_with('-') {
+            let shell = run(
+                &nvx,
+                sandbox_id,
+                ExecRequest::command_line(format!("printf '%s' \"${name}\"")).with_envs(entries()),
+            );
+            assert_eq!(shell.stdout, value.as_bytes(), "{name}");
+        }
+    }
+    // A program lists the entries in the order in which they were supplied, also in a working
+    // directory.
+    let listing: String = values
+        .iter()
+        .map(|(name, value)| format!("{name}={value}\n"))
+        .collect();
+    for request in [
+        ExecRequest::argv(["/usr/bin/env"]),
+        ExecRequest::argv(["/usr/bin/env"]).with_cwd("/tmp"),
+    ] {
+        let all = run(&nvx, sandbox_id, request.with_envs(entries()));
+        assert_eq!(all.stdout, listing.as_bytes(), "{all:?}");
+    }
+
+    // The guest agent takes 256 entries of 4096 bytes each.
+    let many: Vec<String> = (0..256).map(|index| format!("V{index}=x")).collect();
+    let full = run(
+        &nvx,
+        sandbox_id,
+        ExecRequest::argv(["/usr/bin/env"]).with_envs(many.clone()),
+    );
+    let expected: String = many.iter().map(|entry| format!("{entry}\n")).collect();
+    assert_eq!(full.stdout, expected.as_bytes(), "{full:?}");
+    let large = format!("BIG={}", "x".repeat(4096 - 4));
+    let output = run(
+        &nvx,
+        sandbox_id,
+        ExecRequest::argv(["/usr/bin/env"]).with_env(large.clone()),
+    );
+    assert_eq!(output.stdout, format!("{large}\n").as_bytes());
+    for beyond in [
+        ExecRequest::argv(["/usr/bin/env"]).with_envs((0..257).map(|index| format!("V{index}=x"))),
+        ExecRequest::argv(["/usr/bin/env"]).with_env(format!("BIG={}", "x".repeat(4096 - 3))),
+    ] {
+        let rejected = nvx.exec(sandbox_id, &beyond).unwrap_err();
+        assert_eq!(rejected.code(), ErrorCode::PolicyValidation, "{rejected}");
+    }
+}
+
+#[test]
+#[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
+fn environments_leave_the_workload_contained() {
+    let (nvx, backend) = client("containment");
+    let sandbox = started(&nvx, &backend, &ProvisionRequest::new());
+    let sandbox_id = id(&sandbox);
+
+    // The guest agent applies the entries and enters the working directory after it dropped the
+    // workload's privileges, so the workload keeps its identity, no capabilities, and
+    // `no_new_privs`.
+    let probe =
+        || ExecRequest::command_line("id -u; grep -E '^(CapEff|NoNewPrivs):' /proc/self/status");
+    for request in [
+        probe(),
+        probe().with_env("FOO=bar"),
+        probe().with_envs(Vec::<String>::new()),
+        probe().with_env("FOO=bar").with_inherit_default_env(true),
+        probe().with_cwd("/tmp").with_env("FOO=bar"),
+    ] {
+        let output = run(&nvx, sandbox_id, request.clone());
+        assert_eq!(
+            output.stdout, b"65534\nCapEff:\t0000000000000000\nNoNewPrivs:\t1\n",
+            "{request:?}: {output:?}"
+        );
+    }
+
+    // The working directory is entered with the environment in place.
+    let output = run(
+        &nvx,
+        sandbox_id,
+        ExecRequest::command_line("pwd; printf '%s' \"$FOO\"")
+            .with_cwd("/tmp")
+            .with_env("FOO=bar baz"),
+    );
+    assert_eq!(output.stdout, b"/tmp\nbar baz", "{output:?}");
+    // A directory that is missing, or that the workload identity cannot enter, ends the workload
+    // before it runs.
+    for cwd in ["/missing", "/root"] {
+        let refused = run(
+            &nvx,
+            sandbox_id,
+            ExecRequest::argv(["/bin/true"])
+                .with_cwd(cwd)
+                .with_env("FOO=bar"),
+        );
+        assert_eq!(refused.outcome, ExecOutcome::Exited(125), "{refused:?}");
+    }
+
+    // Timeouts and cancellation still reach the workload that the entries were applied to.
+    let timed_out = run(
+        &nvx,
+        sandbox_id,
+        ExecRequest::command_line("sleep 30")
+            .with_env("FOO=bar")
+            .with_timeout(Duration::from_millis(500)),
+    );
+    assert_eq!(timed_out.outcome, ExecOutcome::TimedOut);
+    let started = Instant::now();
+    let mut execution = nvx
+        .exec(
+            sandbox_id,
+            &ExecRequest::command_line("echo started; sleep 30").with_envs(["FOO=bar"]),
+        )
+        .unwrap();
+    let mut stdout = execution.take_stdout().unwrap();
+    let mut first = [0u8; 8];
+    std::io::Read::read_exact(&mut stdout, &mut first).unwrap();
+    assert_eq!(&first, b"started\n");
+    execution.canceller().cancel().unwrap();
+    assert_eq!(execution.wait().unwrap(), ExecOutcome::Cancelled);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let leftover = shell(&nvx, sandbox_id, "pgrep -x sleep || echo none");
+    assert_eq!(leftover.stdout, b"none\n");
+}
+
 #[test]
 #[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
 fn network_policies_are_enforced() {
@@ -333,10 +689,11 @@ fn openvmm_lifecycle_on_a_real_hypervisor() {
         ExecRequest::command_line("sleep 30").with_timeout(Duration::from_millis(500)),
     );
     assert_eq!(timed_out.outcome, ExecOutcome::TimedOut);
+    // Piped standard input is the one exec feature that remains unsupported.
     assert_eq!(
         nvx.exec(
             &sandbox_id,
-            &ExecRequest::command_line("touch /tmp/rejected").with_env("MODE=test")
+            &ExecRequest::command_line("touch /tmp/rejected").with_stdin(StdinMode::Piped)
         )
         .unwrap_err()
         .code(),

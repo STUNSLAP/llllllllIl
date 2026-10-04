@@ -5,13 +5,22 @@
 //! input, serves the authenticated control console on the requested Unix socket or named pipe,
 //! and runs scripted workloads. Integration tests point `OpenVmmConfig::openvmm` at it.
 //!
-//! Workloads are `/bin/sh -c SCRIPT` or `/bin/echo ARGS...`. A script is a `;`-separated list
-//! of commands: `echo TEXT`, `echoerr TEXT`, `sleep MS`, `exit CODE`, `signal NUMBER`,
-//! `flood BYTES`, `write KEY VALUE`, `read KEY`, `fail`, and `launchfail`. Values written with
-//! `write` live in memory until the VM stops, like files in the guest's RAM root file system.
+//! Workloads are `/bin/sh -c SCRIPT`, `/bin/echo ARGS...`, or a program named `env` or
+//! `printenv` in any directory, which prints its environment. A script is a `;`-separated list of
+//! commands: `echo TEXT`, `echoerr TEXT`, `sleep MS`, `exit CODE`, `signal NUMBER`,
+//! `flood BYTES`, `write KEY VALUE`, `read KEY`, `env`, `printenv NAME`, `pwd`, `fail`, and
+//! `launchfail`. Values written with `write` live in memory until the VM stops, like files in the
+//! guest's RAM root file system.
 //! A `CANCEL` request ends a sleeping workload with the cancelled outcome, and a client that
 //! disconnects during an exec abandons it, as the real guest agent does. `pwd` prints the
-//! working directory that the backend's `cd` prelude selects.
+//! working directory of the exec request.
+//!
+//! Each workload gets the environment that its exec request selects, in the order in which the
+//! guest agent builds it. The default environment is the documented guest bootstrap environment:
+//! `PATH`, `TERM`, and the `HOME`, `USER`, and `LOGNAME` of the workload account. The guest's
+//! boot leaves a few more variables behind, which the fake omits. Like BusyBox's `sh`, a script
+//! exports `SHLVL`, one higher than the value that it received, and its working directory as
+//! `PWD`, replacing entries with these names.
 //!
 //! Kernel command-line tokens adjust the emulation: `fake_exit_on_start=CODE` fails the launch,
 //! `fake_boot_delay_ms=MS` delays the control endpoint, `fake_crash_after_ms=MS` makes the VM
@@ -52,8 +61,42 @@ const APP_STOPPED: u8 = 0x85;
 const APP_ERROR: u8 = 0xff;
 
 /// Control features of the current guest: cancellation, host path mappings, workload accounts,
-/// and workload containment.
-const GUEST_FEATURES: u32 = 0b1111;
+/// workload containment, and per-execution environments.
+const GUEST_FEATURES: u32 = 0b1_1111;
+
+const EXEC_EXTENDED: u16 = 1;
+const EXEC_CWD_PRESENT: u16 = 1 << 0;
+const EXEC_ENVIRONMENT_PRESENT: u16 = 1 << 1;
+const EXEC_INHERIT_DEFAULT_ENV: u16 = 1 << 2;
+const MAX_ARGUMENT_BYTES: usize = 4096;
+const MAX_ENVIRONMENT: usize = 256;
+
+/// `NAME=VALUE` variables in the order in which a workload's `environ` lists them.
+type Environment = Vec<(String, String)>;
+
+/// Sets `name` like `putenv`: in place when it exists, and at the end otherwise.
+fn set_variable(environment: &mut Environment, name: &str, value: &str) {
+    match environment
+        .iter_mut()
+        .find(|(existing, _)| existing == name)
+    {
+        Some(entry) => value.clone_into(&mut entry.1),
+        None => environment.push((name.to_owned(), value.to_owned())),
+    }
+}
+
+/// What BusyBox's `sh` does to the environment of everything that it starts: it raises `SHLVL`
+/// and exports its working directory as `PWD`, replacing the values of the same names that it
+/// received. It keeps every other variable.
+fn start_shell(environment: &mut Environment, cwd: &str) {
+    let level = environment
+        .iter()
+        .find(|(name, _)| name == "SHLVL")
+        .and_then(|(_, value)| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    set_variable(environment, "SHLVL", &(level + 1).to_string());
+    set_variable(environment, "PWD", cwd);
+}
 
 struct Options {
     endpoint: String,
@@ -66,6 +109,7 @@ struct Options {
     ignore_stop: bool,
     ignore_cancel: bool,
     legacy_guest: bool,
+    workload_uid: u32,
 }
 
 fn main() -> ExitCode {
@@ -177,14 +221,12 @@ fn parse(arguments: &[String]) -> Result<Options, String> {
         return Err("--memory must be given in MiB".to_owned());
     }
     let identity = single("--microvm-workload-identity")?;
-    let valid_identity = identity.split_once(':').is_some_and(|(uid, gid)| {
-        [uid, gid]
-            .iter()
-            .all(|id| id.parse::<u32>().is_ok_and(|id| id != 0))
-    });
-    if !valid_identity {
-        return Err(format!("invalid workload identity {identity}"));
-    }
+    let workload_uid = identity
+        .split_once(':')
+        .and_then(|(uid, gid)| Some((uid.parse::<u32>().ok()?, gid.parse::<u32>().ok()?)))
+        .filter(|&(uid, gid)| uid != 0 && gid != 0)
+        .map(|(uid, _)| uid)
+        .ok_or_else(|| format!("invalid workload identity {identity}"))?;
     let kernel = PathBuf::from(single("--kernel")?);
     for path in [&kernel, &PathBuf::from(single("--initrd")?)] {
         if !path.is_file() {
@@ -274,6 +316,7 @@ fn parse(arguments: &[String]) -> Result<Options, String> {
         ignore_stop: knob("fake_ignore_stop") == Some("1"),
         ignore_cancel: knob("fake_ignore_cancel") == Some("1"),
         legacy_guest: knob("fake_legacy_guest") == Some("1"),
+        workload_uid,
     })
 }
 
@@ -294,9 +337,43 @@ fn read_capability() -> Result<[u8; CAPABILITY_LEN], String> {
 }
 
 /// Guest state that lives in memory until the VM stops.
-#[derive(Default)]
 struct Guest {
     values: BTreeMap<String, String>,
+    /// Environment that workloads inherit unless they replace it.
+    default_environment: Environment,
+}
+
+impl Guest {
+    fn new(options: &Options) -> Self {
+        // The Alpine image resolves the default identity to `nobody`; for any other host-selected
+        // identity, the managed init creates the `nvx` account homed in /tmp.
+        let (user, home) = if options.workload_uid == 65534 {
+            ("nobody", "/")
+        } else {
+            ("nvx", "/tmp")
+        };
+        let default_environment = [
+            ("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"),
+            ("TERM", "linux"),
+            ("HOME", home),
+            ("USER", user),
+            ("LOGNAME", user),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+        Self {
+            values: BTreeMap::new(),
+            default_environment,
+        }
+    }
+}
+
+struct Exec {
+    argv: Vec<String>,
+    cwd: Option<String>,
+    environment: Option<Vec<String>>,
+    inherit_default_env: bool,
 }
 
 enum Flow {
@@ -518,30 +595,32 @@ impl<S: Read + Write + Pending> Session<'_, S> {
         payload: &[u8],
         guest: &mut Guest,
     ) -> io::Result<Option<()>> {
-        let Some(argv) = decode_exec(payload) else {
+        let Some(exec) = decode_exec(payload) else {
             return self.send_some(APP_ERROR, request_id, 22, b"invalid-request");
         };
-        let timeout_ms = u32_at(payload, 0);
-        const PRELUDE: &str = "cd -- \"$1\" || exit 125\nshift\n";
-        let words: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let (words, cwd) = match words.as_slice() {
-            ["/bin/sh", "-c", script, "/bin/sh", cwd, rest @ ..] if script.starts_with(PRELUDE) => {
-                let script = &script[PRELUDE.len()..];
-                let mut words = if script == "exec \"$@\"" {
-                    rest.to_vec()
-                } else {
-                    vec!["/bin/sh", "-c", script]
-                };
-                if words.is_empty() {
-                    words.push("/bin/true");
-                }
-                (words, (*cwd).to_owned())
-            }
-            _ => (words, "/".to_owned()),
+        let mut environment = if exec.inherit_default_env {
+            guest.default_environment.clone()
+        } else {
+            Environment::new()
         };
-        let script = match words.as_slice() {
-            ["/bin/sh", "-c", script] => (*script).to_owned(),
-            ["/bin/echo", words @ ..] => format!("echo {}", words.join(" ")),
+        for entry in exec.environment.iter().flatten() {
+            let (name, value) = entry.split_once('=').unwrap();
+            set_variable(&mut environment, name, value);
+        }
+        let cwd = exec.cwd.as_deref().unwrap_or("/");
+        let timeout_ms = u32_at(payload, 0);
+        let program_name =
+            |program: &str| program.rsplit('/').next().unwrap_or_default().to_owned();
+        let script = match exec.argv.as_slice() {
+            [shell, option, script] if shell == "/bin/sh" && option == "-c" => {
+                start_shell(&mut environment, cwd);
+                script.clone()
+            }
+            [program, words @ ..] if program == "/bin/echo" => format!("echo {}", words.join(" ")),
+            [program] if ["env", "printenv"].contains(&program_name(program).as_str()) => {
+                "env".to_owned()
+            }
+            [program, name] if program_name(program) == "printenv" => format!("printenv {name}"),
             [program, ..] => {
                 let message = format!("aci-edge-sandboxes-fake-openvmm: {program}: not found\n");
                 self.send(APP_STDERR, request_id, 0, message.as_bytes())?;
@@ -563,16 +642,14 @@ impl<S: Read + Write + Pending> Session<'_, S> {
             match name {
                 "echo" | "echoerr" => {
                     let line = format!("{argument}\n");
-                    if output + line.len() > MAX_OUTPUT_BYTES {
-                        return self.send_some(APP_EXIT, request_id, 125, b"output-limit");
-                    }
-                    output += line.len();
                     let kind = if name == "echo" {
                         APP_STDOUT
                     } else {
                         APP_STDERR
                     };
-                    self.send(kind, request_id, 0, line.as_bytes())?;
+                    if !self.forward(kind, request_id, &mut output, line.as_bytes())? {
+                        return self.send_some(APP_EXIT, request_id, 125, b"output-limit");
+                    }
                 }
                 "sleep" => {
                     let wake =
@@ -606,12 +683,10 @@ impl<S: Read + Write + Pending> Session<'_, S> {
                     let mut remaining: usize = argument.parse().unwrap_or(0);
                     while remaining > 0 {
                         let chunk = remaining.min(OUTPUT_CHUNK_BYTES);
-                        if output + chunk > MAX_OUTPUT_BYTES {
+                        if !self.forward(APP_STDOUT, request_id, &mut output, &vec![b'x'; chunk])? {
                             return self.send_some(APP_EXIT, request_id, 125, b"output-limit");
                         }
-                        output += chunk;
                         remaining -= chunk;
-                        self.send(APP_STDOUT, request_id, 0, &vec![b'x'; chunk])?;
                     }
                 }
                 "write" => {
@@ -621,6 +696,25 @@ impl<S: Read + Write + Pending> Session<'_, S> {
                 "read" => {
                     if let Some(value) = guest.values.get(argument).cloned() {
                         self.send(APP_STDOUT, request_id, 0, value.as_bytes())?;
+                    }
+                }
+                "env" => {
+                    for (name, value) in &environment {
+                        let line = format!("{name}={value}\n");
+                        if !self.forward(APP_STDOUT, request_id, &mut output, line.as_bytes())? {
+                            return self.send_some(APP_EXIT, request_id, 125, b"output-limit");
+                        }
+                    }
+                }
+                "printenv" => {
+                    let value = environment
+                        .iter()
+                        .find(|(variable, _)| variable == argument)
+                        .map(|(_, value)| format!("{value}\n"));
+                    if let Some(line) = value
+                        && !self.forward(APP_STDOUT, request_id, &mut output, line.as_bytes())?
+                    {
+                        return self.send_some(APP_EXIT, request_id, 125, b"output-limit");
                     }
                 }
                 "pwd" => {
@@ -651,22 +745,112 @@ impl<S: Read + Write + Pending> Session<'_, S> {
     ) -> io::Result<Option<()>> {
         self.send(kind, request_id, status, payload).map(Some)
     }
+
+    /// Forwards workload output unless it would exceed the guest agent's output limit, and
+    /// returns whether it did. A workload whose output was refused ends with `output-limit`.
+    fn forward(
+        &mut self,
+        kind: u8,
+        request_id: u64,
+        forwarded: &mut usize,
+        output: &[u8],
+    ) -> io::Result<bool> {
+        if *forwarded + output.len() > MAX_OUTPUT_BYTES {
+            return Ok(false);
+        }
+        *forwarded += output.len();
+        self.send(kind, request_id, 0, output)?;
+        Ok(true)
+    }
 }
 
-fn decode_exec(payload: &[u8]) -> Option<Vec<String>> {
-    if payload.len() < 8 || payload[6..8] != [0, 0] {
+/// Reads the `length` bytes at `offset` as text. Like the guest agent, refuses a NUL byte, which
+/// it rejects in every argument, working directory, and environment entry.
+fn text_at(payload: &[u8], offset: usize, length: usize) -> Option<String> {
+    let bytes = payload.get(offset..offset + length)?;
+    if bytes.contains(&0) {
         return None;
     }
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+fn decode_exec(payload: &[u8]) -> Option<Exec> {
+    if payload.len() < 8 {
+        return None;
+    }
+    let extension = u16::from_le_bytes(payload[6..8].try_into().ok()?);
     let count = usize::from(u16::from_le_bytes([payload[4], payload[5]]));
-    let mut offset = 8;
+    // Like the guest agent, accept only flags that it knows, in combinations that make sense.
+    let (flags, environment_count, cwd_len, mut offset) = match extension {
+        0 => (0, 0, 0, 8),
+        EXEC_EXTENDED if payload.len() >= 16 => {
+            let flags = u16::from_le_bytes(payload[8..10].try_into().ok()?);
+            let environment_count =
+                usize::from(u16::from_le_bytes(payload[10..12].try_into().ok()?));
+            let cwd_len = u32_at(payload, 12) as usize;
+            let known = EXEC_CWD_PRESENT | EXEC_ENVIRONMENT_PRESENT | EXEC_INHERIT_DEFAULT_ENV;
+            let cwd_valid = if flags & EXEC_CWD_PRESENT == 0 {
+                cwd_len == 0
+            } else {
+                (1..=MAX_ARGUMENT_BYTES).contains(&cwd_len)
+            };
+            let environment_valid = flags & EXEC_ENVIRONMENT_PRESENT != 0
+                || (environment_count == 0 && flags & EXEC_INHERIT_DEFAULT_ENV == 0);
+            if flags & !known != 0
+                || !cwd_valid
+                || !environment_valid
+                || environment_count > MAX_ENVIRONMENT
+            {
+                return None;
+            }
+            (flags, environment_count, cwd_len, 16)
+        }
+        _ => return None,
+    };
     let mut argv = Vec::with_capacity(count);
     for _ in 0..count {
         let length = u32_at(payload.get(offset..offset + 4)?, 0) as usize;
         offset += 4;
-        argv.push(String::from_utf8(payload.get(offset..offset + length)?.to_vec()).ok()?);
+        if length == 0 || length > MAX_ARGUMENT_BYTES {
+            return None;
+        }
+        argv.push(text_at(payload, offset, length)?);
         offset += length;
     }
-    (offset == payload.len() && !argv.is_empty()).then_some(argv)
+    let cwd = if flags & EXEC_CWD_PRESENT == 0 {
+        None
+    } else {
+        let cwd = text_at(payload, offset, cwd_len)?;
+        offset += cwd_len;
+        if !cwd.starts_with('/') {
+            return None;
+        }
+        Some(cwd)
+    };
+    let mut environment = Vec::with_capacity(environment_count);
+    let mut names = BTreeSet::new();
+    for _ in 0..environment_count {
+        let length = u32_at(payload.get(offset..offset + 4)?, 0) as usize;
+        offset += 4;
+        if length == 0 || length > MAX_ARGUMENT_BYTES {
+            return None;
+        }
+        let entry = text_at(payload, offset, length)?;
+        offset += length;
+        // Like the guest agent, refuse entries without a name and repeated names.
+        let (name, _) = entry.split_once('=').filter(|(name, _)| !name.is_empty())?;
+        if !names.insert(name.to_owned()) {
+            return None;
+        }
+        environment.push(entry);
+    }
+    (offset == payload.len() && !argv.is_empty()).then_some(Exec {
+        argv,
+        cwd,
+        environment: (flags & EXEC_ENVIRONMENT_PRESENT != 0).then_some(environment),
+        inherit_default_env: flags & EXEC_ENVIRONMENT_PRESENT == 0
+            || flags & EXEC_INHERIT_DEFAULT_ENV != 0,
+    })
 }
 
 /// Authenticates one client and serves it until it disconnects or stops the VM.
@@ -737,7 +921,7 @@ fn serve(options: &Options, capability: &[u8; CAPABILITY_LEN]) -> io::Result<()>
 
     let listener = UnixListener::bind(&options.endpoint)?;
     fs::set_permissions(&options.endpoint, fs::Permissions::from_mode(0o600))?;
-    let mut guest = Guest::default();
+    let mut guest = Guest::new(options);
     let mut epoch = 0;
     for stream in listener.incoming() {
         let mut stream = stream?;
@@ -792,7 +976,7 @@ fn serve(options: &Options, capability: &[u8; CAPABILITY_LEN]) -> io::Result<()>
     // SAFETY: CreateNamedPipeW returned a fresh handle that nothing else owns.
     let mut file = File::from(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) });
     let pipe = file.as_raw_handle() as HANDLE;
-    let mut guest = Guest::default();
+    let mut guest = Guest::new(options);
     let mut epoch = 0;
     loop {
         // SAFETY: the handle is a pipe server instance; a null OVERLAPPED waits synchronously.
@@ -817,6 +1001,66 @@ fn serve(options: &Options, capability: &[u8; CAPABILITY_LEN]) -> io::Result<()>
         unsafe { DisconnectNamedPipe(pipe) };
         if let Flow::Exit = flow {
             return Ok(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encodes an extended exec request with an explicit environment.
+    fn extended(argv: &[&str], cwd: Option<&str>, environment: &[&str]) -> Vec<u8> {
+        let length = |text: &str| u32::try_from(text.len()).unwrap().to_le_bytes();
+        let mut flags = EXEC_ENVIRONMENT_PRESENT;
+        if cwd.is_some() {
+            flags |= EXEC_CWD_PRESENT;
+        }
+        let mut payload = 0u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&u16::try_from(argv.len()).unwrap().to_le_bytes());
+        payload.extend_from_slice(&EXEC_EXTENDED.to_le_bytes());
+        payload.extend_from_slice(&flags.to_le_bytes());
+        payload.extend_from_slice(&u16::try_from(environment.len()).unwrap().to_le_bytes());
+        payload.extend_from_slice(&length(cwd.unwrap_or_default()));
+        for argument in argv {
+            payload.extend_from_slice(&length(argument));
+            payload.extend_from_slice(argument.as_bytes());
+        }
+        payload.extend_from_slice(cwd.unwrap_or_default().as_bytes());
+        for entry in environment {
+            payload.extend_from_slice(&length(entry));
+            payload.extend_from_slice(entry.as_bytes());
+        }
+        payload
+    }
+
+    #[test]
+    fn exec_requests_are_refused_where_the_guest_agent_refuses_them() {
+        let exec = decode_exec(&extended(
+            &["/usr/bin/env", "-0"],
+            Some("/tmp"),
+            &["FOO=bar", "EMPTY="],
+        ))
+        .unwrap();
+        assert_eq!(exec.argv, ["/usr/bin/env", "-0"]);
+        assert_eq!(exec.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(
+            exec.environment,
+            Some(vec!["FOO=bar".to_owned(), "EMPTY=".to_owned()])
+        );
+        assert!(!exec.inherit_default_env);
+        for payload in [
+            extended(&["/usr/bin/env"], None, &["FOO=b\0r"]),
+            extended(&["/usr/bin/env"], None, &["F\0O=bar"]),
+            extended(&["/usr/bin/e\0nv"], None, &[]),
+            extended(&["/usr/bin/env", "a\0b"], None, &[]),
+            extended(&["/usr/bin/env"], Some("/t\0mp"), &[]),
+            extended(&["/usr/bin/env"], Some("tmp"), &[]),
+            extended(&["/usr/bin/env"], None, &["FOO=1", "FOO=2"]),
+            extended(&["/usr/bin/env"], None, &["NOVALUE"]),
+            extended(&["/usr/bin/env"], None, &["=value"]),
+        ] {
+            assert!(decode_exec(&payload).is_none(), "{payload:?}");
         }
     }
 }

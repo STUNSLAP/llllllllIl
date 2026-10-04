@@ -232,7 +232,7 @@ def _write_release_fixture(
         "openvmm": {
             "microvm_abi_version": 2,
             "control_session_protocol_version": 1,
-            "control_contract_revision": "nvx-microvm-v2-control-v1",
+            "control_contract_revision": "nvx-microvm-v2-control-v2",
         },
         "linux": {
             "version": "6.18.38",
@@ -852,6 +852,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(execute.sandbox_operation, "exec")
         self.assertEqual(execute.sandbox_arg, ["-c", "echo managed"])
         self.assertEqual(execute.exec_timeout_ms, 5000)
+        self.assertFalse(execute.inherit_default_environment)
 
         configured = nvx.parse_args(
             [
@@ -865,6 +866,7 @@ class CliTests(unittest.TestCase):
                 "EMPTY=",
                 "--environment",
                 "VALUE=space = value",
+                "--inherit-default-environment",
             ]
         )
         self.assertEqual(configured.cwd, "/work tree")
@@ -872,6 +874,7 @@ class CliTests(unittest.TestCase):
             configured.environment,
             ["EMPTY=", "VALUE=space = value"],
         )
+        self.assertTrue(configured.inherit_default_environment)
 
         report = nvx.parse_args(
             [
@@ -920,7 +923,50 @@ class CliTests(unittest.TestCase):
             response_timeout=60.0,
             cwd="/work",
             environment=(),
+            inherit_default_environment=False,
         )
+
+    def test_sandbox_exec_forwards_environment_inheritance(self):
+        cases: tuple[tuple[list[str], tuple[str, ...] | None], ...] = (
+            (["--environment", "A=1"], ("A=1",)),
+            (
+                ["--environment", "A=1", "--environment", "TERM=dumb"],
+                ("A=1", "TERM=dumb"),
+            ),
+            # Without entries the workload gets the defaults whatever the flag says.
+            ([], None),
+        )
+        for environment_args, environment in cases:
+            with self.subTest(environment=environment):
+                args = nvx.parse_args(
+                    [
+                        "sandbox",
+                        "exec",
+                        "--state-dir",
+                        "state",
+                        *environment_args,
+                        "--inherit-default-environment",
+                    ]
+                )
+                result = sandbox_lifecycle.ManagedExecResult(0, "exit", b"", b"")
+                with (
+                    patch.object(
+                        sandbox_lifecycle,
+                        "exec_workload",
+                        return_value=result,
+                    ) as execute,
+                    self.assertRaises(SystemExit),
+                ):
+                    nvx.command_sandbox(args)
+                execute.assert_called_once_with(
+                    Path("state"),
+                    ("/bin/sh",),
+                    timeout_ms=0,
+                    response_timeout=60.0,
+                    cwd=None,
+                    environment=environment,
+                    inherit_default_environment=True,
+                )
 
     def test_sandbox_exec_rejects_ambiguous_or_one_shot_environment(self):
         both = nvx.parse_args(
@@ -941,6 +987,16 @@ class CliTests(unittest.TestCase):
         one_shot = nvx.parse_args(["sandbox", "run", "--environment", "A=1"])
         with self.assertRaisesRegex(common.ScriptError, "require.*exec"):
             nvx.command_sandbox(one_shot)
+
+        for operation in ("run", "start"):
+            inheriting = nvx.parse_args(
+                ["sandbox", operation, "--inherit-default-environment"]
+            )
+            with (
+                self.subTest(operation=operation),
+                self.assertRaisesRegex(common.ScriptError, "require.*exec"),
+            ):
+                nvx.command_sandbox(inheriting)
 
     def test_sandbox_environment_file_is_bounded_before_state_access(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -4622,7 +4678,7 @@ class BuildTests(unittest.TestCase):
             {
                 "microvm_abi_version": 2,
                 "control_session_protocol_version": 1,
-                "control_contract_revision": "nvx-microvm-v2-control-v1",
+                "control_contract_revision": "nvx-microvm-v2-control-v2",
             },
         )
 
@@ -6425,11 +6481,20 @@ class ManagedAgentStopTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, stderr)
 
     def test_agent_advertises_the_control_features_of_its_mode(self):
-        cancel, host_mappings, workload_account, exec_cgroup = 1, 2, 4, 8
+        cancel, host_mappings, workload_account, exec_cgroup, environment = (
+            1,
+            2,
+            4,
+            8,
+            16,
+        )
         for rootfs, expected in (
             # Only the direct agent maps host paths and gives each workload a cgroup.
-            ("-", cancel | host_mappings | workload_account | exec_cgroup),
-            ("/run/nvx/rootfs", cancel | workload_account),
+            (
+                "-",
+                cancel | host_mappings | workload_account | exec_cgroup | environment,
+            ),
+            ("/run/nvx/rootfs", cancel | workload_account | environment),
         ):
             with self.subTest(rootfs=rootfs):
                 kind, request_id, status, body = self._request(rootfs, 5)
@@ -11006,7 +11071,7 @@ class ReleaseTests(unittest.TestCase):
             )
             self.assertEqual(
                 manifest["openvmm"]["control_contract_revision"],
-                "nvx-microvm-v2-control-v1",
+                "nvx-microvm-v2-control-v2",
             )
             self.assertEqual(
                 manifest["linux"]["kernel_sha256"],

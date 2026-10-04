@@ -54,6 +54,7 @@
 #define FEATURE_HOST_MAPPINGS (1U << 1)
 #define FEATURE_WORKLOAD_ACCOUNT (1U << 2)
 #define FEATURE_EXEC_CGROUP (1U << 3)
+#define FEATURE_EXEC_ENVIRONMENT (1U << 4)
 
 #define MAX_ARGUMENTS 64U
 #define MAX_ARGUMENT_LEN 4096U
@@ -61,6 +62,7 @@
 #define EXEC_EXTENDED 1U
 #define EXEC_CWD_PRESENT 1U
 #define EXEC_ENVIRONMENT_PRESENT 2U
+#define EXEC_INHERIT_DEFAULT_ENV 4U
 #define MAX_OUTPUT_BYTES (1024U * 1024U)
 #define OUTPUT_CHUNK_BYTES 32768U
 #define CONTAINER_BARRIER_ATTEMPTS 500U
@@ -116,6 +118,7 @@ struct exec_config {
     char **environment;
     uint16_t environment_count;
     int environment_present;
+    int inherit_default_env;
 };
 
 static uint16_t read_u16(const uint8_t *bytes)
@@ -1100,12 +1103,15 @@ static int decode_exec_payload(
         environment_count = read_u16(payload + 10);
         cwd_len = read_u32(payload + 12);
         offset = 16;
-        if ((flags & ~(EXEC_CWD_PRESENT | EXEC_ENVIRONMENT_PRESENT)) != 0 ||
+        if ((flags &
+             ~(EXEC_CWD_PRESENT | EXEC_ENVIRONMENT_PRESENT |
+               EXEC_INHERIT_DEFAULT_ENV)) != 0 ||
             ((flags & EXEC_CWD_PRESENT) == 0 && cwd_len != 0) ||
             ((flags & EXEC_CWD_PRESENT) != 0 &&
              (cwd_len == 0 || cwd_len > MAX_ARGUMENT_LEN)) ||
             ((flags & EXEC_ENVIRONMENT_PRESENT) == 0 &&
-             environment_count != 0) ||
+             (environment_count != 0 ||
+              (flags & EXEC_INHERIT_DEFAULT_ENV) != 0)) ||
             environment_count > MAX_ENVIRONMENT) {
             return -1;
         }
@@ -1162,6 +1168,8 @@ static int decode_exec_payload(
                 goto fail;
             }
             config->environment_present = 1;
+            config->inherit_default_env =
+                (flags & EXEC_INHERIT_DEFAULT_ENV) != 0;
             config->environment_count = environment_count;
             for (index = 0; index < environment_count; ++index) {
                 uint32_t length;
@@ -1259,6 +1267,9 @@ static int write_exec_config(int fd, const struct exec_config *config)
     if (config->environment_present) {
         flags |= EXEC_ENVIRONMENT_PRESENT;
     }
+    if (config->inherit_default_env) {
+        flags |= EXEC_INHERIT_DEFAULT_ENV;
+    }
     write_u16(header, flags);
     write_u16(header + 2, config->environment_count);
     write_u32(header + 4, config->cwd == NULL ? 0 : (uint32_t)strlen(config->cwd));
@@ -1324,13 +1335,16 @@ static int launch_workload(int argc, char **argv)
     flags = read_u16(header);
     environment_count = read_u16(header + 2);
     cwd_len = read_u32(header + 4);
-    if ((flags & ~(EXEC_CWD_PRESENT | EXEC_ENVIRONMENT_PRESENT)) != 0 ||
+    if ((flags &
+         ~(EXEC_CWD_PRESENT | EXEC_ENVIRONMENT_PRESENT |
+           EXEC_INHERIT_DEFAULT_ENV)) != 0 ||
         environment_count > MAX_ENVIRONMENT ||
         ((flags & EXEC_CWD_PRESENT) == 0 && cwd_len != 0) ||
         ((flags & EXEC_CWD_PRESENT) != 0 &&
          (cwd_len == 0 || cwd_len > MAX_ARGUMENT_LEN)) ||
         ((flags & EXEC_ENVIRONMENT_PRESENT) == 0 &&
-         environment_count != 0)) {
+         (environment_count != 0 ||
+          (flags & EXEC_INHERIT_DEFAULT_ENV) != 0))) {
         return 125;
     }
     if (cwd_len != 0) {
@@ -1380,7 +1394,7 @@ static int launch_workload(int argc, char **argv)
         goto fail;
     }
     if ((flags & EXEC_ENVIRONMENT_PRESENT) != 0) {
-        if (clearenv() != 0) {
+        if ((flags & EXEC_INHERIT_DEFAULT_ENV) == 0 && clearenv() != 0) {
             goto fail;
         }
         for (index = 0; index < environment_count; ++index) {
@@ -1796,7 +1810,8 @@ static int run_exec(
 /* Direct mode alone sets up host mappings and a cgroup for each workload. */
 static uint32_t agent_features(const struct agent_config *config)
 {
-    uint32_t features = FEATURE_CANCEL | FEATURE_WORKLOAD_ACCOUNT;
+    uint32_t features =
+        FEATURE_CANCEL | FEATURE_WORKLOAD_ACCOUNT | FEATURE_EXEC_ENVIRONMENT;
 
     if (config->direct) {
         features |= FEATURE_HOST_MAPPINGS | FEATURE_EXEC_CGROUP;

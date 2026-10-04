@@ -445,6 +445,7 @@ python3 scripts/nvx.py sandbox
     [--cwd GUEST_PATH]
     [--environment KEY=VALUE]...
     [--environment-file PATH]
+    [--inherit-default-environment]
     [--hypervisor {auto,whp,kvm,mshv}]
     [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]
     [--mount-deny HOST_PATH]...
@@ -484,6 +485,7 @@ launches.
 | `--cwd GUEST_PATH` | `/` | Set an absolute working directory inside the workload root for managed `exec`. It is resolved after the workload identity and root are applied; missing, inaccessible, or non-directory paths fail the workload launch. |
 | `--environment KEY=VALUE` | omitted | Set the exact managed `exec` environment. Repeat for multiple entries. Empty values, spaces, additional equals signs, and UTF-8 are preserved. Inline values are visible in the invoking host process arguments; use `--environment-file` for sensitive values. |
 | `--environment-file PATH` | omitted | Read the exact managed `exec` environment from a UTF-8 JSON array of `KEY=VALUE` strings, limited to 1 MiB of input. An empty array requests an empty environment. This option is mutually exclusive with `--environment`; omitting both preserves guest defaults. |
+| `--inherit-default-environment` | off | Layer the managed `exec` environment from `--environment` or `--environment-file` over the guest default environment instead of replacing it; an entry replaces the default variable of the same name. Without either option the workload already receives the defaults, so the flag has no effect. |
 | `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the host hypervisor. |
 | `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Live-share one host directory at the absolute target inside the container rootfs for `run` or `provision`; defaults to `ro`. An `rw` share accepts guest-created symbolic links, which the host never follows. `/`, `/etc`, and the `/proc`, `/sys`, `/dev`, and `/.nvx-agent` trees are reserved. |
 | `--mount-deny HOST_PATH` | none | Hide one existing file or directory inside the `--mount` host directory; relative paths are resolved inside it. Repeat to deny multiple paths. |

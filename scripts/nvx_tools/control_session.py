@@ -25,6 +25,7 @@ APP_MAX_CWD_BYTES = 4096
 APP_EXEC_EXTENDED = 1
 APP_EXEC_CWD_PRESENT = 1
 APP_EXEC_ENVIRONMENT_PRESENT = 2
+APP_EXEC_INHERIT_DEFAULT_ENV = 4
 
 OUTER_HOST_ATTACH = 2
 OUTER_RESET = 3
@@ -383,6 +384,7 @@ class ControlSession:
         response_timeout: float,
         cwd: str | None = None,
         environment: tuple[str, ...] | None = None,
+        inherit_default_environment: bool = False,
     ) -> ManagedExecResult:
         if not 0 < response_timeout < float("inf"):
             raise ValueError(
@@ -423,11 +425,17 @@ class ControlSession:
                 )
             flags |= APP_EXEC_CWD_PRESENT
 
+        if type(inherit_default_environment) is not bool:
+            raise TypeError("managed exec environment inheritance must be a boolean")
         encoded_environment: list[bytes] = []
         if environment is not None:
             for value in encode_exec_environment(environment):
                 encoded_environment.append(struct.pack("<I", len(value)) + value)
             flags |= APP_EXEC_ENVIRONMENT_PRESENT
+            # An omitted environment already is the default one, so inheritance only
+            # changes a supplied environment, as MXC's inheritDefaultEnv does.
+            if inherit_default_environment:
+                flags |= APP_EXEC_INHERIT_DEFAULT_ENV
 
         if flags == 0:
             payload = struct.pack("<IHH", timeout_ms, len(arguments), 0) + b"".join(

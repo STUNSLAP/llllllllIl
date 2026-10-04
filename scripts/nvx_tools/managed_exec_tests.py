@@ -21,6 +21,7 @@ FORBIDDEN_DEFAULT_ENVIRONMENT_NAMES = {
     "COMPLEX",
     "SECOND",
     "ORDER",
+    "LAYERED",
     "NVX_EXEC_CONFIG_FD",
 }
 
@@ -308,7 +309,6 @@ def run_managed_exec_configuration(
                     f"{_bounded_text(identity.stderr)!r}"
                 )
             workload_name, workload_home = _read_workload_identity(identity.stdout)
-            default_environment = workload("/usr/bin/env")
             expected_defaults = {
                 "PATH": DEFAULT_PATH,
                 "TERM": DEFAULT_TERM,
@@ -316,6 +316,29 @@ def run_managed_exec_configuration(
                 "USER": workload_name,
                 "LOGNAME": workload_name,
             }
+            # Layered entries add variables to the defaults and replace defaults of the
+            # same name; the next execution must see none of them.
+            layered = workload(
+                "/usr/bin/env",
+                "--environment",
+                "LAYERED=layered value",
+                "--environment",
+                "TERM=layered",
+                "--inherit-default-environment",
+            )
+            layered_environment = _read_environment(layered.stdout)
+            if (
+                layered.stderr
+                or layered_environment.pop("LAYERED", None) != "layered value"
+                or not _default_environment_matches(
+                    layered_environment, {**expected_defaults, "TERM": "layered"}
+                )
+            ):
+                raise RuntimeError(
+                    "public managed environment did not layer entries over "
+                    "workload defaults"
+                )
+            default_environment = workload("/usr/bin/env")
             if default_environment.stderr or not _default_environment_matches(
                 _read_environment(default_environment.stdout), expected_defaults
             ):

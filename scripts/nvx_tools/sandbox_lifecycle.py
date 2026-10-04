@@ -499,6 +499,7 @@ def exec_workload(
     response_timeout: float,
     cwd: str | None = None,
     environment: tuple[str, ...] | None = None,
+    inherit_default_environment: bool = False,
 ) -> ManagedExecResult:
     state_dir = _prepare_state_directory(state_path, create=False)
     runtime, capability = _load_running(state_dir)
@@ -511,6 +512,7 @@ def exec_workload(
             response_timeout=response_timeout,
             cwd=cwd,
             environment=environment,
+            inherit_default_environment=inherit_default_environment,
         )
 
 
