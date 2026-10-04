@@ -402,15 +402,42 @@ fn each_execution_has_its_own_environment() {
     nvx.start(&sandbox_id).unwrap();
     let foo = |request: ExecRequest| output_of(&nvx, &sandbox_id, request).stdout;
     let print = || ExecRequest::command_line("printenv FOO");
+    // `printenv` prints nothing and fails when the variable is unset.
+    let assert_unset = |request: ExecRequest| {
+        let output = nvx
+            .exec(&sandbox_id, &request)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(output.outcome, ExecOutcome::Exited(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    };
 
     assert_eq!(foo(print().with_env("FOO=one")), b"one\n");
     assert_eq!(foo(print().with_env("FOO=two")), b"two\n");
     // Nothing is left over once a later execution supplies no environment.
-    assert_eq!(foo(print()), b"");
-    assert_eq!(foo(print().with_envs(Vec::<String>::new())), b"");
+    assert_unset(print());
+    assert_unset(print().with_envs(Vec::<String>::new()));
     assert_eq!(foo(print().with_env("FOO=")), b"\n");
     assert_eq!(foo(print().with_env("FOO=one")), b"one\n");
-    assert_eq!(foo(print()), b"");
+    assert_unset(print());
+    // A script exits with the status of its last command.
+    let last_unset = nvx
+        .exec(
+            &sandbox_id,
+            &ExecRequest::command_line("printenv BAR; printenv FOO").with_env("BAR=x"),
+        )
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(last_unset.outcome, ExecOutcome::Exited(1), "{last_unset:?}");
+    assert_eq!(last_unset.stdout, b"x\n");
+    assert_eq!(
+        foo(ExecRequest::command_line("printenv FOO; printenv BAR").with_env("BAR=x")),
+        b"x\n"
+    );
+    assert_unset(ExecRequest::argv(["/usr/bin/printenv", "FOO"]));
     assert_eq!(
         environment_of(&nvx, &sandbox_id, ExecRequest::argv(["/usr/bin/env"])),
         sorted(DEFAULT_ENVIRONMENT)
