@@ -7,7 +7,7 @@ import shutil
 import stat
 import tarfile
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path, PurePosixPath
 
 from .build_constants import (
@@ -33,12 +33,21 @@ def _normalize_member(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
 def create_reproducible_tar_gz(
     output: Path,
     inputs: Sequence[ArchiveInput],
+    *,
+    mode: Callable[[tarfile.TarInfo], int] | None = None,
 ) -> None:
     missing = [str(path) for path, _ in inputs if not path.exists()]
     if missing:
         raise ScriptError(
             "cannot create source archive; missing: " + ", ".join(missing)
         )
+
+    def normalize(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        normalized = _normalize_member(member)
+        if normalized is not None and mode is not None:
+            normalized.mode = mode(normalized)
+        return normalized
+
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("wb") as raw:
         with gzip.GzipFile(
@@ -53,7 +62,7 @@ def create_reproducible_tar_gz(
                         source,
                         arcname=arcname,
                         recursive=True,
-                        filter=_normalize_member,
+                        filter=normalize,
                     )
 
 

@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -652,7 +652,7 @@ def _copy_release_file(source: Path, destination: Path) -> None:
     shutil.copy2(source, destination)
 
 
-def _validate_alpine_sources(package_manifests: list[Path]) -> None:
+def _validate_alpine_sources(package_manifests: list[Path]) -> frozenset[str]:
     source_root = BuildConstants.SOURCE_DIR / AlpineBuildConstants.GUEST_NAME
     source_manifest_path = require_file(
         source_root / "manifest.json",
@@ -662,6 +662,19 @@ def _validate_alpine_sources(package_manifests: list[Path]) -> None:
         source_manifest_path,
         "collected Alpine source manifest",
     )
+    if source_manifest.get("format") != AlpineBuildConstants.SOURCE_MANIFEST_FORMAT:
+        raise ScriptError(
+            "collected Alpine sources use an unsupported manifest format; "
+            "run collect-sources again"
+        )
+    recorded_executables = source_manifest.get("executables")
+    if not isinstance(recorded_executables, list) or not all(
+        isinstance(path, str) for path in cast(list[object], recorded_executables)
+    ):
+        raise ScriptError(
+            "collected Alpine source manifest has an invalid executables list"
+        )
+    executables = frozenset(cast(list[str], recorded_executables))
     source_packages = cast(list[dict[str, str]], source_manifest["packages"])
     collected = {
         (package["package"], package["version"], package["commit"]): package
@@ -691,7 +704,13 @@ def _validate_alpine_sources(package_manifests: list[Path]) -> None:
                     f"collected Alpine {field} is missing for "
                     f"{package['package']}: {path}"
                 )
-    verify_sha256_sums(source_root)
+    checksummed = dict(verify_sha256_sums(source_root).files)
+    for path in sorted(executables):
+        if path not in checksummed or not path.startswith("recipes/"):
+            raise ScriptError(
+                f"collected Alpine executable is not a checksummed recipe file: {path}"
+            )
+    return executables
 
 
 def _validate_ubuntu_sources(package_manifests: list[Path]) -> None:
@@ -731,9 +750,11 @@ def _validate_ubuntu_sources(package_manifests: list[Path]) -> None:
 def _create_source_archive(
     output: Path,
     inputs: list[tuple[Path, str]],
+    *,
+    mode: Callable[[tarfile.TarInfo], int] | None = None,
 ) -> None:
     print(f">> creating source archive {output}")
-    create_reproducible_tar_gz(output, inputs)
+    create_reproducible_tar_gz(output, inputs, mode=mode)
 
 
 def _project_source_archive(
@@ -766,6 +787,7 @@ def _alpine_source_archive(
     output: Path,
     version: str,
     package_manifests: list[Path],
+    executables: frozenset[str],
 ) -> None:
     root = f"nvx-alpine-source-{version}"
     inputs = [
@@ -778,7 +800,15 @@ def _alpine_source_archive(
         )
         for manifest in package_manifests
     )
-    _create_source_archive(output, inputs)
+    executable_members = {f"{root}/sources/{path}" for path in executables}
+
+    def mode(member: tarfile.TarInfo) -> int:
+        # Apply the recorded modes, which hosts such as Windows cannot store.
+        if member.isdir() or member.name in executable_members:
+            return 0o755
+        return 0o644
+
+    _create_source_archive(output, inputs, mode=mode)
 
 
 def _ubuntu_source_archive(
@@ -1375,8 +1405,9 @@ def package_release(
         / KernelBuildConstants.SOURCE_DIRECTORY_NAME
         / KernelBuildConstants.SOURCE_ARCHIVE_NAME
     )
+    alpine_executables: frozenset[str] = frozenset()
     if include_source:
-        _validate_alpine_sources(alpine_manifests)
+        alpine_executables = _validate_alpine_sources(alpine_manifests)
         _validate_ubuntu_sources(ubuntu_manifests)
         require_file(linux_source_archive, "Linux corresponding-source archive")
         _validate_linux_source_archive(linux_source_archive)
@@ -1506,6 +1537,7 @@ def package_release(
                 source_destination / f"nvx-alpine-source-{release_version}.tar.gz",
                 release_version,
                 alpine_manifests,
+                alpine_executables,
             )
             _ubuntu_source_archive(
                 source_destination / f"nvx-ubuntu-source-{release_version}.tar.gz",

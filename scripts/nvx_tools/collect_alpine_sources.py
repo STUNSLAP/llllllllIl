@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import tarfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 
 from .build_constants import (
@@ -134,20 +136,124 @@ def _prepare_aports(cache: Path, branch: str) -> None:
         )
 
 
-def _safe_extract(data: bytes, destination: Path) -> None:
+def _recipe_symlink_source(
+    path: PurePosixPath,
+    members: dict[PurePosixPath, tarfile.TarInfo],
+    directories: set[PurePosixPath],
+    recipe: PurePosixPath,
+) -> tarfile.TarInfo:
+    # Resolve within the archive so a recipe link becomes a copy of its target.
+    message = (
+        f"aports recipe symlink {path} -> {members[path].linkname} does not "
+        f"resolve to a regular file inside {recipe}"
+    )
+    current = path
+    member = members[path]
+    visited: set[PurePosixPath] = set()
+    while member.issym():
+        link = PurePosixPath(member.linkname)
+        if current in visited or link.is_absolute():
+            raise SourceError(message)
+        visited.add(current)
+        parts: list[str] = list(current.parent.parts)
+        for index, part in enumerate(link.parts):
+            if part == "..":
+                if not parts:
+                    raise SourceError(message)
+                parts.pop()
+                continue
+            parts.append(part)
+            if index + 1 < len(link.parts) and PurePosixPath(*parts) not in directories:
+                raise SourceError(message)
+        current = PurePosixPath(*parts)
+        target = members.get(current)
+        if target is None or recipe not in current.parents:
+            raise SourceError(message)
+        member = target
+    if not member.isfile():
+        raise SourceError(message)
+    return member
+
+
+def _safe_extract(data: bytes, destination: Path, recipe: str) -> list[str]:
+    recipe_path = PurePosixPath(recipe)
     destination.mkdir(parents=True, exist_ok=True)
-    archive_path = destination.resolve()
-    from io import BytesIO
-
-    with tarfile.open(fileobj=BytesIO(data), mode="r:") as archive:
+    root = destination.resolve()
+    try:
+        archive = tarfile.open(fileobj=io.BytesIO(data), mode="r:")
+    except tarfile.TarError as error:
+        raise SourceError(f"invalid aports archive for {recipe}: {error}") from error
+    with archive:
+        members: dict[PurePosixPath, tarfile.TarInfo] = {}
         for member in archive.getmembers():
-            target = (destination / member.name).resolve()
-            if archive_path != target and archive_path not in target.parents:
+            path = PurePosixPath(member.name)
+            if not path.parts or path.is_absolute() or ".." in path.parts:
                 raise SourceError(f"unsafe path in aports archive: {member.name}")
-        archive.extractall(destination)
+            target = destination.joinpath(*path.parts).resolve()
+            if target != root and root not in target.parents:
+                raise SourceError(f"unsafe path in aports archive: {member.name}")
+            if not (member.isdir() or member.isfile() or member.issym()):
+                raise SourceError(
+                    "aports archive member is not a file, directory, or symlink: "
+                    f"{member.name}"
+                )
+            if path in members:
+                raise SourceError(f"duplicate path in aports archive: {member.name}")
+            if not (
+                path == recipe_path
+                or recipe_path in path.parents
+                or path in recipe_path.parents
+            ):
+                raise SourceError(
+                    f"aports archive member is outside {recipe}: {member.name}"
+                )
+            members[path] = member
+        # As tar extraction does, treat every parent of a member as a directory.
+        directories = {path for path, member in members.items() if member.isdir()}
+        for path in members:
+            for parent in path.parents:
+                if not parent.parts:
+                    break
+                listed = members.get(parent)
+                if listed is not None and not listed.isdir():
+                    raise SourceError(
+                        f"aports archive places {path} below non-directory {parent}"
+                    )
+                directories.add(parent)
+        files = {
+            path: (
+                _recipe_symlink_source(path, members, directories, recipe_path)
+                if member.issym()
+                else member
+            )
+            for path, member in members.items()
+            if not member.isdir()
+        }
+        for directory in sorted(directories):
+            target = destination.joinpath(*directory.parts)
+            target.mkdir(exist_ok=True)
+            target.chmod(0o755)
+        executables: list[str] = []
+        for path, source in sorted(files.items(), key=lambda item: item[0]):
+            contents = archive.extractfile(source)
+            if contents is None:
+                raise SourceError(f"cannot read aports archive member: {source.name}")
+            target = destination.joinpath(*path.parts)
+            with contents, target.open("xb") as output:
+                shutil.copyfileobj(contents, output)
+            executable = bool(source.mode & 0o111)
+            target.chmod(0o755 if executable else 0o644)
+            if executable:
+                executables.append(path.as_posix())
+        return executables
 
 
-def _extract_recipe(cache: Path, output: Path, metadata: dict[str, str]) -> str:
+def _extract_recipe(
+    cache: Path,
+    output: Path,
+    metadata: dict[str, str],
+    executables: set[str],
+) -> str:
     repositories = (
         metadata["repository"],
         *(
@@ -196,7 +302,10 @@ def _extract_recipe(cache: Path, output: Path, metadata: dict[str, str]) -> str:
         ],
         capture=True,
     )
-    _safe_extract(result.stdout, destination)
+    executables.update(
+        f"{destination.relative_to(output).as_posix()}/{path}"
+        for path in _safe_extract(result.stdout, destination, recipe)
+    )
     if not apkbuild.is_file():
         raise SourceError(f"aports recipe was not extracted: {recipe}")
     return apkbuild.relative_to(output).as_posix()
@@ -284,13 +393,16 @@ def collect_alpine_sources(
     _prepare_aports(cache, branch)
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    executables: set[str] = set()
     for item in metadata:
-        item["recipe"] = _extract_recipe(cache, output, item)
+        item["recipe"] = _extract_recipe(cache, output, item, executables)
     manifest: dict[str, object] = {
         "format": AlpineBuildConstants.SOURCE_MANIFEST_FORMAT,
         "alpine_branch": branch,
         "architecture": architecture,
         "packages": metadata,
+        # Hosts such as Windows cannot store file modes, so record them here.
+        "executables": sorted(executables),
     }
     (output / "manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n",

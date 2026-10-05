@@ -170,7 +170,7 @@ class AlpineBuildConstants:
     )
     PACKAGE_MANIFEST_FORMAT: Final = "apk-v1"
     PACKAGE_MANIFEST_VERSION: Final = 1
-    SOURCE_MANIFEST_FORMAT: Final = 1
+    SOURCE_MANIFEST_FORMAT: Final = 2
     PACKAGES: Final = (
         "blkid",
         "busybox-extras",
