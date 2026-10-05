@@ -536,7 +536,7 @@ launches.
 | `--memory-mib MIB` | `256` | Set guest memory in MiB. |
 | `--timeout SECONDS` | `60` | Set the control response timeout for managed `start`, `exec`, and `stop`. |
 | `--exec-timeout-ms MILLISECONDS` | `0` | Set the managed `exec` guest workload timeout in the unsigned 32-bit range `0..4294967295`; zero disables the workload deadline. This is separate from the finite host `--timeout` response deadline. |
-| `--cwd GUEST_PATH` | `/` | Set an absolute working directory inside the workload root for managed `exec`. It is resolved after the workload identity and root are applied; missing, inaccessible, or non-directory paths fail the workload launch. |
+| `--cwd GUEST_PATH` | `/` | Set an absolute working directory inside the workload root for managed `exec`. It is resolved after the workload identity and root are applied; missing, inaccessible, or non-directory paths fail the workload launch. Default and layered environments point `PWD` at this directory; an exact replacement environment controls `PWD` itself. |
 | `--environment KEY=VALUE` | omitted | Set the exact managed `exec` environment. Repeat for multiple entries. Empty values, spaces, additional equals signs, and UTF-8 are preserved. Inline values are visible in the invoking host process arguments; use `--environment-file` for sensitive values. |
 | `--environment-file PATH` | omitted | Read the exact managed `exec` environment from a UTF-8 JSON array of `KEY=VALUE` strings, limited to 1 MiB of input. An empty array requests an empty environment. This option is mutually exclusive with `--environment`; omitting both preserves guest defaults. |
 | `--inherit-default-environment` | off | Layer the managed `exec` environment from `--environment` or `--environment-file` over the guest default environment instead of replacing it; an entry replaces the default variable of the same name. Without either option the workload already receives the defaults, so the flag has no effect. |
@@ -555,7 +555,7 @@ launches.
 | `--host-loopback-forward PROTOCOL:HOST_PORT:GUEST_PORT` | none | Publish one TCP or UDP localhost port to the guest; repeat to add forwards and set `--host-loopback allow`. |
 | `--outcome-report PATH` | none | Write a bounded local JSON outcome report for one-shot `run` or managed `exec`. |
 | `--cmdline TEXT` | empty | Append non-sandbox kernel parameters; `nvx_*`, `virtfs_*`, and `tsc=` tokens are reserved. |
-| `--dry-run` | off | Print the generated OpenVMM microVM command without running it. |
+| `--dry-run` | off | For one-shot `run` only, print the generated OpenVMM microVM command without running it. Managed operations reject this option. |
 
 See [Run](run.md) for artifact preparation, the security boundary, and current
 snapshot/configuration limitations.

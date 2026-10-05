@@ -1529,6 +1529,28 @@ static int launch_workload(int argc, char **argv)
     if (unsetenv("NVX_EXEC_CONFIG_FD") != 0) {
         goto fail;
     }
+    if ((flags & EXEC_CWD_ENTERED) == 0) {
+        const char *directory = cwd == NULL ? "/" : cwd;
+
+        if (chdir(directory) != 0) {
+            dprintf(
+                STDERR_FILENO,
+                "nvx-managed-agent: cannot use working directory %s: %s\n",
+                directory,
+                strerror(errno));
+            goto fail;
+        }
+        if (((flags & EXEC_ENVIRONMENT_PRESENT) == 0 ||
+             (flags & EXEC_INHERIT_DEFAULT_ENV) != 0) &&
+            export_working_directory(directory) != 0) {
+            dprintf(
+                STDERR_FILENO,
+                "nvx-managed-agent: cannot configure working directory "
+                "environment: %s\n",
+                strerror(errno));
+            goto fail;
+        }
+    }
     if ((flags & EXEC_ENVIRONMENT_PRESENT) != 0) {
         if ((flags & EXEC_INHERIT_DEFAULT_ENV) == 0 && clearenv() != 0) {
             goto fail;
@@ -1539,14 +1561,6 @@ static int launch_workload(int argc, char **argv)
             }
             environment[index] = NULL;
         }
-    }
-    if ((flags & EXEC_CWD_ENTERED) == 0 && chdir(cwd == NULL ? "/" : cwd) != 0) {
-        dprintf(
-            STDERR_FILENO,
-            "nvx-managed-agent: cannot use working directory %s: %s\n",
-            cwd == NULL ? "/" : cwd,
-            strerror(errno));
-        goto fail;
     }
     execv(argv[4], &argv[4]);
     dprintf(

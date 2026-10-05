@@ -315,6 +315,7 @@ def run_managed_exec_configuration(
                 "HOME": workload_home,
                 "USER": workload_name,
                 "LOGNAME": workload_name,
+                "PWD": "/",
             }
             # Layered entries add variables to the defaults and replace defaults of the
             # same name; the next execution must see none of them.
@@ -344,6 +345,19 @@ def run_managed_exec_configuration(
             ):
                 raise RuntimeError(
                     "public managed environment did not match workload defaults"
+                )
+            working_environment = workload(
+                "/usr/bin/env",
+                "--cwd",
+                "/tmp",
+            )
+            if working_environment.stderr or not _default_environment_matches(
+                _read_environment(working_environment.stdout),
+                {**expected_defaults, "PWD": "/tmp"},
+            ):
+                raise RuntimeError(
+                    "public managed environment did not point PWD at the "
+                    "working directory"
                 )
 
             relative = workload(

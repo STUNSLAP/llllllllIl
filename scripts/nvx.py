@@ -419,6 +419,8 @@ def command_run(args: argparse.Namespace) -> None:
 def command_sandbox(args: argparse.Namespace) -> None:
     operation = args.sandbox_operation
     exec_environment: tuple[str, ...] | None = None
+    if args.dry_run and operation != "run":
+        raise ScriptError("--dry-run is only valid for sandbox run")
     if args.environment and args.environment_file is not None:
         raise ScriptError("--environment and --environment-file are mutually exclusive")
     if operation != "exec" and (
@@ -1020,7 +1022,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="write a bounded local JSON outcome report for run or exec",
     )
     sandbox.add_argument("--cmdline", default="")
-    sandbox.add_argument("--dry-run", action="store_true")
+    sandbox.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the one-shot run command without launching it",
+    )
     sandbox.set_defaults(handler=command_sandbox)
 
     benchmark = subparsers.add_parser(
