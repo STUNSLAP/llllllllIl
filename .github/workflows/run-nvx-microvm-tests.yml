@@ -364,7 +364,7 @@ jobs:
           rm -rf "${share}" "${scratch}" "${outside}"
 
       - name: Run Ubuntu sandbox caller-owned live-share test on Linux
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail

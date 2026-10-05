@@ -147,10 +147,11 @@ production kernels leave out. It selects the same-host restore scenarios
 `snapshot-tiers`. The jobs skip every other test step, because those boot the
 production kernel, which the `nvx-microvm-tests-{kvm,mshv,whp}` jobs already
 cover: the public managed execution configuration, the Ubuntu and Azure Linux
-guest tests, the Ubuntu sandbox layer and live-share smoke tests, and the
-`aci_edge_sandboxes` lifecycle test. Any RCU stall, soft lockup, or hung task
-makes the guest's time ABI watcher power off with status 194, which fails the
-run. Every guest those scenarios restore asks `nvx-time status` before it exits
+guest tests, the Ubuntu sandbox layer and live-share smoke tests, the
+caller-owned live-share test, and the `aci_edge_sandboxes` lifecycle test. Any
+RCU stall, soft lockup, or hung task makes the guest's time ABI watcher power
+off with status 194, which fails the run. Every guest those scenarios restore
+asks `nvx-time status` before it exits
 (`snapshot-tiers` after its tier assertions), which waits for the restore's
 deferred checks and must report a passing restore line, so no restore leaves
 its checks pending. The one exception is `snapshot-tiers`' gate-timeout check,
