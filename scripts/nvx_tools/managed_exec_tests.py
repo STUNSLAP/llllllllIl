@@ -144,7 +144,10 @@ def run_managed_exec_configuration(
     scratch_template = require_file(
         artifact_path("ubuntu-smoke-scratch.ext4"), "sandbox scratch template"
     )
-    manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ScriptError(f"invalid Ubuntu layer manifest: {manifest_path}") from error
     if not isinstance(manifest, dict):
         raise ScriptError("Ubuntu layer manifest must contain a UUID string")
     layer_uuid = cast(dict[str, object], manifest).get("uuid")
