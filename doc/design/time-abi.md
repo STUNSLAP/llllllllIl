@@ -562,15 +562,24 @@ reports every violation at once, naming the leaf, subleaf, register, and bit:
 6. On MSHV and WHP, which pass reserved entries through, the hypervisor
    presents no non-zero CPUID entry outside the profile's tables, apart from
    the identity range and the topology leaves (`E_CPU_UNLISTED`).
-   - `--cpu-fingerprint` checks the probe partition's guest view, at the
-     entries its own enumeration reaches.
+   - `--cpu-fingerprint` checks what a cold boot checks. On WHP, it creates a
+     second probe partition whose feature banks and XSAVE features derive
+     from the profile, as a cold boot's partition's do, and reads its VP 0 at
+     the host's candidates (below). The fingerprint's own probe partition
+     enables every available feature, so on a CET-capable host, such as a
+     twelfth-generation Core, it presents CET's XSAVE components `0xD.11` and
+     `0xD.12`, which no profile enables. On MSHV, the check still reads the
+     fingerprint's probe partition, at the entries its own enumeration
+     reaches.
    - At every cold boot and restore, step 5's check covers it on VP 0's
      view. The candidates are the entries that the host's CPUID enumerates
      outside the profile's tables (`cpu_profile::unlisted_cpuid_candidates`),
      each read at subleaf 0 if subleaf-independent. The backend reads them
      with the governed leaves: 7 more entries on the Skylake-SP hosts
-     (`0xF.1`, `0x10.1` to `0x10.3`, `0x12.1`, `0x12.2`, and `0x14.1`) and 6
-     on the Azure 8370C and 8573C runners, whose roots report no Intel PT.
+     (`0xF.1`, `0x10.1` to `0x10.3`, `0x12.1`, `0x12.2`, and `0x14.1`), 6
+     on the Azure 8370C and 8573C runners, whose roots report no Intel PT,
+     and 12 on the Core i9-12900H, among them `0xD.11`, `0xD.12`, `0x14.1`,
+     and `0x20`, which its root reads as non-zero.
      The supported surface of step 3 cannot serve: it derives from the
      root's CPUID, which shows values that a guest does not see there, so
      it would fail sound hosts.
