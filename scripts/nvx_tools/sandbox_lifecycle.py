@@ -269,33 +269,120 @@ def _deserialize_launch(config: dict[str, Any]) -> SandboxLaunch:
     return launch.validated()
 
 
-def _process_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
+def _linux_start_time(stat: bytes) -> int | None:
+    # The command name may contain spaces and parentheses, so the fields after it
+    # start at its last ")", with the state as field 3 and starttime as field 22.
+    end = stat.rfind(b")")
+    fields = stat[end + 1 :].split() if end >= 0 else []
+    if len(fields) < 20 or not fields[19].isdigit():
+        raise ValueError("process status has an unexpected format")
+    if fields[0] in (b"Z", b"X"):
+        return None
+    return int(fields[19])
+
+
+def _process_start_time(pid: int) -> int | None:
+    """Returns the start time of a live process, or None if no live process has the ID.
+
+    A zombie counts as exited. On Windows, so does a process that the caller cannot
+    open: OpenVMM runs as the caller, so such a process cannot be its VM. Raises
+    OSError or ValueError when the state cannot be determined.
+    """
     if os.name != "nt":
         try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
+            stat = Path(f"/proc/{pid}/stat").read_bytes()
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        return _linux_start_time(stat)
 
     import ctypes
+    from ctypes import wintypes
 
+    synchronize = 0x00100000
     process_query_limited_information = 0x1000
-    still_active = 259
+    error_access_denied = 5
+    error_invalid_parameter = 87
+    wait_object_0 = 0
+    wait_timeout = 0x102
+    if pid > 0xFFFFFFFF:
+        return None
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    filetime = ctypes.POINTER(wintypes.FILETIME)
+    kernel32.GetProcessTimes.argtypes = (
+        wintypes.HANDLE,
+        filetime,
+        filetime,
+        filetime,
+        filetime,
+    )
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(
+        synchronize | process_query_limited_information, False, pid
+    )
     if not handle:
-        return False
+        error = ctypes.get_last_error()
+        if error in (error_access_denied, error_invalid_parameter):
+            return None
+        raise ctypes.WinError(error)
     try:
-        exit_code = ctypes.c_uint32()
-        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-            raise OSError(ctypes.get_last_error(), "GetExitCodeProcess failed")
-        return exit_code.value == still_active
+        wait = kernel32.WaitForSingleObject(handle, 0)
+        if wait == wait_object_0:
+            return None
+        if wait != wait_timeout:
+            raise ctypes.WinError(ctypes.get_last_error())
+        created = wintypes.FILETIME()
+        unused = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(unused),
+            ctypes.byref(unused),
+            ctypes.byref(unused),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return (created.dwHighDateTime << 32) | created.dwLowDateTime
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _process_running(pid: int, start_time: int | None) -> bool:
+    """Returns whether the recorded OpenVMM process still runs.
+
+    A record without a start time, written by an earlier NVX version, identifies
+    OpenVMM by its process ID alone.
+    """
+    if pid <= 0:
+        return False
+    try:
+        current = _process_start_time(pid)
+    except (OSError, ValueError) as error:
+        raise ScriptError(
+            f"cannot determine whether OpenVMM process {pid} is running: {error}"
+        ) from error
+    if start_time is None:
+        return current is not None
+    return current == start_time
+
+
+def _runtime_process(runtime: dict[str, Any]) -> tuple[int, int | None]:
+    try:
+        pid = int(runtime["pid"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ScriptError("sandbox runtime state has an invalid process ID") from error
+    start_time = runtime.get("start_time")
+    if start_time is not None and (
+        not isinstance(start_time, int)
+        or isinstance(start_time, bool)
+        or start_time < 0
+    ):
+        raise ScriptError("sandbox runtime state has an invalid process start time")
+    return pid, start_time
 
 
 def _load_running(state_dir: Path) -> tuple[dict[str, Any], bytes]:
@@ -303,11 +390,7 @@ def _load_running(state_dir: Path) -> tuple[dict[str, Any], bytes]:
     if not runtime_path.is_file():
         raise ScriptError("sandbox is not running")
     runtime = _read_json(runtime_path, "sandbox runtime state")
-    try:
-        pid = int(runtime["pid"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise ScriptError("sandbox runtime state has an invalid process ID") from error
-    if not _process_running(pid):
+    if not _process_running(*_runtime_process(runtime)):
         raise ScriptError(
             "sandbox runtime state is stale because the OpenVMM process is not running"
         )
@@ -461,6 +544,20 @@ def start(state_path: Path, timeout: float) -> None:
         )
         if process.stdin is None:
             raise ScriptError("failed to create the OpenVMM capability pipe")
+        # Until this process reaps the child or closes its handle, no other process
+        # can reuse its ID, so this identifies OpenVMM itself.
+        try:
+            start_time = _process_start_time(process.pid)
+        except (OSError, ValueError) as error:
+            raise ScriptError(
+                f"cannot identify the OpenVMM process: {error}"
+            ) from error
+        if start_time is None:
+            raise ScriptError(
+                "OpenVMM exited during startup"
+                if process.poll() is not None
+                else "cannot identify the OpenVMM process"
+            )
         process.stdin.write(capability)
         process.stdin.close()
         _write_json(
@@ -468,6 +565,7 @@ def start(state_path: Path, timeout: float) -> None:
             {
                 "format": STATE_FORMAT,
                 "pid": process.pid,
+                "start_time": start_time,
                 "control_endpoint": endpoint_value,
             },
         )
@@ -519,11 +617,11 @@ def exec_workload(
 def stop(state_path: Path, timeout: float) -> dict[str, Any]:
     state_dir = _prepare_state_directory(state_path, create=False)
     runtime, capability = _load_running(state_dir)
+    pid, start_time = _runtime_process(runtime)
     with ControlSession.connect(_endpoint(runtime), capability, timeout) as session:
         session.stop(timeout)
-    pid = int(runtime["pid"])
     deadline = time.monotonic() + timeout
-    while _process_running(pid):
+    while _process_running(pid, start_time):
         if time.monotonic() >= deadline:
             raise TimeoutError("OpenVMM did not terminate after managed stop")
         time.sleep(0.025)
@@ -541,13 +639,7 @@ def deprovision(state_path: Path) -> None:
     runtime_path = state_dir / RUNTIME_NAME
     if runtime_path.is_file():
         runtime = _read_json(runtime_path, "sandbox runtime state")
-        try:
-            running = _process_running(int(runtime["pid"]))
-        except (KeyError, TypeError, ValueError) as error:
-            raise ScriptError(
-                "sandbox runtime state has an invalid process ID"
-            ) from error
-        if running:
+        if _process_running(*_runtime_process(runtime)):
             raise ScriptError("sandbox must be stopped before deprovision")
     for name in (
         RUNTIME_NAME,

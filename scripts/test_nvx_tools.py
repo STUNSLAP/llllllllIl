@@ -8239,6 +8239,74 @@ class AciSandboxRunnerTests(unittest.TestCase):
         self.assertIn(f"{sandbox} (OpenVMM pid 77)", stderr)
 
 
+def _write_managed_runtime(state: Path, pid: int, start_time: int | None) -> None:
+    runtime: dict[str, object] = {
+        "format": sandbox_lifecycle.STATE_FORMAT,
+        "pid": pid,
+        "control_endpoint": os.fspath(state / sandbox_lifecycle.CONTROL_SOCKET_NAME),
+    }
+    if start_time is not None:
+        runtime["start_time"] = start_time
+    sandbox_lifecycle._write_json(state / sandbox_lifecycle.RUNTIME_NAME, runtime)
+    (state / sandbox_lifecycle.CAPABILITY_NAME).write_bytes(b"x" * 32)
+
+
+def _provision_managed_sandbox(root: Path) -> Path:
+    layer_path = root / "distro.erofs"
+    scratch_path = root / "scratch.ext4"
+    layer_path.write_bytes(b"layer")
+    scratch_path.write_bytes(b"scratch")
+    state = root / "state"
+    sandbox_lifecycle.provision(
+        state,
+        sandbox.SandboxLaunch(
+            layers=(
+                sandbox.SandboxLayer(
+                    role="distro",
+                    path=layer_path,
+                    uuid="11111111-1111-1111-1111-111111111111",
+                ),
+            ),
+            scratch=scratch_path,
+        ),
+        hypervisor="whp",
+        memory_mib=256,
+        net=None,
+        network_profile=None,
+        network_egress=None,
+        network_ingress=None,
+        network_egress_allow=(),
+        network_egress_deny=(),
+        host_loopback=None,
+        network_proxy=None,
+        host_loopback_forward=(),
+        cmdline="quiet",
+    )
+    return state
+
+
+def _stdin_bound_child() -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+    )
+
+
+def _finish_child(child: subprocess.Popen[bytes]) -> None:
+    if child.stdin is not None:
+        child.stdin.close()
+    child.wait(timeout=30)
+
+
+def _exit_unreaped(child: subprocess.Popen[bytes]) -> None:
+    if sys.platform != "linux":
+        raise unittest.SkipTest("zombie processes require a Linux host")
+    assert child.stdin is not None
+    child.stdin.close()
+    # WNOWAIT leaves the exited child unreaped, so it stays a zombie.
+    os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+
+
 class SandboxTests(unittest.TestCase):
     def test_launch_contract_orders_roles_and_builds_agent_command_line(self):
         custom = sandbox.SandboxLayer.parse(
@@ -8648,6 +8716,9 @@ class SandboxTests(unittest.TestCase):
                     sandbox_lifecycle.subprocess, "Popen", return_value=process
                 ) as popen,
                 patch.object(
+                    sandbox_lifecycle, "_process_start_time", return_value=456
+                ),
+                patch.object(
                     sandbox_lifecycle.ControlSession, "connect", return_value=context
                 ),
             ):
@@ -8849,6 +8920,11 @@ class SandboxTests(unittest.TestCase):
                     return_value=process,
                 ) as popen,
                 patch.object(
+                    sandbox_lifecycle,
+                    "_process_start_time",
+                    return_value=456,
+                ) as process_start_time,
+                patch.object(
                     sandbox_lifecycle.ControlSession,
                     "connect",
                     return_value=context,
@@ -8862,6 +8938,11 @@ class SandboxTests(unittest.TestCase):
                 state / sandbox_lifecycle.OUTCOME_NAME,
             )
             session.ping.assert_called_once_with(10)
+            process_start_time.assert_called_once_with(123)
+            runtime = json.loads(
+                (state / sandbox_lifecycle.RUNTIME_NAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual((runtime["pid"], runtime["start_time"]), (123, 456))
 
     def test_versioned_json_reader_supports_custom_version_field(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -8970,6 +9051,218 @@ class SandboxTests(unittest.TestCase):
             self.assertFalse((state / sandbox_lifecycle.CAPABILITY_NAME).exists())
             self.assertFalse((state / sandbox_lifecycle.CONTROL_SOCKET_NAME).exists())
             self.assertTrue((state / sandbox_lifecycle.OUTCOME_NAME).exists())
+
+    def test_process_identity_parses_linux_process_status(self):
+        def status(state: bytes, start_time: bytes = b"98765") -> bytes:
+            fields = b" ".join([state, *(b"0" for _ in range(18)), start_time, b"0"])
+            # The command name contains a space and parentheses.
+            return b"42 (sh) x (y) " + fields + b"\n"
+
+        self.assertEqual(sandbox_lifecycle._linux_start_time(status(b"S")), 98765)
+        self.assertEqual(sandbox_lifecycle._linux_start_time(status(b"D")), 98765)
+        for state in (b"Z", b"X"):
+            self.assertIsNone(sandbox_lifecycle._linux_start_time(status(state)))
+        for malformed in (
+            b"42 (sh",
+            b"42 (sh) S 1 2\n",
+            status(b"S", b"-1"),
+            status(b"S", b"tick"),
+        ):
+            with self.assertRaisesRegex(ValueError, "unexpected format"):
+                sandbox_lifecycle._linux_start_time(malformed)
+
+    def test_process_identity_requires_the_recorded_start_time(self):
+        if os.name != "nt" and sys.platform != "linux":
+            self.skipTest("process identity requires a Linux or Windows host")
+        pid = os.getpid()
+        start_time = sandbox_lifecycle._process_start_time(pid)
+        assert isinstance(start_time, int)
+
+        self.assertTrue(sandbox_lifecycle._process_running(pid, start_time))
+        self.assertFalse(sandbox_lifecycle._process_running(pid, start_time + 1))
+        # Records from earlier NVX versions identify OpenVMM by process ID alone.
+        self.assertTrue(sandbox_lifecycle._process_running(pid, None))
+
+    def test_process_identity_counts_an_exited_process_as_stopped(self):
+        if os.name != "nt" and sys.platform != "linux":
+            self.skipTest("process identity requires a Linux or Windows host")
+        child = _stdin_bound_child()
+        try:
+            start_time = sandbox_lifecycle._process_start_time(child.pid)
+            assert isinstance(start_time, int)
+            self.assertTrue(sandbox_lifecycle._process_running(child.pid, start_time))
+        finally:
+            _finish_child(child)
+
+        # On Windows, the handle that Popen holds keeps the exited process's ID.
+        self.assertFalse(sandbox_lifecycle._process_running(child.pid, start_time))
+        self.assertFalse(sandbox_lifecycle._process_running(child.pid, None))
+
+    def test_process_identity_counts_a_zombie_as_stopped(self):
+        if sys.platform != "linux":
+            self.skipTest("zombie processes require a Linux host")
+        child = _stdin_bound_child()
+        try:
+            start_time = sandbox_lifecycle._process_start_time(child.pid)
+            assert isinstance(start_time, int)
+            _exit_unreaped(child)
+            stat = Path(f"/proc/{child.pid}/stat").read_bytes()
+            self.assertEqual(stat[stat.rfind(b")") + 2 :][:1], b"Z")
+
+            self.assertIsNone(sandbox_lifecycle._process_start_time(child.pid))
+            self.assertFalse(sandbox_lifecycle._process_running(child.pid, start_time))
+            self.assertFalse(sandbox_lifecycle._process_running(child.pid, None))
+        finally:
+            _finish_child(child)
+
+    def test_managed_stop_completes_while_openvmm_remains_unreaped(self):
+        if sys.platform != "linux":
+            self.skipTest("zombie processes require a Linux host")
+        child = _stdin_bound_child()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                state = Path(temporary)
+                _write_managed_runtime(
+                    state,
+                    child.pid,
+                    sandbox_lifecycle._process_start_time(child.pid),
+                )
+                outcome = {
+                    "schema_version": sandbox_lifecycle.OUTCOME_SCHEMA_VERSION,
+                    "outcome": {"category": "stopped"},
+                    "network_policy": {},
+                    "teardown": {},
+                }
+                (state / sandbox_lifecycle.OUTCOME_NAME).write_text(
+                    json.dumps(outcome), encoding="utf-8"
+                )
+                session = MagicMock()
+                context = MagicMock()
+                context.__enter__.return_value = session
+
+                def acknowledge_stop(_timeout: float) -> None:
+                    # OpenVMM exits after the guest acknowledges STOP, but its
+                    # parent, such as a container init without --init, never
+                    # reaps it.
+                    _exit_unreaped(child)
+
+                session.stop.side_effect = acknowledge_stop
+                with patch.object(
+                    sandbox_lifecycle.ControlSession,
+                    "connect",
+                    return_value=context,
+                ):
+                    self.assertEqual(sandbox_lifecycle.stop(state, 10), outcome)
+
+                session.stop.assert_called_once_with(10)
+                self.assertFalse((state / sandbox_lifecycle.RUNTIME_NAME).exists())
+                self.assertFalse((state / sandbox_lifecycle.CAPABILITY_NAME).exists())
+        finally:
+            _finish_child(child)
+
+    def test_managed_lifecycle_treats_a_reused_process_id_as_stopped(self):
+        if os.name != "nt" and sys.platform != "linux":
+            self.skipTest("process identity requires a Linux or Windows host")
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            state.mkdir()
+            start_time = sandbox_lifecycle._process_start_time(os.getpid())
+            assert isinstance(start_time, int)
+            # OpenVMM is gone, and this test process now has its process ID.
+            _write_managed_runtime(state, os.getpid(), start_time + 1)
+            (state / sandbox_lifecycle.CONFIG_NAME).write_text("{}", encoding="utf-8")
+
+            with patch.object(sandbox_lifecycle.ControlSession, "connect") as connect:
+                with self.assertRaisesRegex(
+                    common.ScriptError, "runtime state is stale"
+                ):
+                    sandbox_lifecycle.stop(state, 10)
+                with self.assertRaisesRegex(
+                    common.ScriptError, "runtime state is stale"
+                ):
+                    sandbox_lifecycle.exec_workload(
+                        state, ("/bin/true",), timeout_ms=0, response_timeout=10
+                    )
+            connect.assert_not_called()
+
+            sandbox_lifecycle.deprovision(state)
+            self.assertFalse(state.exists())
+
+    def test_managed_lifecycle_identifies_legacy_records_by_process_id(self):
+        if os.name != "nt" and sys.platform != "linux":
+            self.skipTest("process identity requires a Linux or Windows host")
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            _write_managed_runtime(state, os.getpid(), None)
+
+            with self.assertRaisesRegex(common.ScriptError, "must be stopped"):
+                sandbox_lifecycle.deprovision(state)
+            self.assertTrue((state / sandbox_lifecycle.RUNTIME_NAME).exists())
+
+    def test_managed_lifecycle_rejects_invalid_process_start_times(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            for start_time in ("1", True, -1, 1.5):
+                with self.subTest(start_time=start_time):
+                    sandbox_lifecycle._write_json(
+                        state / sandbox_lifecycle.RUNTIME_NAME,
+                        {
+                            "format": sandbox_lifecycle.STATE_FORMAT,
+                            "pid": os.getpid(),
+                            "start_time": start_time,
+                            "control_endpoint": "control.sock",
+                        },
+                    )
+                    for operation in (
+                        lambda: sandbox_lifecycle.stop(state, 10),
+                        lambda: sandbox_lifecycle.deprovision(state),
+                    ):
+                        with self.assertRaisesRegex(
+                            common.ScriptError, "invalid process start time"
+                        ):
+                            operation()
+
+    def test_managed_start_fails_closed_without_openvmm_identity(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        # A side effect that yields None reports that no live process has the ID.
+        for identity, exit_status, message in (
+            ((None,), 1, "OpenVMM exited during startup"),
+            ((None,), None, "cannot identify the OpenVMM process$"),
+            (OSError("denied"), None, "cannot identify the OpenVMM process: denied"),
+        ):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                state = _provision_managed_sandbox(Path(temporary).resolve())
+                process = MagicMock()
+                process.pid = 123
+                process.stdin = io.BytesIO()
+                process.poll.return_value = exit_status
+                with (
+                    patch.object(
+                        sandbox_lifecycle, "require_file", side_effect=require
+                    ),
+                    patch.object(
+                        sandbox_lifecycle.subprocess, "Popen", return_value=process
+                    ),
+                    patch.object(
+                        sandbox_lifecycle, "_process_start_time", side_effect=identity
+                    ),
+                    patch.object(
+                        sandbox_lifecycle.ControlSession, "connect"
+                    ) as connect,
+                    self.assertRaisesRegex(common.ScriptError, message),
+                ):
+                    sandbox_lifecycle.start(state, 10)
+
+                connect.assert_not_called()
+                self.assertEqual(process.terminate.called, exit_status is None)
+                self.assertFalse((state / sandbox_lifecycle.RUNTIME_NAME).exists())
+                self.assertFalse((state / sandbox_lifecycle.CAPABILITY_NAME).exists())
+                self.assertTrue((state / sandbox_lifecycle.CONFIG_NAME).exists())
 
     def test_launch_contract_rejects_disk_option_delimiters(self):
         with tempfile.TemporaryDirectory() as temporary:
