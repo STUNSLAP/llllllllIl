@@ -99,9 +99,11 @@ envelope (`version`, `phase`, and `containment`) belongs to the caller.
     memory for consumers' unit tests.
 - `AsyncAciEdgeSandbox` (feature `async`) wraps `AciEdgeSandbox` for Tokio. Lifecycle calls run on
   the blocking pool, and output arrives as `AsyncRead` streams. A call keeps
-  running when its future is dropped: a dropped `exec` cancels its workload as
-  soon as the workload starts, and the other calls complete, so the sandbox's
-  state shows their effects.
+  running when its future is dropped. A dropped `exec` requests the
+  cancellation of its workload as soon as the workload starts, but only
+  backends whose `capabilities().exec.cancel` is true, such as the OpenVMM
+  backend, honor the request; with other backends, the workload runs until it
+  ends. The other calls complete, so the sandbox's state shows their effects.
 
 To add a backend, implement `Backend`. Declare only the capabilities it can
 enforce, and report state-machine violations with the codes listed in the

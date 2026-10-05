@@ -30,13 +30,17 @@ use crate::stream::{self, QueueReader, QueueWriter};
 /// # Cancellation
 ///
 /// Tokio cannot interrupt work on its blocking pool, so every call keeps running after its future
-/// is dropped. When the future of [`exec`](Self::exec) is dropped before it resolves, the workload
-/// that the call starts is cancelled at once, as [`Canceller::cancel`] would cancel it, because
-/// nothing else can reach it: it could run indefinitely and, with the OpenVMM backend, keep later
-/// executions waiting for the sandbox. The other calls run to completion, and the sandbox's state
-/// reflects their effects: a dropped `start` or `stop` may still start or stop the sandbox, a
-/// dropped `deprovision` may still release it, and a dropped `provision` may still allocate a
-/// sandbox whose ID the caller never receives.
+/// is dropped. When the future of [`exec`](Self::exec) is dropped before it resolves, nothing else
+/// can reach the workload that the call starts, which could then run indefinitely and, with the
+/// OpenVMM backend, keep later executions waiting for the sandbox. The call therefore requests the
+/// workload's cancellation as soon as the backend starts it, as [`Canceller::cancel`] would. Only
+/// backends whose [`ExecCapabilities::cancel`](crate::ExecCapabilities::cancel) is true, such as
+/// the OpenVMM backend, honor the request; with other backends, the workload runs until it ends
+/// on its own, so check [`capabilities`](Self::capabilities) before relying on a dropped future
+/// to stop a workload. The other calls run to completion, and the sandbox's state reflects their
+/// effects: a dropped `start` or `stop` may still start or stop the sandbox, a dropped
+/// `deprovision` may still release it, and a dropped `provision` may still allocate a sandbox
+/// whose ID the caller never receives.
 ///
 /// Dropping an [`AsyncExecution`] does not cancel its workload. To bound a running execution,
 /// take a [`Canceller`] from [`AsyncExecution::canceller`] before awaiting
@@ -82,7 +86,8 @@ impl AsyncAciEdgeSandbox {
 
     /// Starts a workload in a running sandbox and returns its live streams.
     ///
-    /// Dropping the returned future before it resolves cancels the workload; see
+    /// Dropping the returned future before it resolves requests the workload's cancellation, which
+    /// only backends with [`ExecCapabilities::cancel`](crate::ExecCapabilities::cancel) honor; see
     /// [Cancellation](Self#cancellation).
     pub async fn exec(
         &self,
@@ -151,11 +156,12 @@ where
         .map_err(|error| Error::backend_error("sandbox blocking task failed").with_source(error))?
 }
 
-/// Cancels an execution when dropped, unless [`CancelOnDrop::defuse`] hands it over first.
+/// Requests the cancellation of an execution when dropped, unless [`CancelOnDrop::defuse`] hands
+/// the execution over first.
 ///
 /// The blocking task of [`AsyncAciEdgeSandbox::exec`] keeps running after its caller drops the
-/// future, and Tokio then drops the task's output, so the workload that the task started is
-/// cancelled instead of running out of anyone's reach.
+/// future, and Tokio then drops the task's output, so the backend is asked to cancel the workload
+/// that the task started, which nothing else could reach.
 struct CancelOnDrop(Option<Box<dyn ExecControl>>);
 
 impl CancelOnDrop {
@@ -171,7 +177,8 @@ impl CancelOnDrop {
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         if let Some(control) = self.0.take() {
-            // Nobody is left to report a failure to.
+            // Nobody is left to report a failure to, such as the `Unsupported` error of a backend
+            // that cannot cancel.
             let _ = control.cancel();
         }
     }
