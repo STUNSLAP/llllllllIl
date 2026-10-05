@@ -39,7 +39,9 @@ CONFIG_FORMAT = 1
 # Format-1 readers ignore unknown fields, so a configuration with a live share
 # uses a format that older NVX releases reject instead of starting without it.
 MOUNT_CONFIG_FORMAT = 2
-CONFIG_FORMATS = (CONFIG_FORMAT, MOUNT_CONFIG_FORMAT)
+# Likewise, format-2 readers would start a caller-owned share as the VMM.
+OWNER_CONFIG_FORMAT = 3
+CONFIG_FORMATS = (CONFIG_FORMAT, MOUNT_CONFIG_FORMAT, OWNER_CONFIG_FORMAT)
 OUTCOME_SCHEMA_VERSION = 1
 
 
@@ -180,7 +182,7 @@ def _serialize_launch(
     cmdline: str,
 ) -> dict[str, Any]:
     return {
-        "format": CONFIG_FORMAT if launch.mount is None else MOUNT_CONFIG_FORMAT,
+        "format": _config_format(launch.mount),
         "layers": [
             {
                 "role": layer.role,
@@ -211,6 +213,12 @@ def _serialize_launch(
     }
 
 
+def _config_format(mount: SandboxMount | None) -> int:
+    if mount is None:
+        return CONFIG_FORMAT
+    return OWNER_CONFIG_FORMAT if mount.owner == "caller" else MOUNT_CONFIG_FORMAT
+
+
 def _serialize_mount(mount: SandboxMount | None) -> dict[str, Any] | None:
     if mount is None:
         return None
@@ -220,6 +228,7 @@ def _serialize_mount(mount: SandboxMount | None) -> dict[str, Any] | None:
         "host_path": os.fspath(absolute.host_path),
         "access": absolute.access,
         "denied_paths": list(absolute.denied_paths),
+        "owner": absolute.owner,
     }
 
 
@@ -237,6 +246,8 @@ def _deserialize_mount(value: object) -> SandboxMount | None:
         host_path=Path(str(mount["host_path"])),
         access=str(mount["access"]),
         denied_paths=tuple(str(path) for path in cast(list[object], denied_paths)),
+        # Configurations written before ownership modes ran shares as the VMM.
+        owner=str(mount.get("owner", "vmm")),
     )
 
 
@@ -264,7 +275,7 @@ def _deserialize_launch(config: dict[str, Any]) -> SandboxLaunch:
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ScriptError("sandbox configuration is malformed") from error
-    if (config.get("format") == MOUNT_CONFIG_FORMAT) != (launch.mount is not None):
+    if config.get("format") != _config_format(launch.mount):
         raise ScriptError("sandbox configuration format does not match its mount")
     return launch.validated()
 

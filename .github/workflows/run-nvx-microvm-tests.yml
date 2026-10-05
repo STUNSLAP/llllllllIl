@@ -363,6 +363,79 @@ jobs:
           python3 scripts/nvx.py sandbox deprovision --state-dir "${state}"
           rm -rf "${share}" "${scratch}" "${outside}"
 
+      - name: Run Ubuntu sandbox caller-owned live-share test on Linux
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          uuid=$(
+            python3 -c 'import json; print(json.load(open("build/ubuntu-distro.erofs.manifest.json", encoding="utf-8"))["uuid"])'
+          )
+          scratch="build/ubuntu-caller-${{ inputs.backend }}.ext4"
+          share="build/ubuntu-caller-share-${{ inputs.backend }}"
+          logs="build/test-results/ubuntu-${{ inputs.backend }}"
+          # Keep the control socket path short.
+          state=$(mktemp -d)
+          cleanup() {
+            if [ -f "${state}/runtime.json" ]; then
+              python3 scripts/nvx.py sandbox stop --state-dir "${state}" --timeout 30 || true
+            fi
+            mkdir -p "${logs}"
+            cp "${state}/openvmm.log" "${logs}/caller-share-openvmm.log" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          rm -rf "${share}"
+          mkdir -p "${share}"
+          printf 'host-to-guest\n' >"${share}/nvx-host-marker"
+          chmod 0777 "${share}"
+          # The runner grants OpenVMM neither CAP_SETUID nor CAP_SETGID, so it
+          # can neither assume the 65534 workload identity nor drop its backend
+          # group. With --mount-owner caller, every share operation must fail
+          # with EPERM instead of running as the runner. The OpenVMM unit tests
+          # cover the identity of each request, including guest root squash.
+          cp --reflink=auto build/ubuntu-smoke-scratch.ext4 "${scratch}"
+          python3 scripts/nvx.py sandbox \
+            --hypervisor "${{ inputs.backend }}" \
+            --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
+            --scratch "${scratch}" \
+            --mount "/workspace,${share},rw" \
+            --mount-owner caller \
+            --entrypoint /sbin/nvx-sandbox-smoke \
+            --arg /workspace \
+            --arg eperm \
+            --workload-user 65534:65534 \
+            --memory-mib 256
+          test "$(ls -A "${share}")" = nvx-host-marker
+          # A managed sandbox persists the ownership mode and applies it on start.
+          cp --reflink=auto build/ubuntu-smoke-scratch.ext4 "${scratch}"
+          python3 scripts/nvx.py sandbox provision \
+            --state-dir "${state}" \
+            --hypervisor "${{ inputs.backend }}" \
+            --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
+            --scratch "${scratch}" \
+            --mount "/workspace,${share},rw" \
+            --mount-owner caller \
+            --workload-user 65534:65534
+          python3 - "${state}/config.json" <<'EOF'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              config = json.load(stream)
+          if config["format"] != 3 or config["mount"]["owner"] != "caller":
+              sys.exit(f"managed sandbox did not persist caller ownership: {config}")
+          EOF
+          python3 scripts/nvx.py sandbox start --state-dir "${state}"
+          python3 scripts/nvx.py sandbox exec \
+            --state-dir "${state}" \
+            --entrypoint /sbin/nvx-sandbox-smoke \
+            --arg /workspace \
+            --arg eperm
+          python3 scripts/nvx.py sandbox stop --state-dir "${state}"
+          test "$(ls -A "${share}")" = nvx-host-marker
+          python3 scripts/nvx.py sandbox deprovision --state-dir "${state}"
+          rm -rf "${share}" "${scratch}"
+
       - name: Run Ubuntu sandbox layer smoke test on Windows
         if: runner.os == 'Windows' && !inputs.debug-kernel
         shell: powershell

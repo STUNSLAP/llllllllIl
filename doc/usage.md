@@ -427,6 +427,7 @@ python3 scripts/nvx.py run
     [--processors {1,2,4,8}]
     [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]
     [--mount-deny HOST_PATH]...
+    [--mount-owner {vmm,caller}]
     [--net IPV4/PREFIX]
     [--network-profile {portable}]
     [--network-egress {allow,deny}]
@@ -454,8 +455,9 @@ python3 scripts/nvx.py run
 | `--memory-mib MIB` | guest-specific | Set guest memory in MiB. Defaults to 128 for Alpine, 512 for Ubuntu, and 512 for Azure Linux. |
 | `--memory-capacity-mib MIB` | none | Reserve an immutable, 128 MiB-aligned RAM capacity for a fresh microVM snapshot. |
 | `--processors {1,2,4,8}` | `1` | Select the microVM processor count. |
-| `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Expose one host directory to the absolute guest target. An `rw` mapping accepts guest-created symbolic links, which the host never follows. Active snapshot restore requires the same canonical path, target, and mode; a dormant-slot restore may attach a new mapping that the resumed guest mounts explicitly. |
+| `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Expose one host directory to the absolute guest target. An `rw` mapping accepts guest-created symbolic links, which the host never follows. Active snapshot restore requires the same canonical path, target, mode, and ownership mode; a dormant-slot restore may attach a new mapping that the resumed guest mounts explicitly. |
 | `--mount-deny HOST_PATH` | none | Hide one existing file or directory inside the mounted host root; repeat to deny multiple paths. |
+| `--mount-owner {vmm,caller}` | `vmm` | Select the host identity of the guest's operations on the `--mount` directory. `caller` performs each one as the guest caller's UID and GID and squashes guest root to the directory owner; it requires a Linux host. See [Run](run.md#file-ownership). |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with the static guest IPv4 address and prefix. |
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
 | `--network-egress {allow,deny}` | `allow` | Set the default guest egress policy. |
@@ -503,6 +505,7 @@ python3 scripts/nvx.py sandbox
     [--hypervisor {auto,whp,kvm,mshv}]
     [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]
     [--mount-deny HOST_PATH]...
+    [--mount-owner {vmm,caller}]
     [--net IPV4/PREFIX]
     [--network-profile {portable}]
     [--network-egress {allow,deny}]
@@ -543,6 +546,7 @@ launches.
 | `--hypervisor {auto,whp,kvm,mshv}` | `auto` | Select the host hypervisor. |
 | `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Live-share one host directory at the absolute target inside the container rootfs for `run` or `provision`; defaults to `ro`. An `rw` share accepts guest-created symbolic links, which the host never follows. `/`, `/etc`, and the `/proc`, `/sys`, `/dev`, and `/.nvx-agent` trees are reserved. |
 | `--mount-deny HOST_PATH` | none | Hide one existing file or directory inside the `--mount` host directory; relative paths are resolved inside it. Repeat to deny multiple paths. |
+| `--mount-owner {vmm,caller}` | `vmm` | Select the host identity of the share's file operations for `run` or `provision`. `vmm` performs them as OpenVMM; `caller` performs them as the workload's UID and GID, squashes guest root to the owner of the host directory, and fails them with `EPERM` when OpenVMM cannot assume that identity. `caller` requires a Linux host and is persisted by `provision`. See [File ownership](run.md#file-ownership). |
 | `--net IPV4/PREFIX` | none | Enable virtio-net with a static guest address. |
 | `--network-profile {portable}` | none | Select the required cross-platform network behavior contract; must be specified with `--net`. |
 | `--network-egress {allow,deny}` | `allow` | Set the default guest egress policy for `run` or `provision`. |

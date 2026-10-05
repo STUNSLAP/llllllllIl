@@ -4,6 +4,11 @@ set -eu
 check_share() {
     share=$1
     share_mode=$2
+    if [ "$share_mode" = eperm ]; then
+        check_share_denied "$share"
+        echo "NVX-UBUNTU-SANDBOX-SHARE-OK target=$share mode=$share_mode"
+        return
+    fi
     [ "$(cat "$share/nvx-host-marker")" = host-to-guest ]
     [ ! -e "$share/nvx-denied" ]
     case "$share_mode" in
@@ -11,6 +16,13 @@ check_share() {
             printf 'guest-to-host\n' >"$share/nvx-guest-marker"
             mkdir "$share/nvx-guest-directory"
             check_share_symlinks "$share"
+            ;;
+        caller)
+            printf 'guest-to-host\n' >"$share/nvx-guest-marker"
+            mkdir "$share/nvx-guest-directory"
+            check_share_ownership "$share"
+            mkdir "$share/nvx-caller-links"
+            check_share_symlinks "$share" "$share/nvx-caller-links"
             ;;
         ro)
             if touch "$share/nvx-guest-marker" 2>/dev/null; then
@@ -25,12 +37,62 @@ check_share() {
     echo "NVX-UBUNTU-SANDBOX-SHARE-OK target=$share mode=$share_mode"
 }
 
+# With --mount-owner caller, the workload owns what it creates, so it can
+# populate the directories that it creates without host-granted access.
+check_share_ownership() {
+    share=$1
+    identity=$(id -u):$(id -g)
+    [ "$(stat -c %u:%g "$share/nvx-guest-marker")" = "$identity" ]
+    [ "$(stat -c %u:%g "$share/nvx-guest-directory")" = "$identity" ]
+    mkdir "$share/nvx-guest-directory/nested"
+    printf 'nested\n' >"$share/nvx-guest-directory/nested/file"
+    mv "$share/nvx-guest-directory/nested/file" \
+        "$share/nvx-guest-directory/nested/renamed"
+    [ "$(cat "$share/nvx-guest-directory/nested/renamed")" = nested ]
+    [ "$(stat -c %u:%g "$share/nvx-guest-directory/nested/renamed")" = "$identity" ]
+    echo "NVX-UBUNTU-SANDBOX-OWNER-OK target=$share identity=$identity"
+}
+
+# When OpenVMM cannot assume the workload identity, every share operation
+# fails with EPERM instead of running as the VMM. The guest permission bits
+# allow the read and the listing, so only the host can refuse them. uutils
+# commands describe some EPERM failures as "Permission denied", so writes
+# need only fail; the host checks that the share is unchanged.
+check_share_denied() {
+    share=$1
+    if error=$(cat "$share/nvx-host-marker" 2>&1); then
+        exit 1
+    fi
+    expect_eperm "$error"
+    if error=$(ls "$share" 2>&1); then
+        exit 1
+    fi
+    expect_eperm "$error"
+    if (: >"$share/nvx-guest-marker") 2>/dev/null; then
+        exit 1
+    fi
+    if mkdir "$share/nvx-guest-directory" 2>/dev/null; then
+        exit 1
+    fi
+}
+
+expect_eperm() {
+    case "$1" in
+        *'Operation not permitted'*) ;;
+        *)
+            echo "unexpected share error: $1" >&2
+            exit 1
+            ;;
+    esac
+}
+
 # Exercise the symbolic-link primitives that package managers and language
-# toolchains use. The host pre-creates the world-writable nvx-links directory,
-# because a directory that the guest creates is owned by the VMM user.
+# toolchains use. The links directory defaults to the host-created,
+# world-writable nvx-links, because a directory that the guest creates is
+# owned by the VMM user unless the share runs with --mount-owner caller.
 check_share_symlinks() {
     share=$1
-    links=$share/nvx-links
+    links=${2:-$share/nvx-links}
 
     # An npm-style .bin shim: a relative link to an executable in the share.
     printf '#!/bin/sh\necho NVX-SYMLINK-TOOL-OK\n' >/tmp/nvx-tool

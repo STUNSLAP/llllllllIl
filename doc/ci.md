@@ -228,7 +228,26 @@ no link read or modified host data outside the share or in the denied path. A
 managed sandbox then repeats
 the read-write check through `provision`, `start`, `exec`, and `stop`, and must
 report a successful outcome with a cleanly unmounted scratch filesystem, which
-shows that `stop` unmounted the share and overlay first. Linux/KVM runs the
+shows that `stop` unmounted the share and overlay first. On Linux, a
+world-writable share then runs with `--mount-owner caller`. The runners grant
+OpenVMM neither `CAP_SETUID` nor `CAP_SETGID`, so it can neither assume the
+65534 workload identity nor drop the backend group through which it opens
+`/dev/kvm` or `/dev/mshv`. The smoke script's `eperm` mode therefore
+requires reading and listing the share to fail with `EPERM` and writes to
+fail, and the host requires the share to be unchanged, both for a one-shot
+run and for a managed sandbox whose configuration must persist the mode. The `filesystem-owner` scenario of
+`test-microvm` likewise requires guest root and a foreign guest identity to
+fail with `EPERM` on the runners, and a root-owned export to be rejected
+before boot; on Windows, `--mount-owner caller` must be rejected before boot.
+The OpenVMM unit tests check the host identity that each request runs as,
+including guest root squashed to an export owner other than OpenVMM. Where
+OpenVMM can drop its supplementary groups, the scenario instead requires
+files that guest root creates to belong to the share owner rather than to
+root, and squashed root to fail to chown a file, give it another of OpenVMM's
+groups, or create a device node. When the test process also passes
+`CAP_SETUID` and `CAP_SETGID` to OpenVMM, as on a privileged developer host,
+the scenario requires the foreign identity to own the files it creates.
+Linux/KVM runs the
 broader Ubuntu SMP, managed lifecycle, network snapshot, blockless snapshot,
 and workload-identity set.
 

@@ -366,12 +366,26 @@ set and enforced before HostFs operations. Prefix checks hide complete
 subtrees, while denied root device/inode identities block hard-link, junction,
 and bind-mount aliases. The policy is unchanged by a second guest mount.
 
+The ownership mode selects the host identity of guest operations. By default,
+HostFs performs them as the VMM. With `--mount-owner caller`, a Linux host
+performs each request that can access host files as the UID and GID in its
+FUSE header: the queue worker switches only its own thread's filesystem UID
+and GID, clears the supplementary groups and effective capabilities, and
+restores all of them before handling anything else. Session negotiation,
+`FORGET`, and handle release run unchanged. Guest UID 0 and GID 0 are squashed
+to the owner and group of the export root, which therefore must not be UID 0
+or GID 0. A request whose identity cannot be assumed fails with `EPERM` rather
+than running as the VMM. Windows hosts reject the mode.
+
 The exported directory is external live state, not part of the VM snapshot.
-An active capture saves its exact canonical host path, denied-path set, FUSE negotiation, node
+An active capture saves its exact canonical host path, denied-path set,
+ownership mode, FUSE negotiation, node
 and handle allocation, aliases (including those of symbolic links), lookup
 counts, directory snapshots and cookies, and the identities needed to reopen
 objects. Restore requires the same path,
-target, mode, denied-path set, root identity, and reopenable objects. A dormant capture instead
+target, mode, denied-path set, ownership mode, root identity, and reopenable objects. A caller-owned
+capture records device-private schema version 6, which earlier releases reject
+instead of restoring the attachment as the VMM. A dormant capture instead
 saves explicit unattached state and may restore with no attachment or bind a
 new HostFs backend. The resumed guest then mounts tag `microvm` explicitly;
 the cold-boot mount hook has already run. Snapshots without this capability

@@ -1596,6 +1596,36 @@ class CliTests(unittest.TestCase):
             [Path("share/secrets"), Path("share/private")],
         )
 
+    def test_run_forwards_mount_owner_and_requires_mount(self):
+        args = nvx.parse_args(
+            ["run", "--mount", "/mnt/share,share,rw", "--mount-owner", "caller"]
+            + ["--dry-run"]
+        )
+        with (
+            patch.object(nvx, "require_file", return_value=Path("artifact")),
+            patch.object(
+                nvx, "_format_command", return_value="formatted"
+            ) as format_command,
+        ):
+            if sys.platform == "win32":
+                with self.assertRaisesRegex(common.ScriptError, "Linux host"):
+                    nvx.command_run(args)
+                format_command.assert_not_called()
+            else:
+                nvx.command_run(args)
+                command = format_command.call_args.args[0]
+                self.assertEqual(command[command.index("--mount-owner") + 1], "caller")
+
+            default = nvx.parse_args(["run", "--mount", "/mnt/share,share,rw"])
+            self.assertIsNone(default.mount_owner)
+            unmounted = nvx.parse_args(["run", "--mount-owner", "vmm", "--dry-run"])
+            with self.assertRaisesRegex(common.ScriptError, "requires --mount"):
+                nvx.command_run(unmounted)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            nvx.parse_args(
+                ["run", "--mount", "/mnt/share,share", "--mount-owner", "root"]
+            )
+
     def test_run_forwards_bounded_outcome_report(self):
         args = nvx.parse_args(["run", "--outcome-report", "outcome.json", "--dry-run"])
         with (
@@ -7253,7 +7283,13 @@ class SandboxSmokeShareTests(unittest.TestCase):
         source = self.SMOKE.read_text(encoding="utf-8")
         self.functions = "".join(
             _shell_function(source, name)
-            for name in ("check_share", "check_share_symlinks")
+            for name in (
+                "check_share",
+                "check_share_ownership",
+                "check_share_denied",
+                "expect_eperm",
+                "check_share_symlinks",
+            )
         ).replace("/tmp/nvx-tool", '"$scratch/nvx-tool"')
 
     def _run(self, call: str) -> subprocess.CompletedProcess[str]:
@@ -7326,6 +7362,72 @@ class SandboxSmokeShareTests(unittest.TestCase):
         self.share.chmod(0o755)
         result = self._run('check_share "$share" ro')
         self.assertEqual(result.returncode, 1, result.stdout)
+
+    def test_caller_share_owns_and_populates_its_own_directories(self):
+        if sys.platform != "linux":
+            self.skipTest("ownership checks use GNU stat and Linux identities")
+        result = self._run('check_share "$share" caller')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        share = self.share.as_posix()
+        self.assertIn(
+            f"NVX-UBUNTU-SANDBOX-OWNER-OK target={share} "
+            f"identity={os.getuid()}:{os.getgid()}",
+            result.stdout,
+        )
+        self.assertIn(f"NVX-UBUNTU-SANDBOX-SYMLINK-OK target={share}", result.stdout)
+        self.assertIn(
+            f"NVX-UBUNTU-SANDBOX-SHARE-OK target={share} mode=caller", result.stdout
+        )
+        links = self.share / "nvx-caller-links"
+        self.assertEqual(
+            {name: os.readlink(links / name) for name in os.listdir(links)},
+            {
+                "nvx-tool": "../nvx-tool",
+                "absolute": "/nvx/absolute/target",
+                "outside": "../../nvx-outside-marker",
+                "denied": "../nvx-denied/secret",
+                "denied-directory": "../nvx-denied",
+            },
+        )
+        self.assertEqual(os.listdir(self.links), [])
+        renamed = self.share / "nvx-guest-directory" / "nested" / "renamed"
+        self.assertEqual(renamed.read_text(encoding="utf-8"), "nested\n")
+
+    def test_eperm_share_requires_reads_to_fail_with_eperm_and_writes_to_fail(self):
+        result = self._run('check_share "$share" eperm')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("NVX-UBUNTU-SANDBOX-SHARE-OK", result.stdout)
+
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is not None and geteuid() == 0:
+            self.skipTest("root ignores directory write permissions")
+        # Writes need only fail, so a read-only host directory stands in for
+        # the host's refusal.
+        self.share.chmod(0o555)
+        self.addCleanup(self.share.chmod, 0o755)
+        denied = "".join(
+            f'{command}() {{ echo "{command}: $1: Operation not permitted" >&2; '
+            "return 1; }\n"
+            for command in ("cat", "ls")
+        )
+        result = self._run(denied + 'check_share "$share" eperm')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            f"NVX-UBUNTU-SANDBOX-SHARE-OK target={self.share.as_posix()} mode=eperm",
+            result.stdout,
+        )
+        self.assertFalse((self.share / "nvx-guest-marker").exists())
+
+        other_error = denied.replace("Operation not permitted", "Permission denied")
+        result = self._run(other_error + 'check_share "$share" eperm')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("unexpected share error", result.stderr)
+
+        self.share.chmod(0o755)
+        result = self._run(denied + 'check_share "$share" eperm')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("NVX-UBUNTU-SANDBOX-SHARE-OK", result.stdout)
 
 
 class ManagedAgentCgroupTests(unittest.TestCase):
@@ -8605,6 +8707,68 @@ class SandboxTests(unittest.TestCase):
         with self.assertRaisesRegex(common.ScriptError, "parent component"):
             sandbox.SandboxMount.parse("/workspace,link/../share")
 
+    def test_mount_owner_defaults_to_vmm_and_forwards_caller(self):
+        default = sandbox.SandboxMount.parse("/workspace,host-dir,rw")
+        self.assertEqual(default.owner, "vmm")
+        self.assertNotIn("--mount-owner", default.openvmm_arguments())
+
+        caller = sandbox.SandboxMount.parse(
+            "/workspace,host-dir,rw", ("secrets",), "caller"
+        )
+        self.assertEqual(
+            caller.openvmm_arguments(),
+            [
+                "--mount",
+                f"/workspace,{os.fspath(Path('host-dir'))},rw",
+                "--mount-deny",
+                "secrets",
+                "--mount-owner",
+                "caller",
+            ],
+        )
+        self.assertEqual(caller.absolute().owner, "caller")
+        self.assertEqual(
+            caller.command_line_fragment(), default.command_line_fragment()
+        )
+        with self.assertRaisesRegex(
+            common.ScriptError, "unsupported sandbox mount owner"
+        ):
+            sandbox.SandboxMount.parse("/workspace,host-dir", (), "root")
+
+    def test_caller_owner_requires_linux_and_a_directory_that_root_does_not_own(self):
+        with patch.object(sandbox.os, "name", "nt"):
+            with self.assertRaisesRegex(common.ScriptError, "requires a Linux host"):
+                sandbox.require_mount_owner_supported("caller")
+            sandbox.require_mount_owner_supported("vmm")
+        if sys.platform == "win32":
+            with tempfile.TemporaryDirectory() as temporary:
+                mount = sandbox.SandboxMount(
+                    guest_target="/workspace", host_path=Path(temporary), owner="caller"
+                )
+                with self.assertRaisesRegex(
+                    common.ScriptError, "requires a Linux host"
+                ):
+                    mount.validated()
+            return
+
+        with tempfile.TemporaryDirectory() as temporary:
+            mount = sandbox.SandboxMount(
+                guest_target="/workspace", host_path=Path(temporary), owner="caller"
+            )
+            owner = Path(temporary).stat()
+            if owner.st_uid != 0 and owner.st_gid != 0:
+                self.assertIs(mount.validated(), mount)
+        filesystem_root = Path("/")
+        if filesystem_root.stat().st_uid == 0:
+            root_owned = sandbox.SandboxMount(
+                guest_target="/workspace", host_path=filesystem_root, owner="caller"
+            )
+            with self.assertRaisesRegex(common.ScriptError, "UID 0 or GID 0"):
+                root_owned.validated()
+            sandbox.SandboxMount(
+                guest_target="/workspace", host_path=filesystem_root
+            ).validated()
+
     def test_mount_absolute_path_keeps_symbolic_link_components(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -8782,6 +8946,53 @@ class SandboxTests(unittest.TestCase):
                 command[command.index("--mount") + 1], f"/workspace,{share},rw"
             )
             self.assertEqual(command[command.index("--mount-deny") + 1], "secrets")
+            self.assertNotIn("--mount-owner", command)
+
+    def test_sandbox_command_forwards_mount_owner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            share = root / "share"
+            layer.write_bytes(b"distro")
+            scratch.write_bytes(b"scratch")
+            share.mkdir()
+            args = nvx.parse_args(
+                [
+                    "sandbox",
+                    "--layer",
+                    f"distro,{layer},11111111-1111-1111-1111-111111111111",
+                    "--scratch",
+                    str(scratch),
+                    "--mount",
+                    f"/workspace,{share},rw",
+                    "--mount-owner",
+                    "caller",
+                    "--dry-run",
+                ]
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(nvx, "require_file", side_effect=require),
+                patch.object(
+                    nvx, "_format_command", return_value="formatted"
+                ) as format_command,
+            ):
+                if sys.platform == "win32":
+                    with self.assertRaisesRegex(common.ScriptError, "Linux host"):
+                        nvx.command_sandbox(args)
+                    format_command.assert_not_called()
+                    return
+                if share.stat().st_uid == 0:
+                    self.skipTest("caller ownership refuses a root-owned share")
+                nvx.command_sandbox(args)
+
+            command = format_command.call_args.args[0]
+            self.assertEqual(command[command.index("--mount-owner") + 1], "caller")
+            self.assertLess(command.index("--mount"), command.index("--mount-owner"))
 
     def test_sandbox_command_rejects_misplaced_mount_options(self):
         deny_only = nvx.parse_args(
@@ -8797,6 +9008,19 @@ class SandboxTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(common.ScriptError, "requires --mount"):
             nvx.command_sandbox(deny_only)
+        owner_only = nvx.parse_args(
+            [
+                "sandbox",
+                "--layer",
+                "distro,distro.erofs,11111111-1111-1111-1111-111111111111",
+                "--scratch",
+                "scratch.ext4",
+                "--mount-owner",
+                "caller",
+            ]
+        )
+        with self.assertRaisesRegex(common.ScriptError, "--mount-owner requires"):
+            nvx.command_sandbox(owner_only)
         for operation in ("start", "exec", "stop", "deprovision"):
             with self.subTest(operation=operation):
                 args = nvx.parse_args(
@@ -8873,6 +9097,7 @@ class SandboxTests(unittest.TestCase):
                     "host_path": os.fspath(share),
                     "access": "rw",
                     "denied_paths": ["secrets"],
+                    "owner": "vmm",
                 },
             )
 
@@ -8952,6 +9177,159 @@ class SandboxTests(unittest.TestCase):
             config["format"] = sandbox_lifecycle.CONFIG_FORMAT
             with self.assertRaisesRegex(common.ScriptError, "does not match"):
                 sandbox_lifecycle._deserialize_launch(config)
+
+    def test_managed_configuration_format_binds_the_mount_owner(self):
+        mount: dict[str, object] = {
+            "guest_target": "/workspace",
+            "host_path": "share",
+            "access": "rw",
+            "denied_paths": [],
+        }
+        config: dict[str, object] = {
+            "format": sandbox_lifecycle.MOUNT_CONFIG_FORMAT,
+            "layers": [
+                {
+                    "role": "distro",
+                    "path": "distro.erofs",
+                    "uuid": "11111111-1111-1111-1111-111111111111",
+                }
+            ],
+            "scratch": "scratch.ext4",
+            "hostname": "nvx-sandbox",
+            "workload_uid": 65534,
+            "workload_gid": 65534,
+            "memory_max": None,
+            "pids_max": None,
+            "mount": mount,
+        }
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        def unchanged(mount: sandbox.SandboxMount) -> sandbox.SandboxMount:
+            return mount
+
+        with (
+            patch.object(sandbox, "require_file", side_effect=require),
+            patch.object(sandbox.SandboxMount, "validated", unchanged),
+        ):
+            # A share configured before ownership modes runs as the VMM.
+            launch = sandbox_lifecycle._deserialize_launch(config)
+            assert launch.mount is not None
+            self.assertEqual(launch.mount.owner, "vmm")
+            mount["owner"] = "vmm"
+            launch = sandbox_lifecycle._deserialize_launch(config)
+            assert launch.mount is not None
+            self.assertEqual(launch.mount.owner, "vmm")
+            # Only format 3, which older releases reject, carries caller ownership.
+            mount["owner"] = "caller"
+            with self.assertRaisesRegex(common.ScriptError, "does not match"):
+                sandbox_lifecycle._deserialize_launch(config)
+            config["format"] = sandbox_lifecycle.OWNER_CONFIG_FORMAT
+            launch = sandbox_lifecycle._deserialize_launch(config)
+            assert launch.mount is not None
+            self.assertEqual(launch.mount.owner, "caller")
+            mount["owner"] = "vmm"
+            with self.assertRaisesRegex(common.ScriptError, "does not match"):
+                sandbox_lifecycle._deserialize_launch(config)
+            mount["owner"] = "root"
+            with self.assertRaisesRegex(
+                common.ScriptError, "unsupported sandbox mount owner"
+            ):
+                sandbox_lifecycle._deserialize_launch(config)
+
+    def test_managed_lifecycle_persists_and_replays_caller_owner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            layer_path = root / "distro.erofs"
+            scratch_path = root / "scratch.ext4"
+            share = root / "share"
+            layer_path.write_bytes(b"layer")
+            scratch_path.write_bytes(b"scratch")
+            share.mkdir()
+            state = root / "state"
+            launch = sandbox.SandboxLaunch(
+                layers=(
+                    sandbox.SandboxLayer(
+                        role="distro",
+                        path=layer_path,
+                        uuid="11111111-1111-1111-1111-111111111111",
+                    ),
+                ),
+                scratch=scratch_path,
+                mount=sandbox.SandboxMount.parse(
+                    f"/workspace,{share},rw", (), "caller"
+                ),
+            )
+
+            def provision() -> None:
+                sandbox_lifecycle.provision(
+                    state,
+                    launch,
+                    hypervisor="whp" if sys.platform == "win32" else "kvm",
+                    memory_mib=256,
+                    net=None,
+                    network_profile=None,
+                    network_egress=None,
+                    network_ingress=None,
+                    network_egress_allow=(),
+                    network_egress_deny=(),
+                    host_loopback=None,
+                    network_proxy=None,
+                    host_loopback_forward=(),
+                    cmdline="quiet",
+                )
+
+            if sys.platform == "win32":
+                with self.assertRaisesRegex(common.ScriptError, "Linux host"):
+                    provision()
+                self.assertFalse((state / sandbox_lifecycle.CONFIG_NAME).exists())
+                return
+            if share.stat().st_uid == 0:
+                self.skipTest("caller ownership refuses a root-owned share")
+            provision()
+
+            config = json.loads(
+                (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(config["format"], sandbox_lifecycle.OWNER_CONFIG_FORMAT)
+            self.assertEqual(config["mount"]["owner"], "caller")
+            # NVX releases that know only formats 1 and 2 refuse to start it.
+            with self.assertRaisesRegex(common.ScriptError, "unsupported format"):
+                sandbox_lifecycle._read_json(
+                    state / sandbox_lifecycle.CONFIG_NAME,
+                    "sandbox configuration",
+                    version=(
+                        sandbox_lifecycle.CONFIG_FORMAT,
+                        sandbox_lifecycle.MOUNT_CONFIG_FORMAT,
+                    ),
+                )
+
+            process = MagicMock()
+            process.pid = 123
+            process.stdin = io.BytesIO()
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(sandbox_lifecycle, "require_file", side_effect=require),
+                patch.object(
+                    sandbox_lifecycle.subprocess, "Popen", return_value=process
+                ) as popen,
+                patch.object(
+                    sandbox_lifecycle, "_process_start_time", return_value=456
+                ),
+                patch.object(
+                    sandbox_lifecycle.ControlSession,
+                    "connect",
+                    return_value=MagicMock(),
+                ),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            command = popen.call_args.args[0]
+            self.assertEqual(command[command.index("--mount-owner") + 1], "caller")
 
     def test_managed_lifecycle_provisions_and_deprovisions_state(self):
         with tempfile.TemporaryDirectory() as temporary:

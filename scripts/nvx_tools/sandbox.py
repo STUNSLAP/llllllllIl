@@ -25,6 +25,9 @@ SANDBOX_COMMAND_LINE_MAX_SIZE = (
 _HOSTNAME = re.compile(r"(?=^.{1,63}$)(?!-)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 DEFAULT_WORKLOAD_IDENTITY = (65534, 65534)
 MOUNT_ACCESS_MODES = ("ro", "rw")
+# `vmm` performs every share operation as OpenVMM; `caller` performs each as the
+# guest caller's identity, with guest root squashed to the share owner.
+MOUNT_OWNERS = ("vmm", "caller")
 # The container runtime owns these guest paths: it mounts procfs, sysfs, and a
 # private /dev over them, stages its tools under /.nvx-agent, and bind-mounts the
 # workload machine ID into /etc. A live share must not shadow or be shadowed by
@@ -100,6 +103,15 @@ def validate_mount_target(target: str) -> str:
     return target
 
 
+def require_mount_owner_supported(owner: str) -> None:
+    """Reject an ownership mode that the host cannot enforce."""
+    if owner == "caller" and os.name == "nt":
+        raise ScriptError(
+            "--mount-owner caller requires a Linux host; Windows has no "
+            "per-request POSIX identity for OpenVMM to switch to"
+        )
+
+
 @dataclass(frozen=True)
 class SandboxMount:
     """A live virtio-fs share mounted inside the sandbox container rootfs."""
@@ -108,9 +120,12 @@ class SandboxMount:
     host_path: Path
     access: str = "ro"
     denied_paths: tuple[str, ...] = ()
+    owner: str = "vmm"
 
     @classmethod
-    def parse(cls, value: str, denied_paths: tuple[str, ...] = ()) -> SandboxMount:
+    def parse(
+        cls, value: str, denied_paths: tuple[str, ...] = (), owner: str = "vmm"
+    ) -> SandboxMount:
         fields = value.split(",")
         if len(fields) not in (2, 3):
             raise ScriptError("--mount must be GUEST_TARGET,HOST_PATH[,ro|rw]")
@@ -123,6 +138,7 @@ class SandboxMount:
             host_path=Path(raw_path),
             access=access,
             denied_paths=denied_paths,
+            owner=owner,
         )
 
     def __post_init__(self) -> None:
@@ -130,6 +146,10 @@ class SandboxMount:
         if self.access not in MOUNT_ACCESS_MODES:
             raise ScriptError(
                 f"unsupported sandbox mount mode {self.access!r}; choose ro or rw"
+            )
+        if self.owner not in MOUNT_OWNERS:
+            raise ScriptError(
+                f"unsupported sandbox mount owner {self.owner!r}; choose vmm or caller"
             )
         raw_path = os.fspath(self.host_path)
         if any(character in raw_path for character in ",\0"):
@@ -151,10 +171,19 @@ class SandboxMount:
             raise ScriptError("sandbox mount denied paths must be unique")
 
     def validated(self) -> SandboxMount:
+        require_mount_owner_supported(self.owner)
         if self.host_path.is_symlink() or not self.host_path.is_dir():
             raise ScriptError(
                 f"sandbox mount host path is not a plain directory: {self.host_path}"
             )
+        if self.owner == "caller" and os.name != "nt":
+            status = self.host_path.stat()
+            if status.st_uid == 0 or status.st_gid == 0:
+                raise ScriptError(
+                    "--mount-owner caller squashes guest root to the owner of the "
+                    f"shared directory, so {self.host_path} must not be owned by "
+                    "UID 0 or GID 0"
+                )
         return self
 
     def absolute(self) -> SandboxMount:
@@ -169,6 +198,7 @@ class SandboxMount:
             ),
             access=self.access,
             denied_paths=self.denied_paths,
+            owner=self.owner,
         )
 
     def openvmm_arguments(self) -> list[str]:
@@ -178,6 +208,8 @@ class SandboxMount:
         ]
         for denied in self.denied_paths:
             arguments.extend(("--mount-deny", denied))
+        if self.owner != "vmm":
+            arguments.extend(("--mount-owner", self.owner))
         return arguments
 
     def command_line_fragment(self) -> str:

@@ -840,6 +840,299 @@ class GuestSymlinkTests(unittest.TestCase):
             microvm_tests.assert_guest_symlink(followable, str(self.target))
 
 
+class FilesystemOwnerTests(unittest.TestCase):
+    def test_identity_capabilities_come_from_ambient_or_bounding_sets(self):
+        def status(ambient: int, bounding: int) -> str:
+            return (
+                "Name:\tpython3\nCapInh:\t0000000000000000\n"
+                f"CapAmb:\t{ambient:016x}\nCapBnd:\t{bounding:016x}\n"
+            )
+
+        both = (1 << 6) | (1 << 7)
+        inherited = microvm_tests.identity_capabilities_inherited
+        self.assertTrue(inherited(status(both, both), root=False))
+        self.assertFalse(inherited(status(1 << 7, both), root=False))
+        self.assertFalse(inherited(status(0, both), root=False))
+        self.assertTrue(inherited(status(0, both), root=True))
+        self.assertFalse(inherited(status(both, 1 << 6), root=True))
+
+    def test_other_groups_exclude_the_effective_gid(self):
+        with (
+            patch.object(microvm_tests.sys, "platform", "linux"),
+            patch.object(microvm_tests.os, "getegid", create=True, return_value=1000),
+            patch.object(
+                microvm_tests.os,
+                "getgroups",
+                create=True,
+                return_value=[27, 1000, 4, 27],
+            ),
+        ):
+            self.assertEqual(microvm_tests.openvmm_other_groups(), [4, 27])
+
+    def _render(
+        self,
+        owner: str,
+        foreign: str,
+        root_result: str,
+        foreign_result: str,
+        other_group: str,
+        share: Path,
+    ) -> str:
+        return (
+            microvm_tests._render_script(
+                "filesystem-owner.sh.in",
+                OWNER=owner,
+                FOREIGN=foreign,
+                OTHER_GROUP=other_group,
+                ROOT_RESULT=root_result,
+                FOREIGN_RESULT=foreign_result,
+            )
+            .replace("share=/mnt/share", f"share={share.as_posix()}")
+            .replace("nvx-exit", "nvx_exit")
+        )
+
+    def _run_script(self, script: str, stubs: str) -> subprocess.CompletedProcess[str]:
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        return subprocess.run(
+            [shell, "-s"],
+            input='nvx_exit() { exit "$1"; }\n' + stubs + script,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+    def _run_in_share(
+        self,
+        owner: str,
+        foreign: str,
+        results: tuple[str, str],
+        stubs: str,
+        *,
+        other_group: str = "none",
+        read_only: bool = False,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        share = Path(temporary.name)
+        if read_only:
+            share.chmod(0o500)
+            self.addCleanup(share.chmod, 0o700)
+        root_result, foreign_result = results
+        script = self._render(
+            owner, foreign, root_result, foreign_result, other_group, share
+        )
+        return self._run_script(script, stubs), share
+
+    def test_script_checks_root_squash_and_both_foreign_results(self):
+        if sys.platform != "linux":
+            self.skipTest("the script uses Linux semantics")
+        if os.geteuid() == 0:
+            self.skipTest("root may chown and create device nodes")
+        identity = f"{os.getuid()}:{os.getgid()}"
+
+        # Without privilege, setpriv itself fails with EPERM, as OpenVMM does.
+        denied, share = self._run_in_share(
+            identity,
+            "4242:4242",
+            ("owned", "denied"),
+            'setpriv() { echo "setpriv: Operation not permitted" >&2; return 1; }\n',
+        )
+        self.assertEqual(denied.returncode, 0, denied.stdout + denied.stderr)
+        self.assertIn("NVX-FILESYSTEM-OWNER-OK", denied.stdout)
+        self.assertTrue((share / "root-file").stat().st_mode & 0o4000)
+        self.assertFalse((share / "foreign").exists())
+
+        wrong_error, _ = self._run_in_share(
+            identity,
+            "4242:4242",
+            ("owned", "denied"),
+            'setpriv() { echo "Permission denied" >&2; return 1; }\n',
+        )
+        self.assertNotEqual(wrong_error.returncode, 0)
+        self.assertNotIn("NVX-FILESYSTEM-OWNER-OK", wrong_error.stdout)
+
+        wrong_owner, _ = self._run_in_share(
+            "4242:4242", "4243:4243", ("owned", "denied"), "setpriv() { return 1; }\n"
+        )
+        self.assertEqual(wrong_owner.returncode, 100, wrong_owner.stdout)
+
+        # Squashed root must not give a file one of OpenVMM's other groups.
+        regrouped, _ = self._run_in_share(
+            identity,
+            "4242:4242",
+            ("owned", "denied"),
+            "chgrp() { return 0; }\nsetpriv() { return 1; }\n",
+            other_group="4444",
+        )
+        self.assertEqual(regrouped.returncode, 119, regrouped.stdout)
+
+        # The foreign caller here is this test's own identity, which may chown
+        # to itself, so stub chown as the squashed root identity sees it.
+        owned, share = self._run_in_share(
+            identity,
+            identity,
+            ("owned", "owned"),
+            "chown() { return 1; }\n"
+            'setpriv() { while [ "$1" != -- ]; do shift; done; shift; "$@"; }\n',
+        )
+        self.assertEqual(owned.returncode, 0, owned.stdout + owned.stderr)
+        self.assertTrue((share / "foreign" / "nested" / "file").is_file())
+        self.assertEqual((share / "foreign").stat().st_mode & 0o777, 0o777)
+
+    def test_script_requires_guest_root_to_fail_closed_when_denied(self):
+        if sys.platform != "linux":
+            self.skipTest("the script uses Linux semantics")
+        if os.geteuid() == 0:
+            self.skipTest("root may write to a read-only directory")
+        identity = f"{os.getuid()}:{os.getgid()}"
+        setpriv = (
+            'setpriv() { echo "setpriv: Operation not permitted" >&2; return 1; }\n'
+        )
+
+        def stat(message: str) -> str:
+            return f'stat() {{ echo "stat: {message}" >&2; return 1; }}\n'
+
+        def run(
+            stubs: str, *, read_only: bool = True
+        ) -> tuple[subprocess.CompletedProcess[str], Path]:
+            return self._run_in_share(
+                identity,
+                "4242:4242",
+                ("denied", "denied"),
+                setpriv + stubs,
+                read_only=read_only,
+            )
+
+        # OpenVMM fails every request with EPERM, so nothing reaches the share.
+        denied, share = run(stat("Operation not permitted"))
+        self.assertEqual(denied.returncode, 0, denied.stdout + denied.stderr)
+        self.assertIn("NVX-FILESYSTEM-OWNER-OK", denied.stdout)
+        self.assertEqual(list(share.iterdir()), [])
+
+        wrong_error, _ = run(stat("Permission denied"))
+        self.assertEqual(wrong_error.returncode, 121, wrong_error.stdout)
+        readable, _ = run("")
+        self.assertEqual(readable.returncode, 120, readable.stdout)
+        writable, _ = run(stat("Operation not permitted"), read_only=False)
+        self.assertEqual(writable.returncode, 122, writable.stdout)
+
+    def test_scenario_runs_as_caller_and_checks_host_ownership(self):
+        if sys.platform == "linux":
+            if os.geteuid() == 0:
+                self.skipTest("root runs chown the share to another owner")
+        scripts: list[str] = []
+
+        def guest(command: list[str], script: str, *_args: object, **_kwargs: object):
+            scripts.append(script)
+            mount = command[command.index("--mount") + 1]
+            share = Path(mount.split(",")[1])
+            (share / "root-file").write_text("root\n", encoding="utf-8")
+            (share / "root-file").chmod(0o4755)
+            (share / "root-directory").mkdir()
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests, "run_guest_script", side_effect=guest) as run,
+            patch.object(microvm_tests, "OpenvmmProcess") as process,
+            patch.object(
+                microvm_tests,
+                "openvmm_inherits_identity_capabilities",
+                return_value=False,
+            ),
+            patch.object(microvm_tests, "openvmm_other_groups", return_value=[]),
+        ):
+            expected = (
+                b"must not be owned by UID 0 or GID 0"
+                if sys.platform == "linux"
+                else b"--mount-owner caller requires a Linux host"
+            )
+            process.return_value.__enter__.return_value.wait.return_value = (
+                openvmm_process.OpenvmmProcessResult(2, expected + b"\n")
+            )
+            microvm_tests.run_filesystem_owner(
+                Path("openvmm"),
+                Path("kernel"),
+                Path("initrd"),
+                "kvm" if sys.platform == "linux" else "whp",
+                memory_mib=128,
+                timeout=40,
+                output_dir=Path(temporary),
+            )
+
+        commands = [call.args[0] for call in run.call_args_list] + [
+            call.args[0] for call in process.call_args_list
+        ]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertEqual(command[command.index("--mount-owner") + 1], "caller")
+        if sys.platform != "linux":
+            run.assert_not_called()
+            self.assertEqual(process.call_count, 1)
+            return
+        self.assertEqual(len(scripts), 1)
+        self.assertIn(f"owner={os.getuid()}:{os.getgid()}", scripts[0])
+        self.assertIn("case owned in", scripts[0])
+        self.assertIn("case denied in", scripts[0])
+        self.assertIn("other_group=none", scripts[0])
+        rejected = process.call_args_list[-1].args[0]
+        self.assertEqual(rejected[rejected.index("--mount") + 1], "/mnt/share,/,ro")
+
+    def test_scenario_requires_every_caller_to_fail_without_dropping_groups(self):
+        if sys.platform != "linux":
+            self.skipTest("caller ownership requires a Linux host")
+        if os.geteuid() == 0:
+            self.skipTest("root runs chown the share to another owner")
+        scripts: list[str] = []
+
+        def run_scenario(*, guest_writes: bool) -> None:
+            def guest(
+                command: list[str], script: str, *_args: object, **_kwargs: object
+            ):
+                scripts.append(script)
+                if guest_writes:
+                    mount = command[command.index("--mount") + 1]
+                    share = Path(mount.split(",")[1])
+                    (share / "root-file").write_text("root\n", encoding="utf-8")
+
+            with (
+                tempfile.TemporaryDirectory() as temporary,
+                patch.object(microvm_tests, "run_guest_script", side_effect=guest),
+                patch.object(microvm_tests, "OpenvmmProcess") as process,
+                patch.object(
+                    microvm_tests,
+                    "openvmm_inherits_identity_capabilities",
+                    return_value=False,
+                ),
+                patch.object(
+                    microvm_tests, "openvmm_other_groups", return_value=[4444]
+                ),
+            ):
+                process.return_value.__enter__.return_value.wait.return_value = (
+                    openvmm_process.OpenvmmProcessResult(
+                        2, b"must not be owned by UID 0 or GID 0\n"
+                    )
+                )
+                microvm_tests.run_filesystem_owner(
+                    Path("openvmm"),
+                    Path("kernel"),
+                    Path("initrd"),
+                    "kvm",
+                    memory_mib=128,
+                    timeout=40,
+                    output_dir=Path(temporary),
+                )
+
+        run_scenario(guest_writes=False)
+        self.assertNotIn("case owned in", scripts[0])
+        self.assertEqual(scripts[0].count("case denied in"), 2)
+        self.assertIn("other_group=4444", scripts[0])
+        with self.assertRaisesRegex(RuntimeError, "cannot drop its supplementary"):
+            run_scenario(guest_writes=True)
+
+
 class ControlSessionTests(unittest.TestCase):
     def test_named_pipe_connect_retries_transient_invalid_argument(self):
         error = OSError(control_session.errno.EINVAL, "Invalid argument")
