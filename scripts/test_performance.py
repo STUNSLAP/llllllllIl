@@ -4,6 +4,7 @@
 import contextlib
 import io
 import json
+import re
 import statistics
 import sys
 import tempfile
@@ -214,6 +215,83 @@ class PerformanceTests(unittest.TestCase):
         self.assertEqual(
             action.count("Expected 34 microVM one-vCPU metrics"),
             2,
+        )
+
+    def test_documented_metric_counts_match_collectors(self):
+        shared = len(performance.SHARED_METRICS)
+        lifecycle = len(performance.SHARED_METRICS | performance.LIFECYCLE_METRICS)
+        one_vcpu = len(
+            performance.SHARED_METRICS
+            | performance.LIFECYCLE_METRICS
+            | performance.DEVICE_IO_METRIC_NAMES
+        )
+        # Above one vCPU, an ABI-2 series records only shell_snapshot_restore_512_mib.
+        per_series = one_vcpu + len(performance.MICROVM_PROCESSOR_COUNTS[2] - {1})
+        repository = Path(__file__).parents[1]
+        series = re.findall(
+            r"^[ \t]*benchmark-platform:[ \t]*(\S+)[ \t]*$",
+            (repository / ".github" / "workflows" / "ci.yml").read_text(
+                encoding="utf-8"
+            ),
+            re.MULTILINE,
+        )
+        benchmarks, usage = (
+            " ".join((repository / "doc" / name).read_text(encoding="utf-8").split())
+            for name in ("benchmarks.md", "usage.md")
+        )
+        shell_memories = [str(memory) for memory in benchmark.SHELL_SNAPSHOT_MEMORY_MIB]
+        profile_memories = [
+            str(memory) for memory in benchmark.SNAPSHOT_PROFILE_MEMORY_MIB
+        ]
+
+        self.assertTrue(series)
+        for name in series:
+            self.assertIn(f"| `{name}` |", benchmarks)
+        for phrase in (
+            f"a {shared}-metric microVM non-Python workload suite",
+            f"reports all {one_vcpu} median (p50) values",
+            f"{per_series} p50 values per series, {one_vcpu} at one vCPU",
+            f"and {per_series * len(series)} values across the",
+            f"run all {shared} metrics",
+            f"Runs {shared} metrics",
+            "snapshot restore at "
+            f"{', '.join(shell_memories[:-1])}, and {shell_memories[-1]} MiB",
+            f"summarizes {'/'.join(profile_memories)} MiB warm/cold restores",
+            f"exactly the {shared} shared metrics",
+            f"producing a {lifecycle}-metric one-vCPU result",
+            f"the final {one_vcpu}-metric ABI-2 one-vCPU result",
+        ):
+            self.assertIn(phrase, benchmarks)
+        for phrase in (
+            f"producing the {lifecycle}-metric microVM CI result",
+            f"merges them into a {one_vcpu}-metric one-vCPU result",
+            f"`{' '.join(shell_memories)}` (`{' '.join(profile_memories)}` for "
+            "`snapshot-profile`)",
+        ):
+            self.assertIn(phrase, usage)
+        documented_counts = re.findall(
+            r"\b(\d+)(?:-metric\b| (?:shared )?metrics\b)", f"{benchmarks} {usage}"
+        )
+        self.assertLessEqual(
+            {int(count) for count in documented_counts},
+            {shared, lifecycle, one_vcpu},
+        )
+
+    def test_documented_metric_tables_match_collectors(self):
+        document = (Path(__file__).parents[1] / "doc" / "benchmarks.md").read_text(
+            encoding="utf-8"
+        )
+        _, heading, rest = document.partition("\n## Canonical metrics\n")
+        section = rest.split("\n## ", 1)[0]
+        documented = re.findall(r"^\| `([a-z0-9_]+)` \|", section, re.MULTILINE)
+
+        self.assertTrue(heading)
+        self.assertEqual(len(documented), len(set(documented)))
+        self.assertEqual(
+            set(documented),
+            performance.SHARED_METRICS
+            | performance.LIFECYCLE_METRICS
+            | performance.DEVICE_IO_METRIC_NAMES,
         )
 
     def test_collect_cli_accepts_lifecycle_input(self):
