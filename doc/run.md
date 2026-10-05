@@ -481,7 +481,11 @@ python3 scripts/nvx.py sandbox deprovision \
 
 Lifecycle transitions fail closed: `start` rejects an already-running or stale
 runtime record, `exec` and `stop` require a live OpenVMM process, and
-`deprovision` refuses to remove a running sandbox or unknown files. Managed
+`deprovision` refuses to remove a running sandbox or unknown files. The runtime
+record identifies OpenVMM by its process ID and start time, so these checks
+treat OpenVMM as gone once it exits, even if no process reaps it or another
+process reuses its ID. A record that an earlier NVX version wrote lacks the
+start time and identifies OpenVMM by its process ID alone. Managed
 workload arguments use the bounded control protocol rather than the kernel
 command line and may contain whitespace. Managed execution can select an
 absolute working directory and either repeated inline `KEY=VALUE` entries or a
