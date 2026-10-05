@@ -46,9 +46,9 @@ coordinator fills the `.sh.in` templates before use.
 
 CI runs the complete acceptance and performance suites and the five device metrics at one vCPU
 under the canonical microVM, and only the 512 MiB shell snapshot restore at `2`,
-`4`, and `8` vCPUs. This produces 39 p50 values per series and 117 values across the three-series
-matrix. Counts run sequentially on each host so benchmark workloads never overlap on the same
-physical host.
+`4`, and `8` vCPUs. This produces 37 p50 values per series, 34 at one vCPU and one at each higher
+count, and 111 values across the three-series matrix. Counts run sequentially on each host so
+benchmark workloads never overlap on the same physical host.
 
 ## Running locally
 
