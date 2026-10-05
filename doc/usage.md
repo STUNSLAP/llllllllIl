@@ -34,7 +34,7 @@ python3 scripts/nvx.py performance gate --help
 | `setup-cross-os-cache` | Install GNU tar and zstd for GitHub Actions cross-OS caches. |
 | `check-required-ci` | Validate required GitHub Actions job results. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
-| `test-openvmm` | Run self-contained OpenVMM microVM control-plane tests. |
+| `test-openvmm` | Run OpenVMM Petri VMM tests. |
 | `test-microvm` | Run NVX Linux and device correctness tests through OpenVMM. |
 | `doctor` | Qualify this host for the NVX time ABI. |
 | `test-aci-edge-sandboxes` | Run the `aci_edge_sandboxes` Rust crate lifecycle test on a real hypervisor. |
