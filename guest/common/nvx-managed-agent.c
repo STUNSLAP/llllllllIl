@@ -817,10 +817,29 @@ static int release_container_barrier(const char *path, pid_t child)
     return -1;
 }
 
+static int enable_pids_controller(void)
+{
+    int fd = open(CGROUP_ROOT "/cgroup.subtree_control", O_WRONLY | O_CLOEXEC);
+    int result;
+    int status;
+
+    if (fd < 0) {
+        return -1;
+    }
+    result = write_all(fd, "+pids", 5);
+    status = errno;
+    if (close(fd) != 0 && result == 0) {
+        return -1;
+    }
+    errno = status;
+    return result;
+}
+
 /*
  * Direct-mode workloads run in the guest's own root file system, contained by
  * a cgroup that every process of the workload inherits, whatever session or
- * process group it moves to. Killing the cgroup ends all of them.
+ * process group it moves to. Killing the cgroup ends all of them, and its pids
+ * controller counts each of them until PID 1 reaps it.
  */
 static int prepare_exec_cgroup(void)
 {
@@ -835,7 +854,13 @@ static int prepare_exec_cgroup(void)
             return -1;
         }
     }
-    return mkdir(EXEC_CGROUP, 0755) == 0 || errno == EEXIST ? 0 : -1;
+    if (mkdir(EXEC_CGROUP, 0755) != 0 && errno != EEXIST) {
+        return -1;
+    }
+    if (stat(EXEC_CGROUP "/pids.current", &status) == 0) {
+        return 0;
+    }
+    return errno == ENOENT ? enable_pids_controller() : -1;
 }
 
 static int join_exec_cgroup(void)
@@ -881,23 +906,28 @@ error:
     return -1;
 }
 
-static int exec_cgroup_populated(void)
+/*
+ * Returns 1 if the pids controller still charges a task to the exec cgroup,
+ * 0 if it charges none, or -1. A task stays charged until it is reaped, while
+ * cgroup.events stops counting a killed process as populated before the
+ * process even becomes a zombie.
+ */
+static int exec_cgroup_has_tasks(void)
 {
-    char buffer[256];
-    char *line;
+    char buffer[32];
     size_t length = 0;
-    int populated = -1;
-    int fd = open(EXEC_CGROUP "/cgroup.events", O_RDONLY | O_CLOEXEC);
+    size_t index;
+    int fd = open(EXEC_CGROUP "/pids.current", O_RDONLY | O_CLOEXEC);
 
     if (fd < 0) {
         return -1;
     }
     for (;;) {
-        ssize_t count = read(fd, buffer + length, sizeof(buffer) - 1 - length);
+        ssize_t count = read(fd, buffer + length, sizeof(buffer) - length);
 
         if (count > 0) {
             length += (size_t)count;
-            if (length < sizeof(buffer) - 1) {
+            if (length < sizeof(buffer)) {
                 continue;
             }
             errno = EOVERFLOW;
@@ -917,31 +947,18 @@ static int exec_cgroup_populated(void)
     if (close(fd) != 0) {
         return -1;
     }
-    if (length == 0 || buffer[length - 1] != '\n' ||
-        memchr(buffer, '\0', length) != NULL) {
+    /* A decimal count without sign or leading zeros, then a newline. */
+    if (length < 2 || buffer[length - 1] != '\n' || (buffer[0] == '0' && length != 2)) {
         errno = EPROTO;
         return -1;
     }
-    buffer[length] = '\0';
-    line = buffer;
-    while (*line != '\0') {
-        char *end = strchr(line, '\n');
-
-        *end = '\0';
-        if (strncmp(line, "populated", 9) == 0) {
-            if (populated >= 0 ||
-                (strcmp(line, "populated 0") != 0 && strcmp(line, "populated 1") != 0)) {
-                errno = EPROTO;
-                return -1;
-            }
-            populated = line[10] == '1';
+    for (index = 0; index + 1 < length; ++index) {
+        if (buffer[index] < '0' || buffer[index] > '9') {
+            errno = EPROTO;
+            return -1;
         }
-        line = end + 1;
     }
-    if (populated < 0) {
-        errno = EPROTO;
-    }
-    return populated;
+    return buffer[0] != '0';
 }
 
 /*
@@ -967,29 +984,42 @@ static void reap_children(pid_t child, int *child_exited, int *wait_status)
     }
 }
 
-/* Kills what is left of a direct-mode workload and waits until it is gone. */
+/*
+ * Reaps what the workload left to PID 1, then returns 0 if no task of the
+ * exec cgroup remains, 1 if one does, or -1 on failure.
+ */
+static int reap_exec_cgroup(void)
+{
+    int exited = 1;
+    int status = 0;
+
+    reap_children(0, &exited, &status);
+    return exec_cgroup_has_tasks();
+}
+
+/*
+ * Kills what is left of a direct-mode workload and waits until it is gone:
+ * every process of the workload has exited and been reaped, so the next
+ * workload cannot find any of them in /proc.
+ */
 static int settle_exec_cgroup(void)
 {
     const struct timespec delay = {
         .tv_sec = 0,
         .tv_nsec = 10U * 1000U * 1000U,
     };
-    int exited = 1;
-    int status = 0;
     unsigned int attempt;
 
     if (kill_exec_cgroup() != 0) {
         return -1;
     }
     for (attempt = 0; attempt <= 200; ++attempt) {
-        int populated;
+        int remaining = reap_exec_cgroup();
 
-        reap_children(0, &exited, &status);
-        populated = exec_cgroup_populated();
-        if (populated < 0) {
+        if (remaining < 0) {
             return -1;
         }
-        if (populated == 0) {
+        if (remaining == 0) {
             return 0;
         }
         if (attempt == 200) {
@@ -1755,10 +1785,11 @@ static int run_exec(
         return send_app_error(session, request_id, 125, "launch-failed");
     }
     if (config->direct) {
-        int populated = exec_cgroup_populated();
+        /* A workload whose settlement timed out may have exited since. */
+        int remaining = reap_exec_cgroup();
 
-        if (populated != 0) {
-            portb_error("exec-cgroup-verify", populated < 0 ? errno : EBUSY);
+        if (remaining != 0) {
+            portb_error("exec-cgroup-verify", remaining < 0 ? errno : EBUSY);
             return send_app_error(session, request_id, 125, "containment-failed");
         }
     }

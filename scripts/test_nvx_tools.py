@@ -6334,17 +6334,77 @@ class ManagedAgentCgroupTests(unittest.TestCase):
         self.cgroup = root / "cgroup"
         self.cgroup.mkdir()
         (self.cgroup / "cgroup.procs").touch()
+        self.subtree_control = self.cgroup / "cgroup.subtree_control"
+        self.subtree_control.touch()
         self.execution = self.cgroup / "nvx-exec"
         self.execution.mkdir()
-        self.events = self.execution / "cgroup.events"
-        self.events.write_bytes(b"populated 0\nfrozen 0\n")
+        self.tasks = self.execution / "pids.current"
+        self.tasks.write_bytes(b"0\n")
         (self.execution / "cgroup.kill").touch()
         source = root / "cgroup-test.c"
         source.write_text(
-            f"""#define CGROUP_ROOT {json.dumps(str(self.cgroup))}
+            f"""#define _GNU_SOURCE
+#include <sys/types.h>
+#include <sys/wait.h>
+static pid_t harness_waitpid(pid_t pid, int *status, int options);
+#define waitpid(pid, status, options) harness_waitpid(pid, status, options)
+#define CGROUP_ROOT {json.dumps(str(self.cgroup))}
 #define main managed_agent_main
 #include {json.dumps(str(self.SOURCE))}
 #undef main
+#undef waitpid
+
+static pid_t harness_process = -1;
+
+/* Like the pids controller, stops charging a process once it is reaped. */
+static pid_t harness_waitpid(pid_t pid, int *status, int options)
+{{
+    pid_t result = waitpid(pid, status, options);
+
+    if (result > 0 && result == harness_process) {{
+        int fd = open(EXEC_CGROUP "/pids.current", O_WRONLY | O_TRUNC | O_CLOEXEC);
+
+        if (fd < 0 || write(fd, "0\\n", 2) != 2 || close(fd) != 0) {{
+            _exit(3);
+        }}
+        harness_process = -1;
+    }}
+    return result;
+}}
+
+/*
+ * Calls `check` while a workload process that the cgroup charges exits, or
+ * once it has exited if `exited` is set, and requires `check` to reap it.
+ */
+static int with_exiting_process(int (*check)(void), int exited)
+{{
+    siginfo_t information = {{0}};
+    int result;
+    int status;
+    pid_t child = fork();
+
+    if (child < 0) {{
+        _exit(2);
+    }}
+    if (child == 0) {{
+        const struct timespec delay = {{.tv_nsec = 50L * 1000L * 1000L}};
+
+        nanosleep(&delay, NULL);
+        _exit(0);
+    }}
+    harness_process = child;
+    if (exited && waitid(P_PID, (id_t)child, &information, WEXITED | WNOWAIT) != 0) {{
+        _exit(2);
+    }}
+    result = check();
+    status = errno;
+    if (harness_process >= 0 || waitpid(child, NULL, WNOHANG) >= 0 || errno != ECHILD) {{
+        _exit(4);
+    }}
+    errno = status;
+    return result;
+}}
+
 int main(int argc, char **argv)
 {{
     int result;
@@ -6362,10 +6422,16 @@ int main(int argc, char **argv)
                    ? run_exec(&session, &config, 43, 0, command, &exec_config)
                    : result;
     }}
-    if (strcmp(argv[1], "population") == 0) {{
-        result = exec_cgroup_populated();
+    if (strcmp(argv[1], "tasks") == 0) {{
+        result = exec_cgroup_has_tasks();
+    }} else if (strcmp(argv[1], "prepare") == 0) {{
+        result = prepare_exec_cgroup();
     }} else if (strcmp(argv[1], "settle") == 0) {{
         result = settle_exec_cgroup();
+    }} else if (strcmp(argv[1], "settle-reap") == 0) {{
+        result = with_exiting_process(settle_exec_cgroup, 0);
+    }} else if (strcmp(argv[1], "verify-reap") == 0) {{
+        result = with_exiting_process(reap_exec_cgroup, 1);
     }} else {{
         return 2;
     }}
@@ -6426,61 +6492,90 @@ int main(int argc, char **argv)
             frames = frames[outer.size + length :]
         self.assertEqual(frames, b"")
 
-    def test_population_requires_a_valid_unique_field(self):
-        for value in (0, 1):
-            with self.subTest(value=value):
-                self.events.write_text(f"populated {value}\nfrozen 0\n")
-                self.assertEqual(self._check("population")[0], value)
-        for contents in (
-            b"",
-            b"frozen 0\n",
-            b"populated 0",
-            b"populated 2\n",
-            b"populated 01\n",
-            b"populated 0\npopulated 1\n",
-            b"populated 0\n\x00frozen 0\n",
+    def test_task_count_requires_a_canonical_decimal(self):
+        for contents, expected in (
+            (b"0\n", 0),
+            (b"1\n", 1),
+            (b"10\n", 1),
+            (b"4194304\n", 1),
         ):
             with self.subTest(contents=contents):
-                self.events.write_bytes(contents)
-                self.assertEqual(self._check("population"), (-1, errno.EPROTO))
-        self.events.write_bytes(b"populated 0\n" + b"x" * 256)
-        self.assertEqual(self._check("population"), (-1, errno.EOVERFLOW))
+                self.tasks.write_bytes(contents)
+                self.assertEqual(self._check("tasks")[0], expected)
+        for contents in (
+            b"",
+            b"\n",
+            b"0",
+            b"00\n",
+            b"01\n",
+            b"-1\n",
+            b"+1\n",
+            b" 1\n",
+            b"1 \n",
+            b"0\n0\n",
+            b"1\x00\n",
+            b"max\n",
+        ):
+            with self.subTest(contents=contents):
+                self.tasks.write_bytes(contents)
+                self.assertEqual(self._check("tasks"), (-1, errno.EPROTO))
+        self.tasks.write_bytes(b"1" * 40 + b"\n")
+        self.assertEqual(self._check("tasks"), (-1, errno.EOVERFLOW))
 
-    def test_missing_and_unreadable_events_are_errors(self):
-        self.events.unlink()
-        self.assertEqual(self._check("population"), (-1, errno.ENOENT))
+    def test_missing_and_unreadable_task_counts_are_errors(self):
+        self.tasks.unlink()
+        self.assertEqual(self._check("tasks"), (-1, errno.ENOENT))
         self._assert_further_exec_refused()
-        self.events.mkdir()
-        self.assertEqual(self._check("population"), (-1, errno.EISDIR))
+        self.tasks.mkdir()
+        self.assertEqual(self._check("tasks"), (-1, errno.EISDIR))
         self._assert_further_exec_refused()
+
+    def test_preparation_enables_the_pids_controller_once(self):
+        self.assertEqual(self._check("prepare")[0], 0)
+        self.assertEqual(self.subtree_control.read_bytes(), b"")
+        self.tasks.unlink()
+        self.assertEqual(self._check("prepare")[0], 0)
+        self.assertEqual(self.subtree_control.read_bytes(), b"+pids")
+        self.subtree_control.unlink()
+        self.assertEqual(self._check("prepare"), (-1, errno.ENOENT))
 
     def test_settlement_verifies_emptiness(self):
         self.assertEqual(self._check("settle")[0], 0)
         self.assertEqual((self.execution / "cgroup.kill").read_bytes(), b"1")
 
+    def test_settlement_and_verification_reap_what_the_workload_left(self):
+        for mode in ("settle-reap", "verify-reap"):
+            with self.subTest(mode=mode):
+                self.tasks.write_bytes(b"1\n")
+                self.assertEqual(self._check(mode)[0], 0)
+                self.assertEqual(self.tasks.read_bytes(), b"0\n")
+
     def test_settlement_does_not_hide_kill_or_verification_failures(self):
-        self.events.write_bytes(b"populated 1\n")
+        self.tasks.write_bytes(b"1\n")
         (self.execution / "cgroup.kill").unlink()
         self.assertEqual(self._check("settle"), (-1, errno.ENOENT))
         self._assert_further_exec_refused()
         (self.execution / "cgroup.kill").touch()
-        self.events.unlink()
+        self.tasks.unlink()
         self.assertEqual(self._check("settle"), (-1, errno.ENOENT))
         self._assert_further_exec_refused()
 
-    def test_populated_cgroup_at_deadline_is_not_settled(self):
-        self.events.write_bytes(b"populated 1\n")
+    def test_unreaped_tasks_at_deadline_are_not_settled(self):
+        # cgroup.events no longer counts a killed process that awaits its
+        # reaper, but the pids controller still charges it.
+        (self.execution / "cgroup.events").write_bytes(b"populated 0\nfrozen 0\n")
+        self.tasks.write_bytes(b"1\n")
         started = time.monotonic()
         self.assertEqual(self._check("settle"), (-1, errno.ETIMEDOUT))
         self.assertGreaterEqual(time.monotonic() - started, 1.9)
         self._assert_further_exec_refused()
 
-    def test_malformed_events_refuse_further_exec_until_verified_empty(self):
-        self.events.write_bytes(b"frozen 0\n")
+    def test_malformed_task_count_refuses_further_exec_until_verified_empty(self):
+        self.tasks.write_bytes(b"max\n")
         self.assertEqual(self._check("settle"), (-1, errno.EPROTO))
         self._assert_further_exec_refused()
-        self.events.write_bytes(b"populated 0\nfrozen 0\n")
-        self.assertEqual(self._check("population")[0], 0)
+        self.tasks.write_bytes(b"0\n")
+        self.assertEqual(self._check("tasks")[0], 0)
         self.assertEqual(self._check("settle")[0], 0)
 
 
@@ -6720,7 +6815,7 @@ class ManagedAgentWorkingDirectoryTests(unittest.TestCase):
         (cgroup / "cgroup.procs").touch()
         (execution / "cgroup.procs").touch()
         (execution / "cgroup.kill").touch()
-        (execution / "cgroup.events").write_text("populated 0\nfrozen 0\n")
+        (execution / "pids.current").write_text("0\n")
         tools = self.root / "bin"
         tools.mkdir()
         self.harness = self.root / "working-directory-test"
