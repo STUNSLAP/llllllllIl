@@ -382,10 +382,7 @@ fn valid_guest_network(value: &str) -> bool {
         return false;
     };
     address.parse::<std::net::Ipv4Addr>().is_ok()
-        && prefix
-            .parse::<u8>()
-            .is_ok_and(|prefix| (1..=30).contains(&prefix))
-        && !prefix.starts_with('0')
+        && crate::cidr::parse_prefix_length(prefix).is_some_and(|prefix| (1..=30).contains(&prefix))
 }
 
 /// Describes why extra kernel parameters are unacceptable, if they are.
@@ -436,6 +433,11 @@ mod tests {
         let mut config = base.clone();
         config.guest_network = "10.0.0.2/31".to_owned();
         cases.push(config);
+        for non_canonical in ["10.0.0.2/024", "10.0.0.2/+24"] {
+            let mut config = base.clone();
+            config.guest_network = non_canonical.to_owned();
+            cases.push(config);
+        }
         let mut config = base.clone();
         config.kernel_command_line = "quiet nvx_exec=/bin/sh".to_owned();
         cases.push(config);
@@ -491,6 +493,12 @@ mod tests {
         assert!(valid_guest_network("10.0.0.2/24"));
         assert!(!valid_guest_network("10.0.0.2"));
         assert!(!valid_guest_network("10.0.0.256/24"));
+        for prefix in ["", "0", "024", "+24", "-24", " 24"] {
+            assert!(
+                !valid_guest_network(&format!("10.0.0.2/{prefix}")),
+                "{prefix:?}"
+            );
+        }
         assert!(kernel_command_line_problem("quiet loglevel=0").is_none());
         assert!(kernel_command_line_problem("tsc=reliable").is_some());
         assert!(kernel_command_line_problem("hostname=other").is_some());

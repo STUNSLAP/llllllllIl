@@ -98,7 +98,10 @@ envelope (`version`, `phase`, and `containment`) belongs to the caller.
   - `testing::MockBackend` (feature `testing`) implements the state machine in
     memory for consumers' unit tests.
 - `AsyncAciEdgeSandbox` (feature `async`) wraps `AciEdgeSandbox` for Tokio. Lifecycle calls run on
-  the blocking pool, and output arrives as `AsyncRead` streams.
+  the blocking pool, and output arrives as `AsyncRead` streams. A call keeps
+  running when its future is dropped: a dropped `exec` cancels its workload as
+  soon as the workload starts, and the other calls complete, so the sandbox's
+  state shows their effects.
 
 To add a backend, implement `Backend`. Declare only the capabilities it can
 enforce, and report state-machine violations with the codes listed in the
@@ -161,10 +164,12 @@ your executable as `nvx/`. Dependent build scripts receive its path as
 > incompatible image with `backend_unavailable` rather than running without the
 > requested policy guarantees.
 >
-> The release pinned in [`artifacts.json`](artifacts.json) predates these
-> features, so a `bundled` build cannot start sandboxes until the pin names the
-> first release that includes them. Until then, stage a current build with
-> `ACI_EDGE_SANDBOXES_BUNDLE_DIR`, or point `NVX_ARTIFACTS_DIR` at one.
+> The build script stages only a release whose `SOURCE-MANIFEST.json` declares
+> the crate's control contract. After a contract change, `bundled` builds that
+> download the pinned release fail until [`artifacts.json`](artifacts.json)
+> names a release with the new contract, so repin it as soon as one is
+> published. Until then, stage a current build with
+> `ACI_EDGE_SANDBOXES_BUNDLE_DIR`.
 
 Defaults:
 
@@ -383,7 +388,8 @@ behind the profile's NAT gateway `10.0.0.1`, which also serves DNS.
 - `start` on a running sandbox fails with `already_started`, and `stop` on a
   stopped sandbox fails with `already_stopped`.
 - Deprovisioning a running sandbox fails with `already_started`; stop it first.
-  After deprovision, every call fails with `stale_id`.
+  After deprovision, every call fails with `stale_id` without writing any
+  state, as do calls with IDs that were never provisioned.
 - Lifecycle transitions of one sandbox are serialized by a lock file.
 - Executions run one at a time: a concurrent exec waits up to
   `control_timeout` for the running one to finish.

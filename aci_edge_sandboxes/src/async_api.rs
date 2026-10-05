@@ -26,6 +26,21 @@ use crate::stream::{self, QueueReader, QueueWriter};
 ///
 /// Lifecycle calls run on Tokio's blocking thread pool, so they must be awaited inside a Tokio
 /// runtime. Output streams are delivered in-process without extra operating-system pipes.
+///
+/// # Cancellation
+///
+/// Tokio cannot interrupt work on its blocking pool, so every call keeps running after its future
+/// is dropped. When the future of [`exec`](Self::exec) is dropped before it resolves, the workload
+/// that the call starts is cancelled at once, as [`Canceller::cancel`] would cancel it, because
+/// nothing else can reach it: it could run indefinitely and, with the OpenVMM backend, keep later
+/// executions waiting for the sandbox. The other calls run to completion, and the sandbox's state
+/// reflects their effects: a dropped `start` or `stop` may still start or stop the sandbox, a
+/// dropped `deprovision` may still release it, and a dropped `provision` may still allocate a
+/// sandbox whose ID the caller never receives.
+///
+/// Dropping an [`AsyncExecution`] does not cancel its workload. To bound a running execution,
+/// take a [`Canceller`] from [`AsyncExecution::canceller`] before awaiting
+/// [`AsyncExecution::wait`].
 #[derive(Clone, Debug)]
 pub struct AsyncAciEdgeSandbox {
     nvx: AciEdgeSandbox,
@@ -66,6 +81,9 @@ impl AsyncAciEdgeSandbox {
     }
 
     /// Starts a workload in a running sandbox and returns its live streams.
+    ///
+    /// Dropping the returned future before it resolves cancels the workload; see
+    /// [Cancellation](Self#cancellation).
     pub async fn exec(
         &self,
         sandbox_id: SandboxId,
@@ -91,12 +109,16 @@ impl AsyncAciEdgeSandbox {
             stdin: backend_stdin,
         };
         let nvx = self.nvx.clone();
-        let control = blocking(move || nvx.exec_with_io(&sandbox_id, &request, io)).await?;
+        let control = blocking(move || {
+            nvx.exec_with_io(&sandbox_id, &request, io)
+                .map(CancelOnDrop::new)
+        })
+        .await?;
         Ok(AsyncExecution {
             stdout: Some(OutputStream { reader: stdout }),
             stderr: Some(OutputStream { reader: stderr }),
             stdin,
-            control: Arc::from(control),
+            control: Arc::from(control.defuse()),
         })
     }
 
@@ -127,6 +149,32 @@ where
     tokio::task::spawn_blocking(operation)
         .await
         .map_err(|error| Error::backend_error("sandbox blocking task failed").with_source(error))?
+}
+
+/// Cancels an execution when dropped, unless [`CancelOnDrop::defuse`] hands it over first.
+///
+/// The blocking task of [`AsyncAciEdgeSandbox::exec`] keeps running after its caller drops the
+/// future, and Tokio then drops the task's output, so the workload that the task started is
+/// cancelled instead of running out of anyone's reach.
+struct CancelOnDrop(Option<Box<dyn ExecControl>>);
+
+impl CancelOnDrop {
+    fn new(control: Box<dyn ExecControl>) -> Self {
+        Self(Some(control))
+    }
+
+    fn defuse(mut self) -> Box<dyn ExecControl> {
+        self.0.take().expect("only defuse takes the execution")
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(control) = self.0.take() {
+            // Nobody is left to report a failure to.
+            let _ = control.cancel();
+        }
+    }
 }
 
 /// A live execution returned by [`AsyncAciEdgeSandbox::exec`].

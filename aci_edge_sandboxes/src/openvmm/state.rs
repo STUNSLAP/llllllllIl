@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use super::filesystem::HostMapping;
 use super::platform;
 use super::protocol::CAPABILITY_LEN;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::id::SandboxId;
 use crate::model::NetworkPolicy;
 
@@ -110,6 +110,10 @@ fn io_error(context: String) -> impl FnOnce(io::Error) -> Error {
     move |error| Error::backend_error(context).with_source(error)
 }
 
+fn not_provisioned(sandbox_id: &SandboxId) -> Error {
+    Error::stale_id(format!("sandbox {sandbox_id} is not provisioned"))
+}
+
 impl StateStore {
     /// Opens `root`, creating it and restricting it to the current user if needed.
     pub(crate) fn open(root: &Path) -> io::Result<Self> {
@@ -145,9 +149,29 @@ impl StateStore {
             .join(format!("{}.lock", sandbox_id.token()))
     }
 
-    /// Takes the exclusive lifecycle lock of a sandbox.
-    pub(crate) fn lock(&self, sandbox_id: &SandboxId) -> Result<LockGuard> {
-        lock(&self.lock_path(sandbox_id))
+    /// Takes the exclusive lifecycle lock of a sandbox and loads its configuration.
+    ///
+    /// An ID without state fails with [`ErrorCode::StaleId`] and leaves no lock file behind, also
+    /// when its state disappears while this call waits for the lock, as it does when a
+    /// concurrent deprovision removes it. A stale ID never becomes valid again, so no other call
+    /// can still need the removed lock file.
+    pub(crate) fn lock_and_load(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<(LockGuard, SandboxRecord)> {
+        if matches!(self.dir(sandbox_id).try_exists(), Ok(false)) {
+            return Err(not_provisioned(sandbox_id));
+        }
+        let guard = lock(&self.lock_path(sandbox_id))?;
+        match self.load(sandbox_id) {
+            Ok(record) => Ok((guard, record)),
+            Err(error) if error.code() == ErrorCode::StaleId => {
+                drop(guard);
+                self.remove_lock(sandbox_id);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Removes the lock file of a deprovisioned sandbox.
@@ -179,11 +203,7 @@ impl StateStore {
         let path = self.dir(sandbox_id).join(RECORD_NAME);
         let record: SandboxRecord = match read_json(&path)? {
             Some(record) => record,
-            None => {
-                return Err(Error::stale_id(format!(
-                    "sandbox {sandbox_id} is not provisioned"
-                )));
-            }
+            None => return Err(not_provisioned(sandbox_id)),
         };
         if record.format != STATE_FORMAT || record.backend != BACKEND_KEY {
             return Err(Error::backend_error(format!(
@@ -399,6 +419,10 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
     use crate::ErrorCode;
 
@@ -507,11 +531,59 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = StateStore::open(root.path()).unwrap();
         let id = SandboxId::generate().unwrap();
-        let guard = store.lock(&id).unwrap();
+        store.create(&id, &record()).unwrap();
+        let (guard, loaded) = store.lock_and_load(&id).unwrap();
+        assert_eq!(loaded, record());
         let path = store.lock_path(&id);
         let contender = OpenOptions::new().write(true).open(&path).unwrap();
         assert!(contender.try_lock().is_err());
         drop(guard);
         contender.try_lock().unwrap();
+    }
+
+    fn lock_files(root: &Path) -> usize {
+        fs::read_dir(root.join(LOCKS_NAME)).unwrap().count()
+    }
+
+    #[test]
+    fn stale_ids_leave_no_lock_files() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open(root.path()).unwrap();
+        let never_provisioned = SandboxId::generate().unwrap();
+        // An interrupted removal can leave an empty directory, which is stale too.
+        let emptied = SandboxId::generate().unwrap();
+        fs::create_dir(store.dir(&emptied)).unwrap();
+        for id in [&never_provisioned, &emptied] {
+            let error = store.lock_and_load(id).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::StaleId, "{error}");
+        }
+        assert_eq!(lock_files(root.path()), 0);
+
+        let id = SandboxId::generate().unwrap();
+        store.create(&id, &record()).unwrap();
+        drop(store.lock_and_load(&id).unwrap());
+        assert_eq!(lock_files(root.path()), 1);
+    }
+
+    #[test]
+    fn state_removed_while_waiting_for_the_lock_leaves_no_lock_file() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(StateStore::open(root.path()).unwrap());
+        let id = SandboxId::generate().unwrap();
+        store.create(&id, &record()).unwrap();
+        let (guard, _) = store.lock_and_load(&id).unwrap();
+        let waiter = thread::spawn({
+            let (store, id) = (Arc::clone(&store), id.clone());
+            move || store.lock_and_load(&id).map(drop)
+        });
+        // Let the waiter block on the lock, then deprovision as the backend does. A waiter that
+        // starts late finds no state and must leave no lock file either.
+        thread::sleep(Duration::from_millis(100));
+        store.remove(&id).unwrap();
+        drop(guard);
+        store.remove_lock(&id);
+        let error = waiter.join().unwrap().unwrap_err();
+        assert_eq!(error.code(), ErrorCode::StaleId, "{error}");
+        assert_eq!(lock_files(root.path()), 0);
     }
 }

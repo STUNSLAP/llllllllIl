@@ -545,8 +545,7 @@ impl Backend for OpenVmmBackend {
     }
 
     fn start(&self, sandbox_id: &SandboxId) -> Result<StartResult> {
-        let _guard = self.store.lock(sandbox_id)?;
-        let record = self.store.load(sandbox_id)?;
+        let (_guard, record) = self.store.lock_and_load(sandbox_id)?;
         if let RunState::Running(_) = self.reconcile(sandbox_id)? {
             return Err(Error::already_started(format!(
                 "sandbox {sandbox_id} is already running"
@@ -674,8 +673,7 @@ impl Backend for OpenVmmBackend {
     ) -> Result<Box<dyn ExecControl>> {
         let workload = prepare_exec(&request.process)?;
         let (runtime, capability) = {
-            let _guard = self.store.lock(sandbox_id)?;
-            self.store.load(sandbox_id)?;
+            let (_guard, _) = self.store.lock_and_load(sandbox_id)?;
             match self.reconcile(sandbox_id)? {
                 RunState::Provisioned => {
                     return Err(Error::not_started(format!(
@@ -725,8 +723,7 @@ impl Backend for OpenVmmBackend {
     }
 
     fn stop(&self, sandbox_id: &SandboxId) -> Result<StopResult> {
-        let _guard = self.store.lock(sandbox_id)?;
-        self.store.load(sandbox_id)?;
+        let (_guard, _) = self.store.lock_and_load(sandbox_id)?;
         let RunState::Running(runtime) = self.reconcile(sandbox_id)? else {
             return Err(Error::already_stopped(format!(
                 "sandbox {sandbox_id} is not running"
@@ -774,8 +771,7 @@ impl Backend for OpenVmmBackend {
     }
 
     fn deprovision(&self, sandbox_id: &SandboxId) -> Result<DeprovisionResult> {
-        let guard = self.store.lock(sandbox_id)?;
-        self.store.load(sandbox_id)?;
+        let (guard, _) = self.store.lock_and_load(sandbox_id)?;
         if let RunState::Running(_) = self.reconcile(sandbox_id)? {
             return Err(Error::already_started(format!(
                 "sandbox {sandbox_id} is running; stop it before deprovisioning"
