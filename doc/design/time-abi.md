@@ -361,7 +361,7 @@ document in pretty form.
 | `id` | `<vendor>.<generation>.v<revision>`, each component `[a-z0-9-]+`, for example `intel.icelake-sp.v1` |
 | `description` | Free text |
 | `vendor` | The 12-byte CPUID vendor string |
-| `generation` | The generation `name` (`skylake-sp`, `icelake-sp`, or `emeraldrapids`) and its `cpus`: `(family, model, stepping range)` display signatures; stepping ranges separate model 85's Skylake-SP (0 to 4), Cascade Lake, and Cooper Lake |
+| `generation` | The generation `name` (`skylake-sp`, `icelake-sp`, `emeraldrapids`, or `alderlake`; `host` for a host profile, see **Host profiles**) and its `cpus`: `(family, model, stepping range)` display signatures; stepping ranges separate model 85's Skylake-SP (0 to 4), Cascade Lake, and Cooper Lake |
 | `cpuid` | A dense table of every leaf and subleaf in `[0, max basic]` and `[0x80000000, max extended]` with a value and a mask per register; mask bit 1 pins the value, mask bit 0 marks a VMM-owned or runtime-owned bit |
 | `xcr0`, `xss`, `xsave_components` | The XSAVE features the guest may enable, and the size, offset, and flags of every enabled component |
 | `physical_address_width` | The guest physical address width |
@@ -471,9 +471,11 @@ Informational fields:
 
 - The brand string (`0x80000002..=0x80000004`) is generic per generation:
   `Intel(R) Xeon(R) Processor (<name>)` with the generation's display name
-  (`Skylake-SP`, `Ice Lake-SP`, or `Emerald Rapids`), zero-padded, without a
+  (`Skylake-SP`, `Ice Lake-SP`, or `Emerald Rapids`), or
+  `Intel(R) Core(TM) Processor (Alder Lake)`, zero-padded, without a
   frequency. Every host of a generation presents it whatever its SKU, and
-  derivation needs no common brand across the source hosts.
+  derivation needs no common brand across the source hosts. Host profiles
+  present `Intel(R) Processor (host profile)`.
 - The cache leaves (`0x2` and `0x4`, except their VMM-owned counts) come from
   the reference hosts; other SKUs of the generation differ, and verification
   does not compare them. Address widths are checked as limits.
@@ -495,14 +497,36 @@ mitigation enabled, and the kernel must not leave its thunk pages writable
 and executable (boot check `K1`).
 
 **Selection.** A microVM always has a profile. A cold boot uses
-`--cpu-profile <id>`, or `auto` (the default), which selects the highest
-revision of the single profile whose generation covers the host's vendor,
-family, model, and stepping as the VMM's host OS sees them (the L1 view on
-Azure). No match, or matches in more than one generation, is
+`--cpu-profile <id>`, `auto` (the default), or `host`. `auto` selects the
+highest revision of the single pinned profile whose generation covers the
+host's vendor, family, model, and stepping as the VMM's host OS sees them (the
+L1 view on Azure). No match, or matches in more than one generation, is
 `E_PROFILE_HOST_UNKNOWN`, naming the host's signature and the available IDs;
-host CPUID passthrough does not exist. A restore always uses the profile
-recorded in the snapshot; an explicit `--cpu-profile` must name the same
-profile (`E_PROFILE_UNKNOWN`).
+`auto` never falls back to a host profile, and host CPUID passthrough does not
+exist. A restore always uses the profile recorded in the snapshot; an explicit
+`--cpu-profile` must name the same profile, or be `host` for a host profile
+(`E_PROFILE_UNKNOWN`).
+
+**Host profiles.** `--cpu-profile host` is an
+opt-in for development hosts that no pinned profile serves. Before it creates
+the partition, the VM worker fingerprints the backend on this host, as
+`--cpu-fingerprint` does, and derives `<vendor>.host.v1` from that one
+fingerprint under the pinned profiles' derivation policy
+(`cpu_profile::derive_host_profile`). The guest therefore sees a
+policy-filtered surface, not the host's CPUID: only the policy's data leaves
+keep data, the policy's features are cleared, XCR0 stays within the allowed
+components, the brand string is generic, and the generation, named `host`,
+covers only the host's family, model, and stepping. Every verification step
+below applies to it unchanged. The VM worker hands it to the backend with the
+partition's configuration (`cpu_profile::PartitionProfile`), so each VM of a
+process holds its own host profile. A host profile is neither reviewed nor
+immutable: a microcode, firmware, or hypervisor update can change it. Its
+fingerprint costs a probe partition, 2.6 to 5.5 ms on WHP, and the host
+identity at every cold boot. Only Intel CPUs have host profiles; another
+vendor fails with `E_PROFILE_HOST_UNKNOWN`, and a backend that lacks a CPU
+feature that the time ABI requires fails with `E_PROFILE_UNSUPPORTED`. Host
+qualification never accepts a host profile, so CI and benchmark hosts need a
+pinned one.
 
 **Verification.** At partition creation, for cold boot and restore, OpenVMM
 reports every violation at once, naming the leaf, subleaf, register, and bit:
@@ -527,7 +551,12 @@ reports every violation at once, naming the leaf, subleaf, register, and bit:
    (`E_PROFILE_UNKNOWN`, `E_PROFILE_DIGEST`), and the recomputed effective
    CPUID equals the recorded one (`E_CPU_SURFACE`). Both are comparisons
    with precomputed or recomputed values; nothing is hashed or decoded. The
-   effective-CPUID record replaces the exact-equality CPU contract.
+   effective-CPUID record replaces the exact-equality CPU contract. A host
+   profile has no pinned copy: the snapshot's recorded document is the
+   profile, which the restore preflight and the VM worker decode and accept
+   only as the canonical encoding of a valid host profile of the recorded ID
+   whose SHA-256 is the recorded digest (`E_PROFILE_DIGEST`). Step 2 then
+   requires the capture host's family, model, and stepping.
 5. The backend presents the effective CPUID: VP 0's CPUID for every governed
    leaf equals it under its masks (`E_CPU_SURFACE`).
 6. On MSHV and WHP, which pass reserved entries through, the hypervisor
@@ -551,14 +580,23 @@ reports every violation at once, naming the leaf, subleaf, register, and bit:
    - KVM answers reserved entries from the effective CPUID itself, so it
      needs no check.
 
-The catalog has three profiles, derived from the fingerprints of three
-bare-metal hosts (one per backend) and fifteen Azure hosts:
+The catalog has four profiles, derived from the fingerprints of three
+bare-metal hosts (one per backend), fifteen Azure hosts, and one laptop:
 
 | ID | Generation | Hosts | Source backends |
 | --- | --- | --- | --- |
 | `intel.skylake-sp.v1` | 6/85, steppings 0 to 4 | The bare-metal hosts | KVM, MSHV, WHP |
 | `intel.icelake-sp.v1` | 6/106 | Xeon Platinum 8370C runners | KVM, MSHV, WHP |
 | `intel.emeraldrapids.v1` | 6/207 | Xeon Platinum 8573C runners | MSHV, WHP (no KVM host exists) |
+| `intel.alderlake.v1` | 6/151 and 6/154 | One Core i9-12900H laptop (6/154, stepping 3) | WHP |
+
+The Alder Lake profile serves development hosts, not CI. Derived from one
+WHP fingerprint, it pins XCR0 `0x7`, because WHP offers that host only x87,
+SSE, and AVX state, and leaves Alder Lake hosts on KVM, other SKUs, and
+Alder Lake-S unverified; any of them that lacks one of its features fails
+with `E_PROFILE_UNSUPPORTED` until a later revision intersects their
+fingerprints. The policy needs nothing for the hybrid cores: it clears the
+hybrid flag, `CPUID.(7,0):EDX[15]`, and keeps no data in leaf `0x1A`.
 
 Sharing costs nothing on Ice Lake-SP and Emerald Rapids, where every backend
 offers the same features. On Skylake-SP, used only by the bare-metal
@@ -1575,9 +1613,9 @@ code.
 | `E_SNAPSHOT_VERSION` | Manifest version is not 6; the snapshot must be recaptured | Restore |
 | `E_MANIFEST_TIME` | Time contract missing or malformed, `time_abi_version` not 1, or tolerance not 250 | Restore |
 | `E_BACKEND_MISMATCH` | Snapshot taken on another backend | Restore |
-| `E_PROFILE_UNKNOWN` | Profile ID not pinned in this OpenVMM, or a restore's explicit `--cpu-profile` names another profile than the snapshot's | Cold boot, restore |
-| `E_PROFILE_DIGEST` | The recorded profile digest or embedded document is not the pinned profile's of the same ID | Restore |
-| `E_PROFILE_HOST_UNKNOWN` | `--cpu-profile auto` maps the host to no profile, or to profiles of more than one generation | Cold boot |
+| `E_PROFILE_UNKNOWN` | Profile ID neither pinned in this OpenVMM nor a host profile, or a restore's explicit `--cpu-profile` names another profile than the snapshot's | Cold boot, restore |
+| `E_PROFILE_DIGEST` | The recorded profile digest or embedded document is not the pinned profile's of the same ID, or a host profile's embedded document is not a canonical host profile of the recorded ID and digest | Restore |
+| `E_PROFILE_HOST_UNKNOWN` | `--cpu-profile auto` maps the host to no profile, or to profiles of more than one generation, or `--cpu-profile host` runs on a CPU of another vendor than Intel | Cold boot |
 | `E_PROFILE_TIME_BITS` | The profile is invalid or violates the CPU time bits | Cold boot, restore |
 | `E_CPU_GENERATION` | Host CPU vendor, family, model, or stepping not in the profile | Cold boot, restore |
 | `E_PROFILE_UNSUPPORTED` | Backend lacks a feature, limit, XSAVE layout, MSR value, or feature-bank bit of the profile, or the host is not qualified | Cold boot, restore |
@@ -1773,7 +1811,8 @@ most 2.1 ns.
 ### Generations and runner placement
 
 Generation names used in logs, reports, and job summaries are `skylake-sp`
-(family 6, model 85), `icelake-sp` (6/106), and `emeraldrapids` (6/207).
+(family 6, model 85), `icelake-sp` (6/106), `emeraldrapids` (6/207), and
+`alderlake` (6/151 and 6/154), which no CI runner has.
 `validate-runner` and `nvx.py doctor` detect the generation at run time and
 report it, together with the selected profile, `F_d`, `L`, the `H4` rate
 metrics, and the skew metrics, in their log and the job summary; an unknown
@@ -2191,7 +2230,9 @@ Migration impact:
 - The guest identifies as Hyper-V on every backend, including KVM.
 - CPUID becomes profile-defined, so guests can lose host features that no
   profile of their generation pins.
-- Hosts that fail qualification cannot run microVMs until replaced.
+- Hosts that fail qualification cannot run microVMs on a pinned profile until
+  replaced; an Intel development host can boot on a host profile
+  (`--cpu-profile host`) instead.
   One 8370C MSHV runner stays out of rotation and unqualified because our
   account cannot run guests there.
 - Per-PR CI captures and restores on the same runner. Same-generation
@@ -2216,8 +2257,8 @@ The OpenVMM Guide documents the user-facing contract in
 - **Restoring a snapshot:** restore packet v4, the time sample at `0xeb`, the
   generation ID, and the synchronized TSC set with its read-back.
 - **Time and CPU compatibility:** the identity, the CPU profile and
-  `--cpu-profile`, the 250 ppm rate rule, the exact LAPIC rule, the downtime
-  sources and bounds, and the error codes.
+  `--cpu-profile`, including host profiles, the 250 ppm rate rule, the exact
+  LAPIC rule, the downtime sources and bounds, and the error codes.
 - **Limitations:** the same backend, CPU generation, and profile, and the
   recapture of older snapshots.
 
