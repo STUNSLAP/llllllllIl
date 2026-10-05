@@ -1,18 +1,18 @@
 {
     "repository": "microsoft/nvx",
-    "tag": "v0.1.0-dev.89c192e79f0d",
+    "tag": "v0.1.0-dev.9ceb89fcc31f",
     "assets": {
         "linux-kvm": {
             "name": "nvx-0.1.0-linux-kvm.tar.gz",
-            "sha256": "3f6ed8a69b82431ff65d80c3de0242f139b5a9487c42f8a8344e5b6981189b4c"
+            "sha256": "7d38ad9e3bb92357b7fb88bbdaa050d4a957f13eaf6e5bed14165e3e8830b93d"
         },
         "linux-mshv": {
             "name": "nvx-0.1.0-linux-mshv.tar.gz",
-            "sha256": "023b4901d76c2dce591e15fb870bcd841717bb6cff20a84dc3267d8d821aaf50"
+            "sha256": "5f71c6fd077ef81a6652451dec61ff5cfeaf885df0e3975c2f1d5c783e39eed7"
         },
         "windows-whp": {
             "name": "nvx-0.1.0-windows-whp.zip",
-            "sha256": "3098a47b54737f01d622715942c226b44c140c84a3d6f2898b36c5924146ee32"
+            "sha256": "fb8fcb3e514ee99261a0f4d1ec7ca2cbc64d107957193cc6c78e88d60c6834ee"
         }
     }
 }

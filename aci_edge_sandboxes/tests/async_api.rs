@@ -1,12 +1,14 @@
 //! Exercises the Tokio wrappers through the in-memory `MockBackend`.
 #![cfg(all(feature = "async", feature = "testing"))]
 
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
 use aci_edge_sandboxes::testing::{MockBackend, MockExec};
 use aci_edge_sandboxes::{
-    AciEdgeSandbox, AsyncAciEdgeSandbox, ErrorCode, ExecOutcome, ExecRequest, ProvisionRequest,
-    StdinMode,
+    AciEdgeSandbox, AsyncAciEdgeSandbox, Backend, Capabilities, DeprovisionResult, ErrorCode,
+    ExecControl, ExecIo, ExecOutcome, ExecRequest, ProvisionRequest, ProvisionResult, Result,
+    SandboxId, StartResult, StdinMode, StopResult,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -103,6 +105,118 @@ fn async_stdin_and_cancellation() {
             .unwrap();
         execution.canceller().cancel().unwrap();
         assert_eq!(execution.wait().await.unwrap(), ExecOutcome::Cancelled);
+    });
+}
+
+/// Delegates to a [`MockBackend`], but holds each exec until the test releases it, as a sandbox
+/// whose only execution slot is busy does, and reports every cancellation request.
+#[derive(Debug)]
+struct HeldBackend {
+    inner: MockBackend,
+    released: Mutex<mpsc::Receiver<()>>,
+    cancelled: mpsc::Sender<()>,
+}
+
+impl Backend for HeldBackend {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn probe(&self) -> Result<()> {
+        self.inner.probe()
+    }
+
+    fn provision(&self, request: &ProvisionRequest) -> Result<ProvisionResult> {
+        self.inner.provision(request)
+    }
+
+    fn start(&self, sandbox_id: &SandboxId) -> Result<StartResult> {
+        self.inner.start(sandbox_id)
+    }
+
+    fn exec(
+        &self,
+        sandbox_id: &SandboxId,
+        request: &ExecRequest,
+        io: ExecIo,
+    ) -> Result<Box<dyn ExecControl>> {
+        self.released.lock().unwrap().recv().unwrap();
+        let control = self.inner.exec(sandbox_id, request, io)?;
+        Ok(Box::new(ReportedCancellation {
+            control,
+            cancelled: self.cancelled.clone(),
+        }))
+    }
+
+    fn stop(&self, sandbox_id: &SandboxId) -> Result<StopResult> {
+        self.inner.stop(sandbox_id)
+    }
+
+    fn deprovision(&self, sandbox_id: &SandboxId) -> Result<DeprovisionResult> {
+        self.inner.deprovision(sandbox_id)
+    }
+}
+
+struct ReportedCancellation {
+    control: Box<dyn ExecControl>,
+    cancelled: mpsc::Sender<()>,
+}
+
+impl ExecControl for ReportedCancellation {
+    fn wait(&self) -> Result<ExecOutcome> {
+        self.control.wait()
+    }
+
+    fn cancel(&self) -> Result<()> {
+        let _ = self.cancelled.send(());
+        self.control.cancel()
+    }
+}
+
+#[test]
+fn dropping_an_exec_future_cancels_its_workload() {
+    runtime().block_on(async {
+        let (release, released) = mpsc::channel();
+        let (cancelled, cancellations) = mpsc::channel();
+        let client = AsyncAciEdgeSandbox::new(AciEdgeSandbox::new(HeldBackend {
+            inner: MockBackend::new().with_exec_handler(|_| MockExec {
+                duration: Duration::from_secs(60),
+                ..MockExec::default()
+            }),
+            released: Mutex::new(released),
+            cancelled,
+        }));
+        let sandbox_id = client.provision(request()).await.unwrap().sandbox_id;
+        client.start(sandbox_id.clone()).await.unwrap();
+
+        // The caller gives up while the backend still waits to start the workload.
+        let abandoned = client.exec(sandbox_id.clone(), ExecRequest::command_line("sleep"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), abandoned)
+                .await
+                .is_err()
+        );
+        // The workload starts anyway, and since nothing can reach it, it is cancelled at once.
+        release.send(()).unwrap();
+        cancellations
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the abandoned workload must be cancelled");
+
+        // A caller that receives its execution keeps control of the workload.
+        release.send(()).unwrap();
+        let execution = client
+            .exec(sandbox_id.clone(), ExecRequest::command_line("sleep"))
+            .await
+            .unwrap();
+        assert!(cancellations.try_recv().is_err());
+        execution.canceller().cancel().unwrap();
+        cancellations.try_recv().unwrap();
+        assert_eq!(execution.wait().await.unwrap(), ExecOutcome::Cancelled);
+        assert!(cancellations.try_recv().is_err());
     });
 }
 

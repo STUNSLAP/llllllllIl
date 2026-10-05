@@ -367,11 +367,19 @@ mod tests {
         };
         for rule in [
             NetworkRule::to("10.0.0.1/8"),
+            NetworkRule::to("10.0.0.0/+8"),
             NetworkRule::to("example.com"),
             NetworkRule {
                 to: vec![NetworkPeer {
                     cidr: "10.0.0.0/8".to_owned(),
                     except: vec!["11.0.0.0/16".to_owned()],
+                }],
+                ports: Vec::new(),
+            },
+            NetworkRule {
+                to: vec![NetworkPeer {
+                    cidr: "10.0.0.0/8".to_owned(),
+                    except: vec!["10.1.0.0/+16".to_owned()],
                 }],
                 ports: Vec::new(),
             },

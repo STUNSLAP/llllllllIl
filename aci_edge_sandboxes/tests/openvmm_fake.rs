@@ -159,6 +159,12 @@ impl Fixture {
             })
             .count()
     }
+
+    fn lock_files(&self) -> usize {
+        fs::read_dir(self.state_root.join(".locks"))
+            .unwrap()
+            .count()
+    }
 }
 
 fn run(nvx: &AciEdgeSandbox, sandbox_id: &SandboxId, script: &str) -> ExecOutput {
@@ -607,6 +613,33 @@ fn state_machine_violations_use_contract_codes() {
         nvx.deprovision(&sandbox_id).unwrap_err().code(),
         ErrorCode::StaleId
     );
+}
+
+#[test]
+fn calls_with_stale_ids_leave_no_lock_files() {
+    let fixture = Fixture::new();
+    let nvx = fixture.nvx();
+    let deprovisioned = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
+    nvx.start(&deprovisioned).unwrap();
+    nvx.stop(&deprovisioned).unwrap();
+    assert_eq!(fixture.lock_files(), 1);
+    nvx.deprovision(&deprovisioned).unwrap();
+    assert_eq!(fixture.lock_files(), 0);
+
+    let never_provisioned = SandboxId::generate().unwrap();
+    for sandbox_id in [&deprovisioned, &never_provisioned] {
+        for error in [
+            nvx.start(sandbox_id).unwrap_err(),
+            nvx.exec(sandbox_id, &ExecRequest::command_line("echo"))
+                .unwrap_err(),
+            nvx.stop(sandbox_id).unwrap_err(),
+            nvx.deprovision(sandbox_id).unwrap_err(),
+        ] {
+            assert_eq!(error.code(), ErrorCode::StaleId, "{error}");
+        }
+    }
+    assert_eq!(fixture.lock_files(), 0);
+    assert_eq!(fixture.sandbox_dirs(), 0);
 }
 
 #[test]
@@ -1397,5 +1430,60 @@ fn concurrent_execs_are_serialized() {
     assert_eq!(slow.wait_with_output().unwrap().stdout, b"first\n");
     assert_eq!(fast.wait_with_output().unwrap().stdout, b"second\n");
     nvx.stop(&sandbox_id).unwrap();
+    nvx.deprovision(&sandbox_id).unwrap();
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn dropped_async_execs_do_not_hold_the_sandbox() {
+    let fixture = Fixture::new();
+    let nvx = fixture.nvx_with(|config| {
+        config.control_timeout = Duration::from_secs(5);
+        config.stop_timeout = Duration::from_secs(5);
+    });
+    let client = aci_edge_sandboxes::AsyncAciEdgeSandbox::new(nvx.clone());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sandbox_id = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
+    nvx.start(&sandbox_id).unwrap();
+
+    // The first execution holds the guest's only control slot, so the next one has to wait.
+    let first = nvx
+        .exec(
+            &sandbox_id,
+            &ExecRequest::command_line("sleep 1500; echo first"),
+        )
+        .unwrap();
+    let abandoned = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            client.exec(
+                sandbox_id.clone(),
+                ExecRequest::command_line("write abandoned started; sleep 60000"),
+            ),
+        )
+        .await
+    });
+    assert!(
+        abandoned.is_err(),
+        "the exec must wait for the control slot"
+    );
+    assert_eq!(first.wait_with_output().unwrap().stdout, b"first\n");
+
+    // The abandoned workload starts once the slot is free. It must be cancelled at once, or it
+    // would keep every later execution waiting for the slot until control_timeout fails it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while run(&nvx, &sandbox_id, "read abandoned").stdout != b"started" {
+        assert!(
+            Instant::now() < deadline,
+            "the abandoned workload never started"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(run(&nvx, &sandbox_id, "echo later").stdout, b"later\n");
+    let stopped = nvx.stop(&sandbox_id).unwrap().metadata.unwrap();
+    assert_eq!(stopped["forced"], false);
     nvx.deprovision(&sandbox_id).unwrap();
 }

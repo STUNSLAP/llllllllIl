@@ -26,10 +26,8 @@ impl Cidr {
         };
         let prefix = match prefix {
             None => width,
-            Some(prefix) => prefix
-                .parse::<u8>()
-                .ok()
-                .filter(|prefix| *prefix <= width && !prefix_has_leading_zero(value))
+            Some(prefix) => parse_prefix_length(prefix)
+                .filter(|prefix| *prefix <= width)
                 .ok_or_else(|| format!("{value:?} has an invalid prefix length"))?,
         };
         let cidr = Self { address, prefix };
@@ -75,10 +73,15 @@ impl Cidr {
     }
 }
 
-fn prefix_has_leading_zero(value: &str) -> bool {
-    value
-        .split_once('/')
-        .is_some_and(|(_, prefix)| prefix.len() > 1 && prefix.starts_with('0'))
+/// Parses a prefix length in canonical form: decimal digits without a sign or leading zeros.
+pub(crate) fn parse_prefix_length(text: &str) -> Option<u8> {
+    let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    // `u8::from_str` alone would also accept a leading `+`.
+    if digits && (text.len() == 1 || !text.starts_with('0')) {
+        text.parse().ok()
+    } else {
+        None
+    }
 }
 
 fn mask32(address: u32, prefix: u8) -> u32 {
@@ -196,6 +199,11 @@ mod tests {
             "10.0.0.1/8",
             "10.0.0.0/33",
             "10.0.0.0/08",
+            "0.0.0.0/00",
+            "10.0.0.0/+8",
+            "192.0.2.1/+32",
+            "0.0.0.0/+0",
+            "2001:db8::/+32",
             "example.com",
             "10.0.0.0/",
             "2001:db8::1/32",
