@@ -182,6 +182,9 @@ class AlpineBuildConstants:
     APORTS_CACHE_DIRECTORY_NAME: Final = "aports"
     PACKAGE_INDEX_URL: Final = "https://pkgs.alpinelinux.org/packages"
     REPOSITORIES: Final = ("main", "community", "testing")
+    SOURCE_OUTPUT_ENTRIES: Final = frozenset(
+        ("manifest.json", "recipes", "upstream", "SHA256SUMS")
+    )
 
 
 class UbuntuBuildConstants:

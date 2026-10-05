@@ -8,7 +8,9 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import sys
 import tarfile
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -314,6 +316,14 @@ def _extract_recipe(
 def _fetch_upstream_sources(output: Path, alpine_version: str) -> None:
     script = r"""
 set -eu
+owner=$(stat -c '%u:%g' /bundle)
+restore_owner() {
+    if [ -e /bundle/upstream ]; then
+        chown -R "$owner" /bundle/upstream ||
+            echo "warning: cannot restore ownership of /bundle/upstream" >&2
+    fi
+}
+trap restore_owner EXIT
 apk add --no-cache alpine-sdk
 mkdir -p /bundle/upstream
 find /bundle/recipes -name APKBUILD -type f | while IFS= read -r apkbuild; do
@@ -355,6 +365,60 @@ done
     )
 
 
+def _is_link(path: Path) -> bool:
+    # Path.is_symlink() misses Windows junctions, which redirect a path the same way.
+    try:
+        metadata = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    if sys.platform == "win32":
+        return metadata.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    return False
+
+
+def _resolve_source_output(output: Path) -> Path:
+    # Check the path as given, so a link there is refused instead of followed.
+    if _is_link(output) or (output.exists() and not output.is_dir()):
+        raise SourceError(f"Alpine source output is not a directory: {output}")
+    if output.exists():
+        unexpected = sorted(
+            path.name
+            for path in output.iterdir()
+            if path.name not in AlpineBuildConstants.SOURCE_OUTPUT_ENTRIES
+        )
+        if unexpected:
+            raise SourceError(
+                "Alpine source output contains unexpected entries: "
+                + ", ".join(unexpected)
+            )
+    return output.resolve()
+
+
+def _reset_source_output(output: Path) -> None:
+    for generated in (output / "recipes", output / "upstream"):
+        if _is_link(generated) or (generated.exists() and not generated.is_dir()):
+            raise SourceError(
+                f"Alpine source generated path is not a directory: {generated}"
+            )
+        if generated.exists():
+            try:
+                shutil.rmtree(generated)
+            except OSError as error:
+                raise SourceError(
+                    f"cannot remove previous Alpine source output {generated}: "
+                    f"{error}; an earlier Docker source fetch may have left "
+                    "root-owned files, so remove it manually"
+                ) from error
+    for generated in (output / "manifest.json", output / "SHA256SUMS"):
+        if _is_link(generated) or (generated.exists() and not generated.is_file()):
+            raise SourceError(
+                f"Alpine source generated path is not a file: {generated}"
+            )
+        generated.unlink(missing_ok=True)
+
+
 def configure_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("manifests", nargs="+", type=Path)
     parser.add_argument(
@@ -390,8 +454,9 @@ def collect_alpine_sources(
     metadata = [
         _package_metadata(package, branch, architecture) for package in packages
     ]
+    output = _resolve_source_output(output)
     _prepare_aports(cache, branch)
-    output = output.resolve()
+    _reset_source_output(output)
     output.mkdir(parents=True, exist_ok=True)
     executables: set[str] = set()
     for item in metadata:

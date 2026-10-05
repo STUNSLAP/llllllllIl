@@ -4746,6 +4746,56 @@ class AlpineSourceCollectionTests(unittest.TestCase):
             if os.name == "posix":
                 self.assertEqual(upgrade.stat().st_mode & 0o777, 0o755)
 
+    def test_collection_replaces_stale_output_and_passes_release_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "aports"
+            commit = self._symlinked_recipe_commit(cache)
+            manifest = self._package_manifest(root, commit)
+            source_dir = root / "sources"
+            output = source_dir / "alpine"
+            stale_files = (
+                output / "recipes" / ("0" * 40) / "main/stale/APKBUILD",
+                output / "upstream" / ("0" * 40) / "main/stale/stale.tar.gz",
+            )
+            for stale in stale_files:
+                stale.parent.mkdir(parents=True)
+                stale.write_bytes(b"stale")
+            (output / "manifest.json").write_text("{}", encoding="utf-8")
+            (output / "SHA256SUMS").write_text("", encoding="ascii")
+
+            def fetch_upstream(bundle: Path, _alpine_version: str) -> None:
+                upstream = bundle / "upstream" / commit / "main" / "foo"
+                upstream.mkdir(parents=True)
+                (upstream / "foo-1.0.tar.gz").write_bytes(b"upstream")
+
+            with (
+                patch.object(collect_alpine_sources, "_prepare_aports"),
+                patch.object(
+                    collect_alpine_sources,
+                    "_fetch_upstream_sources",
+                    side_effect=fetch_upstream,
+                ),
+                patch.object(BuildConstants, "SOURCE_DIR", source_dir),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                collect_alpine_sources.collect_alpine_sources([manifest], output, cache)
+                executables = release._validate_alpine_sources([manifest])
+
+            self.assertEqual(
+                executables,
+                {
+                    f"recipes/{commit}/main/foo/foo.post-install",
+                    f"recipes/{commit}/main/foo/foo.post-upgrade",
+                },
+            )
+            for stale in stale_files:
+                self.assertFalse(stale.parent.parent.exists(), stale)
+            self.assertEqual(
+                sorted(path.name for path in output.iterdir()),
+                ["SHA256SUMS", "manifest.json", "recipes", "upstream"],
+            )
+
     def test_recipe_extraction_materializes_symlinks_inside_recipe(self):
         member = self._member
         archive = self._archive(
@@ -4913,6 +4963,149 @@ class AlpineSourceCollectionTests(unittest.TestCase):
                     )
 
                 self.assertEqual(list(destination.iterdir()), [])
+
+    def test_collection_guards_output_before_replacing_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = self._package_manifest(root, "0" * 40)
+            output = root / "alpine"
+            (output / "recipes").mkdir(parents=True)
+            notes = output / "notes.txt"
+            notes.write_text("keep", encoding="utf-8")
+            not_directory = root / "file"
+            not_directory.write_text("keep", encoding="utf-8")
+
+            for target, message in (
+                (output, "unexpected entries: notes.txt"),
+                (not_directory, "is not a directory"),
+            ):
+                with (
+                    self.subTest(output=target.name),
+                    patch.object(collect_alpine_sources, "_prepare_aports") as prepare,
+                    self.assertRaisesRegex(
+                        collect_alpine_sources.SourceError,
+                        message,
+                    ),
+                ):
+                    collect_alpine_sources.collect_alpine_sources(
+                        [manifest],
+                        target,
+                        root / "aports",
+                        skip_upstream=True,
+                    )
+                prepare.assert_not_called()
+            self.assertTrue(notes.is_file())
+            self.assertTrue((output / "recipes").is_dir())
+
+            notes.unlink()
+            with (
+                patch.object(collect_alpine_sources, "_prepare_aports"),
+                patch.object(
+                    collect_alpine_sources.shutil,
+                    "rmtree",
+                    side_effect=PermissionError(13, "Permission denied"),
+                ),
+                self.assertRaisesRegex(
+                    collect_alpine_sources.SourceError,
+                    "cannot remove previous Alpine source output.*remove it manually",
+                ),
+            ):
+                collect_alpine_sources.collect_alpine_sources(
+                    [manifest],
+                    output,
+                    root / "aports",
+                    skip_upstream=True,
+                )
+
+    def test_collection_refuses_symlinked_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "alpine"
+            (output / "recipes").mkdir(parents=True)
+            link = root / "alpine-link"
+            try:
+                link.symlink_to(output, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+
+            with (
+                patch.object(collect_alpine_sources, "_prepare_aports") as prepare,
+                self.assertRaisesRegex(
+                    collect_alpine_sources.SourceError,
+                    "Alpine source output is not a directory",
+                ),
+            ):
+                collect_alpine_sources.collect_alpine_sources(
+                    [self._package_manifest(root, "0" * 40)],
+                    link,
+                    root / "aports",
+                    skip_upstream=True,
+                )
+
+            prepare.assert_not_called()
+            self.assertTrue((output / "recipes").is_dir())
+
+    def test_collection_refuses_output_junctions(self):
+        if sys.platform != "win32":
+            self.skipTest("directory junctions exist only on Windows")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = self._package_manifest(root, "0" * 40)
+            elsewhere = root / "elsewhere"
+            (elsewhere / "recipes").mkdir(parents=True)
+            kept = elsewhere / "recipes" / "kept"
+            kept.write_bytes(b"kept")
+            output = root / "alpine"
+            output.mkdir()
+            cases = (
+                (
+                    root / "junction",
+                    elsewhere,
+                    root / "junction",
+                    "Alpine source output is not a directory",
+                ),
+                (
+                    output / "recipes",
+                    elsewhere / "recipes",
+                    output,
+                    "Alpine source generated path is not a directory",
+                ),
+            )
+            for link, target, collected, message in cases:
+                subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                    capture_output=True,
+                    check=True,
+                )
+                with (
+                    self.subTest(link=link.name),
+                    patch.object(collect_alpine_sources, "_prepare_aports"),
+                    self.assertRaisesRegex(collect_alpine_sources.SourceError, message),
+                ):
+                    collect_alpine_sources.collect_alpine_sources(
+                        [manifest],
+                        collected,
+                        root / "aports",
+                        skip_upstream=True,
+                    )
+                self.assertEqual(kept.read_bytes(), b"kept")
+
+    def test_upstream_fetch_restores_bundle_ownership_on_exit(self):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(collect_alpine_sources, "_run") as run,
+        ):
+            collect_alpine_sources._fetch_upstream_sources(Path(temporary), "3.24")
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[:4], ["docker", "run", "--rm", "--volume"])
+        script = command[-1]
+        self.assertIn("owner=$(stat -c '%u:%g' /bundle)", script)
+        self.assertIn('chown -R "$owner" /bundle/upstream', script)
+        self.assertLess(
+            script.index("trap restore_owner EXIT"),
+            script.index("mkdir -p /bundle/upstream"),
+        )
 
 
 class BuildTests(unittest.TestCase):
