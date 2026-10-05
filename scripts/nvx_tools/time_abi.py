@@ -69,6 +69,28 @@ CI_WARP_GAPS: tuple[str, ...] = (str(WARP_PROBE_IDLE_SECONDS),) * (
 )
 QUALIFICATION_WARP_GAPS: tuple[str, ...] = ("0.1", "1", "5", "1")
 PROFILE_VENDORS: Mapping[str, str] = {"GenuineIntel": "intel"}
+# The generation of every host profile, which `openvmm --cpu-profile host`
+# derives from the host it runs on (doc/design/time-abi.md, "Selection"). No
+# pinned profile uses it, and host qualification never accepts one.
+HOST_PROFILE_GENERATION = "host"
+_PROFILE_ID = re.compile(r"([a-z0-9-]+)\.([a-z0-9-]+)\.v[1-9][0-9]*")
+
+
+@dataclass(frozen=True)
+class CpuModel:
+    """A CPU model of a generation: a display family and model, and the
+    steppings that the generation covers."""
+
+    family: int
+    model: int
+    steppings: range = range(16)
+
+    def describe(self) -> str:
+        """The model as messages name it, such as ``6/85 steppings 0-4``."""
+        name = f"{self.family}/{self.model}"
+        if self.steppings == range(16):
+            return name
+        return f"{name} steppings {self.steppings.start}-{self.steppings.stop - 1}"
 
 
 @dataclass(frozen=True)
@@ -77,23 +99,59 @@ class CpuGeneration:
 
     name: str
     vendor: str
-    family: int
-    model: int
-    steppings: range
+    cpus: tuple[CpuModel, ...]
 
     @property
     def profile_id(self) -> str:
         """The catalog's v1 profile, which every backend shares."""
         return f"{PROFILE_VENDORS[self.vendor]}.{self.name}.v1"
 
+    def contains(self, vendor: str, family: int, model: int, stepping: int) -> bool:
+        """Whether a CPU belongs to the generation."""
+        return self.vendor == vendor and any(
+            (cpu.family, cpu.model) == (family, model) and stepping in cpu.steppings
+            for cpu in self.cpus
+        )
 
-# Model 85 also covers Cascade Lake (steppings 5-7) and Cooper Lake (10-11),
-# which have no profile.
+    def describe(self) -> str:
+        """The generation and its CPUs, such as ``alderlake 6/151 and 6/154``."""
+        return f"{self.name} {' and '.join(cpu.describe() for cpu in self.cpus)}"
+
+
+# A copy of the generations of OpenVMM's pinned CPU profiles
+# (openvmm/vmm_core/cpu_profile/profiles), which test_time_abi compares with
+# the submodule. Doctor uses it only without OpenVMM (--no-openvmm), and run
+# names it in its guidance; otherwise OpenVMM reports the generation and the
+# profile itself. Model 85 also covers Cascade Lake (steppings 5-7) and Cooper
+# Lake (10-11), which have no profile.
 CPU_GENERATIONS: tuple[CpuGeneration, ...] = (
-    CpuGeneration("skylake-sp", "GenuineIntel", 6, 85, range(5)),
-    CpuGeneration("icelake-sp", "GenuineIntel", 6, 106, range(16)),
-    CpuGeneration("emeraldrapids", "GenuineIntel", 6, 207, range(16)),
+    CpuGeneration("skylake-sp", "GenuineIntel", (CpuModel(6, 85, range(5)),)),
+    CpuGeneration("icelake-sp", "GenuineIntel", (CpuModel(6, 106),)),
+    CpuGeneration("emeraldrapids", "GenuineIntel", (CpuModel(6, 207),)),
+    CpuGeneration("alderlake", "GenuineIntel", (CpuModel(6, 151), CpuModel(6, 154))),
 )
+
+
+def describe_cpu_generations() -> str:
+    """The catalog's generations as messages list them."""
+    return ", ".join(generation.describe() for generation in CPU_GENERATIONS)
+
+
+def is_catalog_profile_id(profile_id: str) -> bool:
+    """Whether ``profile_id`` names a catalog profile: a revision of a pinned
+    generation's profile, ``<vendor>.<generation>.v<revision>``, and not a host
+    profile, whatever OpenVMM's catalog holds."""
+    match = _PROFILE_ID.fullmatch(profile_id)
+    return match is not None and match.group(2) != HOST_PROFILE_GENERATION
+
+
+def is_host_profile_id(profile_id: str) -> bool:
+    """Whether ``profile_id`` names a host profile, ``<vendor>.host.v<revision>``,
+    which qualification never accepts."""
+    match = _PROFILE_ID.fullmatch(profile_id)
+    return match is not None and match.group(2) == HOST_PROFILE_GENERATION
+
+
 # Guest boot markers that init prints once the guest is shell-ready. Only the
 # time ABI's initial clock step (C12) precedes them; the other boot checks
 # finish asynchronously.
@@ -127,12 +185,7 @@ def cpu_generation(
 ) -> CpuGeneration | None:
     """Return the time ABI generation of a CPU, or None if it has none."""
     for generation in CPU_GENERATIONS:
-        if (
-            generation.vendor == vendor
-            and generation.family == family
-            and generation.model == model
-            and stepping in generation.steppings
-        ):
+        if generation.contains(vendor, family, model, stepping):
             return generation
     return None
 

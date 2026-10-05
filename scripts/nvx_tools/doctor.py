@@ -29,18 +29,19 @@ from .ci import OPENVMM_TEST_BACKENDS
 from .common import ScriptError, artifact_path, openvmm_binary_path
 from .time_abi import (
     CI_WARP_GAPS,
-    CPU_GENERATIONS,
     LAPIC_HZ,
     MAX_TSC_HZ,
     MIN_TSC_HZ,
     QUALIFICATION_WARP_GAPS,
     WARP_BOUND_NS,
     WARP_PROBE_COMPLETION_MARKER,
-    CpuGeneration,
     TimeAbiFailure,
     TimeAbiMonitor,
     check_warp_probe,
     cpu_generation,
+    describe_cpu_generations,
+    is_catalog_profile_id,
+    is_host_profile_id,
     parse_fields,
     warp_probe_script,
     warp_rounds,
@@ -352,21 +353,8 @@ def check_backend(context: DoctorContext) -> CheckResult:
 def check_cpu(context: DoctorContext) -> CheckResult:
     info = host_cpu(context)
     signature = f"{info['vendor']} {info['family']}/{info['model']}/{info['stepping']}"
-    try:
-        generation = cpu_generation(
-            info["vendor"],
-            int(info["family"]),
-            int(info["model"]),
-            int(info["stepping"]),
-        )
-    except ValueError:
-        generation = None
-    profile = generation.profile_id if generation else None
-    name = generation.name if generation else "unknown"
     context.facts.update(
         {
-            "generation": name,
-            "profile": profile or "none",
             "cpu": signature,
             "brand": info["brand"],
             "microcode": info.get("microcode", "unknown"),
@@ -374,23 +362,36 @@ def check_cpu(context: DoctorContext) -> CheckResult:
             "invariant_tsc": info["invariant_tsc"],
         }
     )
-    detail = (
-        f"generation={name} profile={profile or 'none'} cpu={signature} "
-        f"microcode={info.get('microcode', 'unknown')} os={info['os']} "
-        f"invariant_tsc={info['invariant_tsc']} brand={info['brand']}"
-    )
     problems: list[str] = []
-    if generation is None:
-        problems.append(
-            f"[E_PROFILE_HOST_UNKNOWN] {signature} is not a time ABI generation "
-            "(skylake-sp 6/85 steppings 0-4, icelake-sp 6/106, emeraldrapids 6/207)"
-        )
     if context.fingerprint is None:
-        detail += "; CPU profile not checked: qualification runs without OpenVMM"
+        # Without OpenVMM, NVX's copy of OpenVMM's catalog maps the host.
+        try:
+            generation = cpu_generation(
+                info["vendor"],
+                int(info["family"]),
+                int(info["model"]),
+                int(info["stepping"]),
+            )
+        except ValueError:
+            generation = None
+        name = generation.name if generation else "unknown"
+        profile = generation.profile_id if generation else "none"
+        if generation is None:
+            problems.append(
+                f"[E_PROFILE_HOST_UNKNOWN] {signature} is not a time ABI generation "
+                f"({describe_cpu_generations()})"
+            )
+        profile_detail = "CPU profile not checked: qualification runs without OpenVMM"
     else:
-        profile_detail, profile_problems = _check_cpu_profile(context, generation)
-        detail += f"; {profile_detail}"
+        name, profile, profile_detail, profile_problems = _check_cpu_profile(context)
         problems.extend(profile_problems)
+    context.facts.update({"generation": name, "profile": profile})
+    detail = (
+        f"generation={name} profile={profile} cpu={signature} "
+        f"microcode={info.get('microcode', 'unknown')} os={info['os']} "
+        f"invariant_tsc={info['invariant_tsc']} brand={info['brand']}; "
+        f"{profile_detail}"
+    )
     if problems:
         return CheckResult("H2", False, "; ".join(problems) + f"; {detail}")
     return CheckResult("H2", True, detail)
@@ -419,16 +420,22 @@ def _same_profile_lineage(selected: str, expected: str) -> bool:
     return re.fullmatch(rf"{lineage}\.v\d+", selected) is not None
 
 
-def _check_cpu_profile(
-    context: DoctorContext, generation: CpuGeneration | None
-) -> tuple[str, list[str]]:
-    """Fingerprint the host with OpenVMM and check its generation's profile."""
+def _check_cpu_profile(context: DoctorContext) -> tuple[str, str, str, list[str]]:
+    """Fingerprint the host with OpenVMM and check the profile that it
+    selects. Return the generation and the profile as OpenVMM reports them,
+    the detail, and the problems: OpenVMM's catalog, not NVX's copy, decides
+    which hosts it serves."""
     assert context.fingerprint is not None
     if not context.openvmm.is_file():
-        return "CPU profile not checked", [
-            f"OpenVMM was not found at {context.openvmm}; H2 checks the CPU "
-            "profile with its --cpu-fingerprint tool (or pass --no-openvmm)"
-        ]
+        return (
+            "unknown",
+            "none",
+            "CPU profile not checked",
+            [
+                f"OpenVMM was not found at {context.openvmm}; H2 checks the CPU "
+                "profile with its --cpu-fingerprint tool (or pass --no-openvmm)"
+            ],
+        )
     context.fingerprint.parent.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     environment["OPENVMM_LOG"] = "off"
@@ -462,18 +469,25 @@ def _check_cpu_profile(
         )
         if "--cpu-fingerprint" in output and "unexpected argument" in output:
             last = "this OpenVMM predates the --cpu-fingerprint tool"
-        return "CPU profile not checked", [
-            f"OpenVMM's CPU fingerprint exited {completed.returncode} without "
-            f"an {CPU_PROFILE_PREFIX} line: {last}"
-        ]
+        return (
+            "unknown",
+            "none",
+            "CPU profile not checked",
+            [
+                f"OpenVMM's CPU fingerprint exited {completed.returncode} without "
+                f"an {CPU_PROFILE_PREFIX} line: {last}"
+            ],
+        )
     fields = parse_cpu_profile_line(line)
-    for name in ("profile", "profile_digest", "surface_digest"):
+    generation = fields.get("generation") or "none"
+    profile = fields.get("profile") or "none"
+    for name in ("profile_digest", "surface_digest"):
         if fields.get(name, "none") != "none":
             context.facts[name] = fields[name]
     context.facts["cpu_fingerprint"] = os.fspath(context.fingerprint)
     detail = (
         f"CPU profile check status={fields.get('status')} "
-        f"profile={fields.get('profile')} "
+        f"profile={profile} "
         f"profile_digest={fields.get('profile_digest', 'none')} "
         f"surface_digest={fields.get('surface_digest')} "
         f"fingerprint={context.fingerprint}"
@@ -486,21 +500,31 @@ def _check_cpu_profile(
             f"{prefix}OpenVMM's CPU profile check failed (exit "
             f"{completed.returncode}): {fields.get('detail', line)}"
         )
-        return detail, problems
+        return generation, profile, detail, problems
     if fields.get("backend") != context.backend:
         problems.append(f"OpenVMM fingerprinted the {fields.get('backend')} backend")
-    if generation is not None:
-        if fields.get("generation") != generation.name:
-            problems.append(
-                f"OpenVMM maps the host to generation {fields.get('generation')}, "
-                f"not {generation.name}"
-            )
-        if not _same_profile_lineage(fields.get("profile", ""), generation.profile_id):
-            problems.append(
-                f"OpenVMM selected CPU profile {fields.get('profile')}, not a "
-                f"revision of {generation.profile_id}"
-            )
-    return detail, problems
+    unreported = [name for name in ("generation", "profile") if not fields.get(name)]
+    if unreported:
+        problems.append(
+            "OpenVMM's CPU profile check passed without reporting its "
+            + " and ".join(unreported)
+        )
+    elif is_host_profile_id(profile):
+        problems.append(
+            f"OpenVMM reported host profile {profile}, which qualification "
+            "never accepts"
+        )
+    elif not is_catalog_profile_id(profile):
+        problems.append(
+            f"OpenVMM reported CPU profile {profile}, which is not a catalog "
+            "profile ID (vendor.generation.vN)"
+        )
+    elif profile.split(".")[1] != generation:
+        problems.append(
+            f"OpenVMM reported CPU profile {profile} of generation "
+            f"{profile.split('.')[1]} for generation {generation}"
+        )
+    return generation, profile, detail, problems
 
 
 def _guest_vcpus() -> int:
@@ -590,15 +614,18 @@ def check_openvmm_preflight(context: DoctorContext) -> CheckResult:
             f"{expected_lapic}"
         )
     expected_profile = context.facts.get("profile", "none")
-    selected_profile = fields.get("cpu_profile", "")
-    # A missing or unknown profile fails even when H2 doesn't run with H3.
-    if not any(
-        _same_profile_lineage(selected_profile, generation.profile_id)
-        for generation in CPU_GENERATIONS
-    ):
+    selected_profile = fields.get("cpu_profile") or "none"
+    # A missing, host, or malformed profile fails even when H2 doesn't run
+    # with H3. Which generations have profiles is OpenVMM's to decide.
+    if not is_catalog_profile_id(selected_profile):
         problems.append(
             "OpenVMM verified no catalog CPU profile: "
-            f"cpu_profile={selected_profile or 'none'}"
+            f"cpu_profile={selected_profile}"
+            + (
+                " (a host profile, which qualification never accepts)"
+                if is_host_profile_id(selected_profile)
+                else ""
+            )
         )
     elif expected_profile != "none" and not _same_profile_lineage(
         selected_profile, expected_profile

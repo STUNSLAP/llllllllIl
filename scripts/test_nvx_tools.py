@@ -3308,6 +3308,27 @@ class CiConfigurationTests(unittest.TestCase):
         )
         self.assertNotIn("test-openvmm --backend", unit_tests_job)
 
+    def test_ci_validates_the_cli_after_checking_out_openvmm(self):
+        # The CLI tests read OpenVMM's pinned CPU profiles from the submodule,
+        # which a self-hosted runner's workspace holds at the pinned revision
+        # only after the job checks it out.
+        workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
+        for workflow_name, job_name in (
+            ("ci.yml", "openvmm-vmm-tests"),
+            ("ci.yml", "openvmm-unit-tests"),
+            ("run-nvx-microvm-tests.yml", "test"),
+            ("run-platform.yml", "run"),
+        ):
+            with self.subTest(workflow=workflow_name, job=job_name):
+                job = _workflow_job(
+                    (workflows / workflow_name).read_text(encoding="utf-8"), job_name
+                )
+                self.assertEqual(job.count("uses: ./.github/actions/validate-nvx"), 1)
+                self.assertLess(
+                    job.index("uses: ./.github/actions/checkout-openvmm"),
+                    job.index("uses: ./.github/actions/validate-nvx"),
+                )
+
     def test_ci_preserves_failed_openvmm_test_diagnostics(self):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
