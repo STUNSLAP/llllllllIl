@@ -300,9 +300,10 @@ them over the default environment instead, each entry replacing the default
 variable of the same name. Without bit 1, the entry count must be zero. The
 agent passes these fields through a sealed anonymous file to a launch
 helper, a copy of the agent that runs once `setpriv` has applied the workload's
-identity, inside the container root with sandbox layers. The helper applies
-any environment, enters the working directory, or `/` without one, and executes
-the workload; if it cannot enter the directory, it writes a diagnostic to the
+identity, inside the container root with sandbox layers. The helper enters the
+working directory, or `/` without one, points `PWD` at it unless the request
+replaces the environment, applies any environment, and executes the workload;
+if it cannot enter the directory or set `PWD`, it writes a diagnostic to the
 workload's standard error and exits with status 125. Without sandbox layers,
 the workload's child process enters the directory itself, under the workload's
 user and group IDs with no supplementary groups or effective capabilities,

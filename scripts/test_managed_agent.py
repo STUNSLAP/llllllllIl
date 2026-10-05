@@ -288,10 +288,12 @@ int main(int argc, char **argv) {
         )
 
     def test_helper_preserves_defaults_without_internal_descriptor(self):
-        result = self.launch((b"/usr/bin/env",), None)
+        result = self.launch((b"/usr/bin/env",), None, b"/tmp")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
         self.assertEqual(
-            (result.returncode, result.stdout, result.stderr),
-            (0, b"BASE=inherited\n", b""),
+            set(result.stdout.splitlines()),
+            {b"BASE=inherited", b"PWD=/tmp"},
         )
 
     def test_helper_layers_explicit_environment_over_defaults(self):
@@ -304,7 +306,20 @@ int main(int argc, char **argv) {
         self.assertEqual(result.stderr, b"")
         self.assertEqual(
             set(result.stdout.splitlines()),
-            {b"BASE=inherited", b"VALUE=layered"},
+            {b"BASE=inherited", b"PWD=/", b"VALUE=layered"},
+        )
+
+        result = self.launch(
+            (b"/usr/bin/env",),
+            (b"PWD=/explicit",),
+            b"/tmp",
+            inherit=True,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            set(result.stdout.splitlines()),
+            {b"BASE=inherited", b"PWD=/explicit"},
         )
 
     def test_helper_roundtrip_large_exact_environment(self):

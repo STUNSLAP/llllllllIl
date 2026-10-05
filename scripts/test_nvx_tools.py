@@ -1039,6 +1039,45 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(report.outcome_report, Path("exec-outcome.json"))
 
+    def test_sandbox_managed_operations_reject_dry_run_before_state_access(self):
+        lifecycle_methods = (
+            ("provision", "provision"),
+            ("start", "start"),
+            ("exec", "exec_workload"),
+            ("stop", "stop"),
+            ("deprovision", "deprovision"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            state.mkdir()
+            marker = state / "marker"
+            marker.write_text("preserved", encoding="utf-8")
+
+            for operation, lifecycle_method in lifecycle_methods:
+                with self.subTest(operation=operation):
+                    args = nvx.parse_args(
+                        [
+                            "sandbox",
+                            operation,
+                            "--state-dir",
+                            str(state),
+                            "--dry-run",
+                        ]
+                    )
+                    with (
+                        patch.object(
+                            sandbox_lifecycle,
+                            lifecycle_method,
+                        ) as lifecycle,
+                        self.assertRaisesRegex(
+                            common.ScriptError,
+                            "--dry-run is only valid for sandbox run",
+                        ),
+                    ):
+                        nvx.command_sandbox(args)
+                    lifecycle.assert_not_called()
+                    self.assertEqual(marker.read_text(encoding="utf-8"), "preserved")
+
     def test_sandbox_exec_forwards_explicit_empty_environment_and_cwd(self):
         with tempfile.TemporaryDirectory() as temporary:
             environment_file = Path(temporary) / "environment.json"

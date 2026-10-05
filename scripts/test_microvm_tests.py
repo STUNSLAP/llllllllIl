@@ -47,11 +47,12 @@ def _posix_shell() -> str | None:
     return shell
 
 
-# What `/usr/bin/env` prints in the emulated workload without a supplied environment.
+# What `/usr/bin/env` prints in the emulated workload without a supplied environment
+# or working directory.
 WORKLOAD_DEFAULT_ENVIRONMENT = (
     b"PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
     b"TERM=linux\nHOME=/nonexistent\nUSER=nobody\nLOGNAME=nobody\n"
-    b"SHLVL=1\nnvx_workload_uid=65534\nnvx_hostname=nvx\n"
+    b"SHLVL=1\nPWD=/\nnvx_workload_uid=65534\nnvx_hostname=nvx\n"
 )
 
 
@@ -243,6 +244,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         stop_returncode: int = 0,
         default_environment: bytes = WORKLOAD_DEFAULT_ENVIRONMENT,
         layered_environment: bytes | None = None,
+        working_environment: bytes | None = None,
         evidence_failure: bool = False,
         command_log: list[list[str]] | None = None,
     ) -> tuple[list[list[str]], list[dict[str, object]]]:
@@ -353,13 +355,23 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                         for index, value in enumerate(command)
                         if value == "--environment"
                     ]
-                if entries is None:
+                # Default and layered environments name the working directory in
+                # PWD before any layered entry applies; a replacement controls it.
+                if entries is None and "--cwd" not in command:
                     stdout = default_environment
+                elif entries is None:
+                    stdout = (
+                        working_environment
+                        if working_environment is not None
+                        else _layered(default_environment, [f"PWD={cwd}"])
+                    )
                 elif "--inherit-default-environment" in command:
                     stdout = (
                         layered_environment
                         if layered_environment is not None
-                        else _layered(WORKLOAD_DEFAULT_ENVIRONMENT, entries)
+                        else _layered(
+                            WORKLOAD_DEFAULT_ENVIRONMENT, [f"PWD={cwd}", *entries]
+                        )
                     )
                 else:
                     stdout = (
@@ -566,9 +578,10 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
             "USER": "nobody",
             "LOGNAME": "nobody",
             "SHLVL": "1",
+            "PWD": "/",
             "nvx_workload_uid": "65534",
         }
-        required_names = ("PATH", "TERM", "HOME", "USER", "LOGNAME")
+        required_names = ("PATH", "TERM", "HOME", "USER", "LOGNAME", "PWD")
         mutations = [
             *[
                 (f"wrong-{name}", {**valid, name: f"wrong-{value}"})
@@ -611,7 +624,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         environment = (
             b"PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
             b"TERM=linux\nHOME=/nonexistent\nUSER=nobody\nLOGNAME=nobody\n"
-            b"SHLVL=1\nnvx_layer=distro\nnvx_workload_uid=65534\n"
+            b"SHLVL=1\nPWD=/\nnvx_layer=distro\nnvx_workload_uid=65534\n"
             b"nvx_workload_gid=65534\nnvx_hostname=nvx\n"
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -644,6 +657,28 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     )
         with tempfile.TemporaryDirectory() as temporary:
             self._run_acceptance(Path(temporary), layered_environment=layered)
+
+    def test_public_acceptance_rejects_working_directory_environment_mutations(self):
+        working = _layered(WORKLOAD_DEFAULT_ENVIRONMENT, ["PWD=/tmp"])
+        mutations = {
+            # With sandbox layers, the launch helper once left PWD at `/` (#373).
+            "root-PWD": WORKLOAD_DEFAULT_ENVIRONMENT,
+            "missing-PWD": working.replace(b"PWD=/tmp\n", b""),
+            "replaced-defaults": b"PWD=/tmp\n",
+        }
+        for mutation, environment in mutations.items():
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "did not point PWD at the working directory"
+                ):
+                    self._run_acceptance(
+                        Path(temporary), working_environment=environment
+                    )
+        with tempfile.TemporaryDirectory() as temporary:
+            self._run_acceptance(Path(temporary), working_environment=working)
 
     def test_evidence_failure_still_deprovisions_stopped_sandbox(self):
         with tempfile.TemporaryDirectory() as temporary:
