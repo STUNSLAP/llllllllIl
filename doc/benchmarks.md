@@ -307,10 +307,18 @@ series whose p50 is more than 25% above p25; this prevents a transient host stal
 performance history without hiding a uniformly slower product result.
 Every launch is scanned for the guest's time ABI output as in the
 [microVM correctness jobs](ci.md): a violation event or a time ABI power-off fails the run.
+Each teardown that can return a sample (a guest exit with status 0, a host termination, or a
+teardown timeout) first reads the console to its end, so an event that the guest prints after
+the readiness marker, even on an unterminated last line, still fails the run. A host-terminated
+launch, or one killed after a teardown timeout, fails on a time ABI power-off status but not on
+the status of its termination. A guest exit with a nonzero status fails the run regardless; the
+scan reads what the console delivers within a second, so that a time ABI power-off is reported
+with its event.
 Benchmarks never ask the guest for its time ABI status, as the correctness jobs do after cold
-boots and restores, so the guest prints nothing extra and the scan only parses output the harness
-already reads; it adds nothing to the measured intervals. The guest's boot check, which powers the
-guest off with status 193 if it fails, is part of `openvmm_cold_start`.
+boots and restores, so the guest prints nothing extra. Up to the marker, the scan only parses
+output the harness reads anyway, and the harness reads the rest of the console only after it
+records a sample's intervals, so the scan adds nothing to them. The guest's boot check, which
+powers the guest off with status 193 if it fails, is part of `openvmm_cold_start`.
 Lifecycle capture runs a deterministic affinity-pinned worker on every vCPU
 before the snapshot request. Explicit correctness scenarios also stage a post-restore probe.
 The capture probe is outside the snapshot-generation timing interval. Each worker proves that it
@@ -463,7 +471,7 @@ pipe. Snapshot capture and launch measurements therefore read stderr through a s
 they parse profile records only from stderr and match guest markers only on the console. Their
 logs and error reports interleave the two streams by whole lines. Because the streams are read
 independently, a record written before a guest marker can arrive after it. Snapshot capture, and
-launch measurements that keep a profile or a log, read both streams to their end within the
+launch measurements before they return a sample, read both streams to their end within the
 configured timeout and fail if either stream does not end.
 
 With full profiling, the coordinator retains every record in `profile.raw_samples`. It derives

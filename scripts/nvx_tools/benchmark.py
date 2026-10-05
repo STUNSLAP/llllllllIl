@@ -42,7 +42,7 @@ from .build_constants import (
     OpenVMMBuildConstants,
 )
 from .common import bytes_to_mib, sha256_file
-from .time_abi import TimeAbiMonitor, status_script
+from .time_abi import TimeAbiFailure, TimeAbiMonitor, status_script
 
 BOOT_MARKER = b"ALPINE-MICROVM-BOOT-OK"
 RESTORE_MARKER = b"OPENVMM-SNAPSHOT-RESTORE-OK"
@@ -1688,11 +1688,13 @@ class SeparatedOutput:
         self,
         timeout: float,
         on_stderr: Callable[[bytes], None] | None = None,
+        on_console: Callable[[bytes | None], None] | None = None,
     ) -> bool:
         """Records output until both streams end or ``timeout`` expires.
 
-        ``on_stderr`` also receives each stderr chunk. Returns whether both
-        streams ended.
+        ``on_stderr`` also receives each stderr chunk, and ``on_console`` each
+        console chunk, then ``None`` once the console ends. Returns whether
+        both streams ended.
         """
         deadline = time.monotonic() + timeout
         while self._open_streams:
@@ -1703,7 +1705,10 @@ class SeparatedOutput:
                 stream, chunk = self.get(remaining)
             except queue.Empty:
                 return False
-            if stream == "stderr" and chunk is not None and on_stderr is not None:
+            if stream == "console":
+                if on_console is not None:
+                    on_console(chunk)
+            elif chunk is not None and on_stderr is not None:
                 on_stderr(chunk)
         return True
 
@@ -1783,9 +1788,15 @@ def measure_once(
     line starting with ``failure_marker`` stops the launch immediately, and so
     does a time ABI violation event or failed conformance check. Both markers
     and the time ABI lines match only the guest console, and profile records
-    come only from OpenVMM's stderr. A launch that keeps a profile or a log
-    reads both streams to their end after teardown, within ``timeout``, and
-    fails if they do not end.
+    come only from OpenVMM's stderr. Each teardown that can return a sample (a
+    guest exit with status 0, a host termination, or a teardown timeout) first
+    reads both streams to their end within ``timeout`` and fails if they do
+    not end. The time ABI monitor scans the console to that end, so a
+    violation event or failed check that the guest prints after the marker,
+    even on an unterminated last line, fails the launch, and so does a time
+    ABI power-off status. A guest exit with a nonzero status fails the launch
+    regardless, after a bounded drain that lets the monitor report a power-off
+    with its event.
     """
     started = time.perf_counter_ns()
     interaction = InteractiveProcess(command, environment, separate_stderr=True)
@@ -1800,20 +1811,42 @@ def measure_once(
     output = SeparatedOutput(interaction)
     deadline = time.monotonic() + timeout
 
+    def scan_console(chunk: bytes | None) -> None:
+        if chunk is None:
+            monitor.finish()
+        else:
+            monitor.feed(chunk)
+
+    def scan_console_unchecked(chunk: bytes | None) -> None:
+        # Failure paths still pass the console to the monitor, but raise
+        # nothing over the error being handled.
+        with contextlib.suppress(TimeAbiFailure):
+            scan_console(chunk)
+
     def finish_output(
+        returncode: int | None,
         marker_reached: int,
         readiness_counters: dict[str, int] | None,
     ) -> None:
-        if (profile is None or profile_sink is None) and log_path is None:
-            return
-        # OpenVMM writes some records after it resumes the guest, and the
-        # stderr reader can deliver earlier ones after the console marker.
-        # A profile or log completed before both streams end would silently
-        # omit records or parse an unterminated one.
-        if not output.drain(timeout, profile.feed if profile is not None else None):
+        # The guest can still print a time ABI violation or a failed check
+        # after the marker, up to its exit. OpenVMM writes some profile
+        # records after it resumes the guest, and the stderr reader can
+        # deliver earlier ones after the console marker. A scan, profile, or
+        # log completed before both streams end would silently omit lines or
+        # parse an unterminated one.
+        if not output.drain(
+            timeout,
+            on_stderr=profile.feed if profile is not None else None,
+            on_console=scan_console,
+        ):
             raise RuntimeError(
                 f"OpenVMM output did not reach EOF within {timeout:g}s of its exit"
             )
+        # A completed guest-exit teardown gets here only with status 0, and a
+        # host termination or the kill after a teardown timeout leaves the
+        # status of that termination, so only a time ABI power-off fails the
+        # launch here.
+        monitor.check_exit(returncode)
         if profile is not None and profile_sink is not None:
             profile_sink.append(
                 profile.finish_restore(marker_reached, readiness_counters)
@@ -1847,7 +1880,9 @@ def measure_once(
                 failure = completed_output_line_with_prefix(console, failure_marker)
                 if failure is not None:
                     terminate(process)
-                    output.drain(OUTPUT_DRAIN_TIMEOUT_SECONDS)
+                    output.drain(
+                        OUTPUT_DRAIN_TIMEOUT_SECONDS, on_console=scan_console_unchecked
+                    )
                     raise GuestFailureReported(
                         failure.decode("utf-8", "replace"),
                         output.tail(),
@@ -1890,31 +1925,35 @@ def measure_once(
                 except subprocess.TimeoutExpired:
                     terminate(process)
                     wall_ms = (time.perf_counter_ns() - started) / 1_000_000
-                    finish_output(marker_reached, readiness_counters)
+                    finish_output(
+                        process.returncode, marker_reached, readiness_counters
+                    )
                     return elapsed_ms, peak_bytes, None, wall_ms
                 process_exited = time.perf_counter_ns()
                 teardown_ms = (process_exited - teardown_started) / 1_000_000
                 wall_ms = (process_exited - started) / 1_000_000
                 if teardown_mode == "guest-exit" and returncode != 0:
-                    # The monitor needs the console's last lines before
-                    # finish_output() would drain them.
+                    # The launch fails either way, so a bounded drain suffices
+                    # to report a time ABI power-off with its event.
                     drain_exited_output(output, monitor)
                     monitor.check_exit(returncode)
                     raise monitor.exit_error(returncode, when="during teardown")
-                finish_output(marker_reached, readiness_counters)
+                finish_output(returncode, marker_reached, readiness_counters)
                 return elapsed_ms, peak_bytes, teardown_ms, wall_ms
     except GuestFailureReported:
         raise
     except Exception as error:
         terminate(process)
-        output.drain(OUTPUT_DRAIN_TIMEOUT_SECONDS)
+        output.drain(OUTPUT_DRAIN_TIMEOUT_SECONDS, on_console=scan_console_unchecked)
         tail = output.tail()
         if tail:
             raise RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}") from error
         raise
     finally:
         if log_path is not None:
-            output.drain(OUTPUT_DRAIN_TIMEOUT_SECONDS)
+            output.drain(
+                OUTPUT_DRAIN_TIMEOUT_SECONDS, on_console=scan_console_unchecked
+            )
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_bytes(output.contents())
         interaction.close()

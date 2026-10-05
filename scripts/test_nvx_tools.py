@@ -10029,6 +10029,7 @@ class BenchmarkTests(unittest.TestCase):
             def read_output(self, chunks: queue.Queue[bytes | None]):
                 chunks.put(b"/ # echo OPENVMM-SNAPSHOT-RESTORE-OK\r\n")
                 chunks.put(b"OPENVMM-SNAPSHOT-RESTORE-OK\r\n")
+                chunks.put(None)
 
             def read_stderr(self, chunks: queue.Queue[bytes | None]):
                 chunks.put(None)
@@ -10090,6 +10091,7 @@ class BenchmarkTests(unittest.TestCase):
             def read_output(self, chunks: queue.Queue[bytes | None]):
                 self.process.exited = True
                 chunks.put(benchmark.RESTORE_MARKER + b"\n")
+                chunks.put(None)
 
             def read_stderr(self, chunks: queue.Queue[bytes | None]):
                 chunks.put(None)
