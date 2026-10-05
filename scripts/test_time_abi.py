@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -699,14 +700,31 @@ class RunnerWiringTests(unittest.TestCase):
         """Wait for a fake OpenVMM, whose PID is not a real process."""
         return process.wait()
 
-    def _measure(self, chunks: list[bytes], status: int, command: list[str]):
+    @staticmethod
+    def _teardown_timeout(process: FakeProcess, timeout: float) -> int:
+        raise subprocess.TimeoutExpired(str(process.pid), timeout)
+
+    def _measure(
+        self,
+        chunks: list[bytes],
+        status: int,
+        command: list[str],
+        *,
+        teardown_mode: str = "guest-exit",
+        teardown_timeout: bool = False,
+        log_path: Path | None = None,
+    ):
         interaction = FakeInteraction(chunks, status)
         with (
             patch.object(benchmark, "InteractiveProcess", return_value=interaction),
             patch.object(benchmark, "live_peak_rss_bytes", return_value=1024),
             # Never pidfd_open the fake's PID.
             patch.object(
-                benchmark, "wait_for_process_exit", side_effect=self._fake_exit
+                benchmark,
+                "wait_for_process_exit",
+                side_effect=(
+                    self._teardown_timeout if teardown_timeout else self._fake_exit
+                ),
             ),
         ):
             return benchmark.measure_once(
@@ -715,7 +733,9 @@ class RunnerWiringTests(unittest.TestCase):
                 timeout=5,
                 marker=benchmark.RESTORE_MARKER,
                 marker_must_be_line=True,
+                teardown_mode=teardown_mode,
                 guest_exit_prequeued=True,
+                log_path=log_path,
             )
 
     def test_measure_once_fails_fast_on_a_violation_event(self):
@@ -788,6 +808,134 @@ class RunnerWiringTests(unittest.TestCase):
                     marker_must_be_line=True,
                     guest_exit_prequeued=True,
                 )
+
+    def test_measure_once_scans_the_console_after_the_marker(self):
+        # The guest can print a violation during teardown and still exit 0,
+        # when its power-off loses the race against the queued guest exit.
+        marker = benchmark.RESTORE_MARKER + b"\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "restore.log"
+            for logged in (False, True):
+                with self.subTest(logged=logged):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "violation G_RCU_STALL"
+                    ) as raised:
+                        self._measure(
+                            [marker, VIOLATION],
+                            0,
+                            MSHV_RESTORE,
+                            log_path=log_path if logged else None,
+                        )
+                    self.assertIn("--- OpenVMM output ---", str(raised.exception))
+            self.assertIn(VIOLATION, log_path.read_bytes())
+        _elapsed, peak, teardown, _wall = self._measure(
+            [marker, b"~ # "], 0, MSHV_RESTORE
+        )
+        self.assertEqual(peak, 1024)
+        self.assertIsNotNone(teardown)
+
+    def test_measure_once_scans_an_unterminated_last_line(self):
+        marker = benchmark.RESTORE_MARKER + b"\n"
+        failed_check = (
+            b'NVX-TIME-ABI: v=1 phase=boot status=fail check=C4 detail="kvm-clock"'
+        )
+        for line, error in (
+            (VIOLATION.rstrip(b"\n"), "violation G_RCU_STALL"),
+            (failed_check, "boot check C4 failed: kvm-clock"),
+        ):
+            with self.subTest(error=error):
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self._measure([marker, line], 0, MSHV_RESTORE)
+
+    def test_measure_once_scans_the_console_after_a_teardown_timeout(self):
+        # The harness kills OpenVMM and returns the sample without a teardown
+        # time, unless the console or a power-off that beat the kill fails.
+        marker = benchmark.RESTORE_MARKER + b"\n"
+        _elapsed, peak, teardown, _wall = self._measure(
+            [marker], -9, MSHV_RESTORE, teardown_timeout=True
+        )
+        self.assertEqual(peak, 1024)
+        self.assertIsNone(teardown)
+        with self.assertRaisesRegex(RuntimeError, "violation G_RCU_STALL"):
+            self._measure([marker, VIOLATION], -9, MSHV_RESTORE, teardown_timeout=True)
+        with self.assertRaisesRegex(RuntimeError, "status 194 \\(runtime violation"):
+            self._measure([marker], 194, MSHV_RESTORE, teardown_timeout=True)
+
+    def test_measure_once_scans_the_console_of_a_terminated_openvmm(self):
+        # The status of the termination, -15 on Linux and 1 on Windows, never
+        # fails the launch, but the console and a power-off that beat the
+        # termination do.
+        marker = benchmark.RESTORE_MARKER + b"\n"
+        for status in (-15, 1):
+            with self.subTest(status=status):
+                result = self._measure(
+                    [marker], status, MSHV_RESTORE, teardown_mode="host-terminate"
+                )
+                self.assertEqual(result[1], 1024)
+                with self.assertRaisesRegex(RuntimeError, "violation G_RCU_STALL"):
+                    self._measure(
+                        [marker, VIOLATION],
+                        status,
+                        MSHV_RESTORE,
+                        teardown_mode="host-terminate",
+                    )
+        with self.assertRaisesRegex(RuntimeError, "status 194 \\(runtime violation"):
+            self._measure([marker], 194, MSHV_RESTORE, teardown_mode="host-terminate")
+
+    def test_measure_once_failure_paths_scan_without_masking_their_error(self):
+        # The rest of the console still reaches the monitor and the log, but
+        # no time ABI failure is raised over the error being handled.
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "restore.log"
+            interaction = FakeInteraction([b"NVX-TEST-FAIL broken\n", VIOLATION], 1)
+            with patch.object(
+                benchmark, "InteractiveProcess", return_value=interaction
+            ):
+                with self.assertRaises(benchmark.GuestFailureReported) as reported:
+                    benchmark.measure_once(
+                        MSHV_RESTORE,
+                        environment={},
+                        timeout=5,
+                        marker=benchmark.RESTORE_MARKER,
+                        marker_must_be_line=True,
+                        guest_exit_prequeued=True,
+                        log_path=log_path,
+                        failure_marker=b"NVX-TEST-FAIL",
+                    )
+            self.assertEqual(reported.exception.line, "NVX-TEST-FAIL broken")
+            self.assertIn(VIOLATION, log_path.read_bytes())
+
+        killed = threading.Event()
+
+        class KilledProcess(FakeProcess):
+            def kill(self) -> None:
+                super().kill()
+                killed.set()
+
+        class LateEventInteraction(FakeInteraction):
+            """A guest whose event reaches the console as OpenVMM stops."""
+
+            def read_output(self, chunks: queue.Queue[bytes | None]) -> None:
+                chunks.put(b"booting\n")
+                killed.wait(5)
+                chunks.put(VIOLATION)
+                chunks.put(None)
+
+        interaction = LateEventInteraction([], -9)
+        interaction.process = KilledProcess(-9)
+        with patch.object(benchmark, "InteractiveProcess", return_value=interaction):
+            with self.assertRaisesRegex(
+                RuntimeError, "^guest marker was not observed within 0.2s"
+            ) as timed_out:
+                benchmark.measure_once(
+                    MSHV_RESTORE,
+                    environment={},
+                    timeout=0.2,
+                    marker=benchmark.RESTORE_MARKER,
+                    marker_must_be_line=True,
+                    guest_exit_prequeued=True,
+                )
+        self.assertIn("G_RCU_STALL", str(timed_out.exception))
 
     def test_run_guest_script_classifies_a_conformance_power_off(self):
         interaction = FakeInteraction(
