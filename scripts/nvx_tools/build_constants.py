@@ -170,7 +170,7 @@ class AlpineBuildConstants:
     )
     PACKAGE_MANIFEST_FORMAT: Final = "apk-v1"
     PACKAGE_MANIFEST_VERSION: Final = 1
-    SOURCE_MANIFEST_FORMAT: Final = 1
+    SOURCE_MANIFEST_FORMAT: Final = 2
     PACKAGES: Final = (
         "blkid",
         "busybox-extras",
@@ -182,6 +182,9 @@ class AlpineBuildConstants:
     APORTS_CACHE_DIRECTORY_NAME: Final = "aports"
     PACKAGE_INDEX_URL: Final = "https://pkgs.alpinelinux.org/packages"
     REPOSITORIES: Final = ("main", "community", "testing")
+    SOURCE_OUTPUT_ENTRIES: Final = frozenset(
+        ("manifest.json", "recipes", "upstream", "SHA256SUMS")
+    )
 
 
 class UbuntuBuildConstants:

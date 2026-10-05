@@ -734,6 +734,13 @@ python3 scripts/nvx.py collect-alpine-sources MANIFEST [MANIFEST ...]
 | `--cache PATH` | `.cache/aports` | Select the aports cache directory. |
 | `--skip-upstream` | off | Collect exact aports recipes without running `abuild fetch`. |
 
+Each run replaces the generated `recipes`, `upstream`, `manifest.json`, and
+`SHA256SUMS` entries. The collector rejects an output path that is a symlink or
+a Windows junction, and an output directory that contains anything else.
+Release checksum manifests reject symlinks, so a recipe symlink is stored as a
+regular copy of its target. Links that leave the recipe, hard links, and
+special files are rejected.
+
 ### `collect-ubuntu-sources`
 
 ```text

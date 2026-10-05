@@ -43,9 +43,11 @@ corresponding source is published separately.
 Linux is GPL-2.0-only, so a distributor of `vmlinux` must make its complete
 corresponding source available. Alpine packages retain their individual
 licenses. The collector uses the exact aports commit embedded in every
-installed APK and runs `abuild fetch` plus `abuild verify`. If Python
-initramfs variants are present, `collect-sources` includes their package
-manifests automatically.
+installed APK and runs `abuild fetch` plus `abuild verify`. Its manifest lists
+the executable recipe files, and the Alpine source archive takes its file modes
+from that list rather than from the collecting host, which may not store them.
+If Python initramfs variants are present, `collect-sources` includes their
+package manifests automatically.
 
 Ubuntu artifacts use Ubuntu userland with the NVX kernel. The collector
 deduplicates exact source package name/version pairs from both Ubuntu

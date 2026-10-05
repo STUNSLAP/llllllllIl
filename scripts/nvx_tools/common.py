@@ -204,15 +204,28 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _checksummed_tree_files(directory: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in directory.rglob("*"):
+        file_stat = path.lstat()
+        relative = path.relative_to(directory).as_posix()
+        if stat.S_ISLNK(file_stat.st_mode):
+            raise ScriptError(f"symlink is not allowed in checksummed tree: {relative}")
+        if stat.S_ISDIR(file_stat.st_mode):
+            continue
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ScriptError(
+                f"special file is not allowed in checksummed tree: {relative}"
+            )
+        if relative != "SHA256SUMS":
+            files.append(path)
+    return files
+
+
 def write_sha256_sums(directory: Path) -> None:
-    files = sorted(
-        path
-        for path in directory.rglob("*")
-        if path.is_file() and path.name != "SHA256SUMS"
-    )
     lines = [
         f"{sha256_file(path)}  {path.relative_to(directory).as_posix()}"
-        for path in files
+        for path in sorted(_checksummed_tree_files(directory))
     ]
     (directory / "SHA256SUMS").write_text(
         "\n".join(lines) + "\n",
@@ -233,20 +246,10 @@ def verify_sha256_sums(directory: Path) -> VerifiedChecksumInventory:
             f"source checksums must contain only ASCII text: {checksum_file}"
         ) from error
 
-    packaged_files: set[str] = set()
-    for path in directory.rglob("*"):
-        file_stat = path.lstat()
-        relative = path.relative_to(directory).as_posix()
-        if stat.S_ISLNK(file_stat.st_mode):
-            raise ScriptError(f"symlink is not allowed in checksummed tree: {relative}")
-        if stat.S_ISDIR(file_stat.st_mode):
-            continue
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise ScriptError(
-                f"special file is not allowed in checksummed tree: {relative}"
-            )
-        if relative != "SHA256SUMS":
-            packaged_files.add(relative)
+    packaged_files = {
+        path.relative_to(directory).as_posix()
+        for path in _checksummed_tree_files(directory)
+    }
 
     listed_files: dict[str, str] = {}
     for line in checksum_text.splitlines():
