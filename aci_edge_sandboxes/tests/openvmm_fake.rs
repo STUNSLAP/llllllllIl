@@ -545,6 +545,19 @@ fn a_command_line_runs_in_a_shell_that_exports_variables_of_its_own() {
         environment(print().with_envs(["SHLVL=7", "PWD=/custom"])),
         sorted(["SHLVL=8", "PWD=/"])
     );
+    // It reads `SHLVL` with `atoi` and exports one more as an unsigned integer, which wraps
+    // around at the maximum.
+    for (received, exported) in [
+        ("SHLVL=4294967295", "SHLVL=0"),
+        ("SHLVL=-3", "SHLVL=4294967294"),
+        ("SHLVL=7x", "SHLVL=8"),
+        ("SHLVL=abc", "SHLVL=1"),
+    ] {
+        assert_eq!(
+            environment(print().with_env(received)),
+            sorted([exported, "PWD=/"])
+        );
+    }
     assert_eq!(
         environment(print()),
         sorted(DEFAULT_ENVIRONMENT.into_iter().chain(["SHLVL=1", "PWD=/"]))

@@ -24,8 +24,8 @@
 //! `PATH`, `TERM`, and the `HOME`, `USER`, and `LOGNAME` of the workload account. The guest's
 //! boot leaves a few more variables behind, and the guest agent points `PWD` at the working
 //! directory; the fake omits both. Like BusyBox's `sh`, a script exports `SHLVL`, one higher
-//! than the value that it received, and its working directory as `PWD`, replacing entries with
-//! these names.
+//! than the value that it received as an unsigned 32-bit integer that wraps around, and its
+//! working directory as `PWD`, replacing entries with these names.
 //!
 //! Kernel command-line tokens adjust the emulation: `fake_exit_on_start=CODE` fails the launch,
 //! `fake_boot_delay_ms=MS` delays the control endpoint, `fake_crash_after_ms=MS` makes the VM
@@ -97,10 +97,38 @@ fn start_shell(environment: &mut Environment, cwd: &str) {
     let level = environment
         .iter()
         .find(|(name, _)| name == "SHLVL")
-        .and_then(|(_, value)| value.parse::<u32>().ok())
-        .unwrap_or(0);
-    set_variable(environment, "SHLVL", &(level + 1).to_string());
+        .map_or(0, |(_, value)| atoi(value));
+    // BusyBox exports `atoi(SHLVL) + 1` as an unsigned integer, so `4294967295` and `-1`
+    // become `0`, and `-3` becomes `4294967294`.
+    set_variable(
+        environment,
+        "SHLVL",
+        &level.wrapping_add(1).cast_unsigned().to_string(),
+    );
     set_variable(environment, "PWD", cwd);
+}
+
+/// musl's `atoi`, which the guest's BusyBox uses: it skips leading whitespace, takes an
+/// optional sign and the digits that follow, wraps around on overflow, and stops at the first
+/// other character, so `7x` is 7 and a value without digits is 0.
+fn atoi(value: &str) -> i32 {
+    let value = value.trim_start_matches([' ', '\t', '\n', '\u{b}', '\u{c}', '\r']);
+    let (negative, digits) = match value.as_bytes().first() {
+        Some(b'-') => (true, &value[1..]),
+        Some(b'+') => (false, &value[1..]),
+        _ => (false, value),
+    };
+    let magnitude = digits
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(0i32, |n, digit| {
+            n.wrapping_mul(10).wrapping_add(i32::from(digit - b'0'))
+        });
+    if negative {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    }
 }
 
 struct Options {
