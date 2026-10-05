@@ -83,10 +83,12 @@ from nvx_tools.release import (
     verify_source_tree,
 )
 from nvx_tools.sandbox import (
+    MOUNT_OWNERS,
     SandboxLaunch,
     SandboxLayer,
     SandboxMount,
     parse_workload_identity,
+    require_mount_owner_supported,
 )
 
 DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
@@ -399,8 +401,13 @@ def command_run(args: argparse.Namespace) -> None:
         if args.mount.count(",") not in (1, 2):
             raise ScriptError("--mount must be GUEST_TARGET,HOST_PATH[,ro|rw]")
         command.extend(["--mount", args.mount])
+    elif args.mount_owner is not None:
+        raise ScriptError("--mount-owner requires --mount")
     for denied_path in args.mount_deny:
         command.extend(["--mount-deny", str(denied_path)])
+    if args.mount_owner is not None:
+        require_mount_owner_supported(args.mount_owner)
+        command.extend(["--mount-owner", args.mount_owner])
     _extend_network_arguments(
         command,
         args,
@@ -492,6 +499,8 @@ def command_sandbox(args: argparse.Namespace) -> None:
         )
     if args.mount_deny and args.mount is None:
         raise ScriptError("--mount-deny requires --mount")
+    if args.mount_owner is not None and args.mount is None:
+        raise ScriptError("--mount-owner requires --mount")
     if args.mount is not None and operation not in ("run", "provision"):
         raise ScriptError("--mount is only valid for sandbox run or provision")
     if operation in ("run", "provision"):
@@ -512,7 +521,11 @@ def command_sandbox(args: argparse.Namespace) -> None:
             mount=(
                 None
                 if args.mount is None
-                else SandboxMount.parse(args.mount, tuple(args.mount_deny))
+                else SandboxMount.parse(
+                    args.mount,
+                    tuple(args.mount_deny),
+                    args.mount_owner or "vmm",
+                )
             ),
         ).validated()
         _validate_sandbox_systemd_policy(launch)
@@ -878,6 +891,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument("--processors", type=int, choices=(1, 2, 4, 8), default=1)
     run.add_argument("--mount", help="GUEST_TARGET,HOST_PATH,ro|rw")
     run.add_argument("--mount-deny", action="append", type=Path, default=[])
+    run.add_argument(
+        "--mount-owner",
+        choices=MOUNT_OWNERS,
+        help=(
+            "host identity of the share's file operations: vmm (default) or "
+            "caller, with guest root squashed to the directory owner (Linux only)"
+        ),
+    )
     run.add_argument("--net", metavar="IPV4/PREFIX")
     run.add_argument("--network-profile", choices=NETWORK_PROFILES)
     run.add_argument("--network-egress", choices=("allow", "deny"))
@@ -1000,6 +1021,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=[],
         metavar="HOST_PATH",
         help="hide one existing path inside the --mount host directory",
+    )
+    sandbox.add_argument(
+        "--mount-owner",
+        choices=MOUNT_OWNERS,
+        help=(
+            "host identity of the share's file operations: vmm (default) or "
+            "caller, the workload identity with guest root squashed to the "
+            "directory owner (Linux only)"
+        ),
     )
     sandbox.add_argument("--net", metavar="IPV4/PREFIX")
     sandbox.add_argument("--network-profile", choices=NETWORK_PROFILES)

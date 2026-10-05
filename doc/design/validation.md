@@ -46,6 +46,11 @@ Denied-filesystem coverage verifies listing suppression, allowed writes,
 direct and parent-relative denial, symlink/junction alias denial, guest-created
 links into the denied subtree, a second
 virtio-fs mount, and pre-boot rejection of unsafe path policies.
+Caller-ownership coverage verifies that files guest root creates belong to the
+export owner, that squashed root cannot chown files or create device nodes,
+that a foreign guest identity fails with `EPERM` unless OpenVMM holds
+`CAP_SETUID` and `CAP_SETGID`, in which case it owns what it creates, and
+pre-boot rejection of a root-owned export or, on Windows, of the mode itself.
 The native suite targets KVM, MSHV, and WHP; a passing run on one backend is
 not a fresh result for the others.
 Coverage also includes
