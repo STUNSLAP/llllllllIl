@@ -14101,6 +14101,58 @@ class SharedFileTests(unittest.TestCase):
             with self.assertRaisesRegex(common.ScriptError, "symlink is not allowed"):
                 common.verify_sha256_sums(root)
 
+    def test_checksum_writer_rejects_trees_the_verifier_rejects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = root / "payload"
+            payload.write_bytes(b"payload")
+            nested = root / "nested" / "SHA256SUMS"
+            nested.parent.mkdir()
+            nested.write_bytes(b"nested")
+            common.write_sha256_sums(root)
+            self.assertIn(
+                "nested/SHA256SUMS",
+                dict(common.verify_sha256_sums(root).files),
+            )
+            checksums = (root / "SHA256SUMS").read_bytes()
+
+            link = root / "payload-link"
+            try:
+                link.symlink_to(payload)
+            except OSError as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+            with self.assertRaisesRegex(
+                common.ScriptError,
+                "symlink is not allowed in checksummed tree: payload-link",
+            ):
+                common.write_sha256_sums(root)
+            self.assertEqual((root / "SHA256SUMS").read_bytes(), checksums)
+
+            link.unlink()
+            (root / "SHA256SUMS").unlink()
+            (root / "SHA256SUMS").symlink_to(payload)
+            with self.assertRaisesRegex(
+                common.ScriptError,
+                "symlink is not allowed in checksummed tree: SHA256SUMS",
+            ):
+                common.write_sha256_sums(root)
+            self.assertEqual(payload.read_bytes(), b"payload")
+
+    def test_checksum_writer_rejects_special_files(self):
+        if sys.platform == "win32":
+            self.skipTest("FIFOs are unavailable on Windows")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            os.mkfifo(root / "pipe")
+
+            with self.assertRaisesRegex(
+                common.ScriptError,
+                "special file is not allowed in checksummed tree: pipe",
+            ):
+                common.write_sha256_sums(root)
+
+            self.assertFalse((root / "SHA256SUMS").exists())
+
     def test_release_archives_are_reproducible_with_fixed_layout_and_modes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
