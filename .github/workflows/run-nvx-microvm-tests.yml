@@ -22,7 +22,8 @@ on:
       debug-kernel:
         description: >-
           Run the same-host restore scenarios on the CI debug kernel instead
-          of the full suite and the Ubuntu tests
+          of the full suite and every other step that boots the production
+          kernel
         required: false
         type: boolean
         default: false
@@ -112,7 +113,7 @@ jobs:
           --output-dir "build/test-results/microvm-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}"
 
       - name: Run public managed execution configuration on Linux
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && !inputs.debug-kernel
         shell: bash
         run: >-
           python3 scripts/nvx.py test-microvm
@@ -121,7 +122,7 @@ jobs:
           --output-dir "build/test-results/public-exec-${{ inputs.backend }}"
 
       - name: Run public managed execution configuration on Windows
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !inputs.debug-kernel
         shell: powershell
         run: >-
           python scripts\nvx.py test-microvm
@@ -228,7 +229,7 @@ jobs:
             --memory-mib 256
 
       - name: Run Ubuntu sandbox live-share smoke test on Linux
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -289,7 +290,7 @@ jobs:
           rm -rf "${share}" "${scratch}" "${outside}"
 
       - name: Run Ubuntu sandbox managed live-share smoke test on Linux
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -379,7 +380,7 @@ jobs:
             --memory-mib 256
 
       - name: Run Ubuntu sandbox live-share smoke test on Windows
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !inputs.debug-kernel
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -456,7 +457,7 @@ jobs:
           Remove-Item -Recurse -Force $share, $scratch, $outside
 
       - name: Run Ubuntu sandbox managed live-share smoke test on Windows
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !inputs.debug-kernel
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"

@@ -132,6 +132,15 @@ def _workflow_step(workflow: str, job_name: str, step_name: str) -> str:
     return "\n".join(lines[start:end])
 
 
+def _workflow_steps(workflow: str, job_name: str) -> list[str]:
+    lines = _workflow_job(workflow, job_name).splitlines()
+    starts = [index for index, line in enumerate(lines) if line.startswith("      - ")]
+    return [
+        "\n".join(lines[start:end])
+        for start, end in zip(starts, starts[1:] + [len(lines)], strict=True)
+    ]
+
+
 def _yaml_field(configuration: str, field: str) -> list[str]:
     """Return the first value of a field, with one entry per literal block line."""
     lines = configuration.splitlines()
@@ -3125,16 +3134,40 @@ class CiConfigurationTests(unittest.TestCase):
             "if: inputs.debug-kernel",
             microvm_workflow[download - 120 : download],
         )
-        self.assertEqual(
-            microvm_workflow.count(
-                "${{ inputs.debug-kernel && '--debug-kernel' || '' }}"
-            ),
-            2,
-        )
-        # The debug run replaces the Ubuntu and Azure Linux guest tests and the
-        # crate lifecycle test, which boots the production kernel, rather than
-        # adding to them.
-        self.assertEqual(microvm_workflow.count("!inputs.debug-kernel"), 9)
+        debug_flag = "${{ inputs.debug-kernel && '--debug-kernel' || '' }}"
+        self.assertEqual(microvm_workflow.count(debug_flag), 2)
+        # The debug run replaces every production-kernel workload rather than
+        # adding to it: each step that drives nvx.py without the debug kernel
+        # flag boots build/vmlinux, so it must skip the debug jobs (#371).
+        guard = " && !inputs.debug-kernel"
+        debug_steps: list[str] = []
+        production_steps: list[str] = []
+        for step in _workflow_steps(microvm_workflow, "test"):
+            try:
+                script = _yaml_scalar(step, "run")
+            except AssertionError:
+                continue
+            if "nvx.py" not in script:
+                continue
+            name = _yaml_scalar(step, "name")
+            try:
+                step_condition = _yaml_scalar(step, "if")
+            except AssertionError:
+                step_condition = ""
+            with self.subTest(step=name):
+                if debug_flag in script:
+                    debug_steps.append(name)
+                    self.assertNotIn("debug-kernel", step_condition)
+                    continue
+                production_steps.append(name)
+                self.assertTrue(step_condition.endswith(guard), step_condition)
+                selector = step_condition.removesuffix(guard)
+                if "||" in selector:
+                    self.assertTrue(
+                        _outer_parentheses_enclose(selector), step_condition
+                    )
+        self.assertEqual(len(debug_steps), 2)
+        self.assertTrue(production_steps)
 
     def test_benchmarks_rely_on_the_microvm_correctness_jobs(self):
         # #286: the benchmark action ran a second smp-lapic gate before
