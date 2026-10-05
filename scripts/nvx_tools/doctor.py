@@ -35,6 +35,7 @@ from .time_abi import (
     QUALIFICATION_WARP_GAPS,
     WARP_BOUND_NS,
     WARP_PROBE_COMPLETION_MARKER,
+    HostCpu,
     TimeAbiFailure,
     TimeAbiMonitor,
     check_warp_probe,
@@ -98,6 +99,10 @@ CLOCKSOURCE_PATH = Path(
     "/sys/devices/system/clocksource/clocksource0/current_clocksource"
 )
 CPUINFO_PATH = Path("/proc/cpuinfo")
+# The processor that Windows reports, such as
+# "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel": the display family,
+# model, and stepping, and the CPUID vendor.
+WINDOWS_PROCESSOR = re.compile(r"Family (\d+) Model (\d+) Stepping (\d+), (\S+)")
 ADJTIMEX_TIME_ERROR = 5
 ADJTIMEX_STA_UNSYNC = 0x0040
 # Every H7 failure to read the host's synchronization state starts with this
@@ -254,12 +259,30 @@ def _windows_registry_value(key: str, name: str) -> object:
         return value
 
 
+def host_cpu_signature() -> HostCpu | None:
+    """Return the host CPU's vendor and display family, model, and stepping, as
+    the host OS reports them, or None where they cannot be read."""
+    try:
+        if host_is_windows():
+            match = WINDOWS_PROCESSOR.search(platform.processor())
+            if match is None:
+                return None
+            family, model, stepping, vendor = match.groups()
+        else:
+            cpuinfo = _linux_cpuinfo()
+            vendor = cpuinfo["vendor_id"]
+            family = cpuinfo["cpu family"]
+            model = cpuinfo["model"]
+            stepping = cpuinfo["stepping"]
+        return HostCpu(vendor, int(family), int(model), int(stepping))
+    except (OSError, KeyError, ValueError):
+        return None
+
+
 def host_cpu(context: DoctorContext) -> dict[str, str]:
     """Collect the host CPU identity and the host OS's view of its TSC."""
     if host_is_windows():
-        match = re.search(
-            r"Family (\d+) Model (\d+) Stepping (\d+), (\S+)", platform.processor()
-        )
+        match = WINDOWS_PROCESSOR.search(platform.processor())
         if match is None:
             raise ScriptError(f"cannot parse the processor {platform.processor()!r}")
         family, model, stepping, vendor = match.groups()

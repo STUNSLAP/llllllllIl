@@ -239,6 +239,68 @@ class FieldParsingTests(unittest.TestCase):
                 self.assertEqual(time_abi.is_catalog_profile_id(profile_id), catalog)
                 self.assertEqual(time_abi.is_host_profile_id(profile_id), host)
 
+    def test_guides_hosts_that_no_built_in_profile_serves(self):
+        tiger_lake = time_abi.HostCpu("GenuineIntel", 6, 140, 1)
+        guidance = time_abi.host_cpu_unsupported_guidance(None, tiger_lake)
+        assert guidance is not None
+        # The guidance says what a cold boot with auto does on the CPU, not
+        # which code ended this run, which run cannot read.
+        self.assertIn(
+            "this host's CPU, GenuineIntel 6/140/1, so a cold boot with "
+            "--cpu-profile auto, the default, fails on it with "
+            "E_PROFILE_HOST_UNKNOWN;",
+            guidance,
+        )
+        self.assertIn(time_abi.describe_cpu_generations(), guidance)
+        self.assertIn("rerun with --cpu-profile host", guidance)
+        self.assertIn("https://github.com/microsoft/nvx/issues/390", guidance)
+        self.assertEqual(
+            guidance, time_abi.host_cpu_unsupported_guidance("auto", tiger_lake)
+        )
+        # Host profiles serve Intel CPUs, so a host profile fails on this one
+        # for another reason, which OpenVMM's own error explains.
+        self.assertIsNone(time_abi.host_cpu_unsupported_guidance("host", tiger_lake))
+
+        # Host profiles cannot serve an AMD CPU either: no suggestion, with
+        # either request, and the issue that tracks AMD CPUs.
+        zen4 = time_abi.HostCpu("AuthenticAMD", 25, 17, 1)
+        guidance = time_abi.host_cpu_unsupported_guidance(None, zen4)
+        assert guidance is not None
+        self.assertIn(
+            "this host's CPU, AuthenticAMD 25/17/1, so a cold boot with "
+            "--cpu-profile auto, the default, fails on it with "
+            "E_PROFILE_HOST_UNKNOWN;",
+            guidance,
+        )
+        self.assertIn(time_abi.describe_cpu_generations(), guidance)
+        self.assertNotIn("rerun with", guidance)
+        self.assertIn("host CPU profiles serve only Intel CPUs", guidance)
+        self.assertIn("https://github.com/microsoft/nvx/issues/396", guidance)
+        self.assertNotIn("issues/390", guidance)
+        self.assertEqual(guidance, time_abi.host_cpu_unsupported_guidance("host", zen4))
+        # Another vendor gets the general issue.
+        guidance = time_abi.host_cpu_unsupported_guidance(
+            "auto", time_abi.HostCpu("HygonGenuine", 24, 0, 1)
+        )
+        assert guidance is not None
+        self.assertIn("host CPU profiles serve only Intel CPUs", guidance)
+        self.assertIn("https://github.com/microsoft/nvx/issues/390", guidance)
+
+        # A CPU that a built-in profile serves, an explicit profile, and an
+        # unknown CPU get none.
+        alder_lake = time_abi.HostCpu("GenuineIntel", 6, 154, 3)
+        for cpu_profile, host in (
+            (None, alder_lake),
+            ("host", alder_lake),
+            ("intel.alderlake.v1", tiger_lake),
+            ("intel.alderlake.v1", zen4),
+            (None, None),
+        ):
+            with self.subTest(cpu_profile=cpu_profile, host=host):
+                self.assertIsNone(
+                    time_abi.host_cpu_unsupported_guidance(cpu_profile, host)
+                )
+
     def test_computes_the_checks_cpu_time_budget(self):
         # The spec's final budgets: a base plus an increment per additional
         # CPU, one budget per backend and phase.
@@ -1681,6 +1743,47 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(fields["vendor_id"], "GenuineIntel")
         self.assertEqual(fields["model"], "85")
         self.assertIn("nonstop_tsc", fields["flags"])
+
+    def test_identifies_the_host_cpu_signature(self):
+        HostCpu = time_abi.HostCpu
+        with patch.object(doctor, "host_is_windows", return_value=True):
+            for processor, expected in (
+                (
+                    "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
+                    HostCpu("GenuineIntel", 6, 154, 3),
+                ),
+                (
+                    "AMD64 Family 25 Model 33 Stepping 0, AuthenticAMD",
+                    HostCpu("AuthenticAMD", 25, 33, 0),
+                ),
+                ("", None),
+            ):
+                with (
+                    self.subTest(processor=processor),
+                    patch.object(doctor.platform, "processor", return_value=processor),
+                ):
+                    self.assertEqual(doctor.host_cpu_signature(), expected)
+        cpuinfo = {
+            "vendor_id": "AuthenticAMD",
+            "cpu family": "25",
+            "model": "17",
+            "stepping": "1",
+        }
+        with patch.object(doctor, "host_is_windows", return_value=False):
+            for fields, expected in (
+                (cpuinfo, HostCpu("AuthenticAMD", 25, 17, 1)),
+                ({**cpuinfo, "model": "?"}, None),
+                ({"vendor_id": "AuthenticAMD"}, None),
+            ):
+                with (
+                    self.subTest(fields=fields),
+                    patch.object(doctor, "_linux_cpuinfo", return_value=fields),
+                ):
+                    self.assertEqual(doctor.host_cpu_signature(), expected)
+            with patch.object(
+                doctor, "_linux_cpuinfo", side_effect=FileNotFoundError("cpuinfo")
+            ):
+                self.assertIsNone(doctor.host_cpu_signature())
 
     def test_preflight_parses_openvmm_verification(self):
         # The line format of OpenVMM's openvmm_entry verify.rs.

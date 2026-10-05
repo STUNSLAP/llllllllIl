@@ -71,6 +71,7 @@ from nvx_tools.create_linux_source_archive import (
     configure_parser as configure_linux_source_archive_parser,
 )
 from nvx_tools.doctor import configure_parser as configure_doctor_parser
+from nvx_tools.doctor import host_cpu_signature
 from nvx_tools.egress_policy import compile_policy_file
 from nvx_tools.guests import GUEST_NAMES, guest_descriptor
 from nvx_tools.microvm_tests import configure_parser as configure_microvm_test_parser
@@ -90,6 +91,7 @@ from nvx_tools.sandbox import (
     parse_workload_identity,
     require_mount_owner_supported,
 )
+from nvx_tools.time_abi import host_cpu_unsupported_guidance
 
 DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
 HYPERVISORS = ("auto", "whp", "kvm", "mshv")
@@ -397,6 +399,8 @@ def command_run(args: argparse.Namespace) -> None:
         )
         if args.memory_capacity_mib is not None:
             command.extend(["--memory-capacity", f"{args.memory_capacity_mib}M"])
+    if args.cpu_profile is not None:
+        command.extend(["--cpu-profile", args.cpu_profile])
     if args.mount is not None:
         if args.mount.count(",") not in (1, 2):
             raise ScriptError("--mount must be GUEST_TARGET,HOST_PATH[,ro|rw]")
@@ -420,7 +424,24 @@ def command_run(args: argparse.Namespace) -> None:
         command.extend(["--cmdline", args.cmdline])
     print(f">> {_format_command(command)}")
     if not args.dry_run:
-        raise SystemExit(subprocess.run(command).returncode)
+        raise SystemExit(
+            _run_openvmm(command, args.cpu_profile, args.restore_snapshot is None)
+        )
+
+
+def _run_openvmm(command: list[str], cpu_profile: str | None, cold_boot: bool) -> int:
+    """Run OpenVMM on the terminal, and explain the next steps when a cold boot
+    fails on a host whose CPU no built-in CPU profile serves.
+
+    OpenVMM keeps all three standard streams: it restores the terminal settings
+    that its console changes only when its standard error is a terminal, and
+    writes its log for a terminal there."""
+    returncode = subprocess.run(command).returncode
+    if returncode != 0 and cold_boot:
+        guidance = host_cpu_unsupported_guidance(cpu_profile, host_cpu_signature())
+        if guidance is not None:
+            print(guidance, file=sys.stderr)
+    return returncode
 
 
 def command_sandbox(args: argparse.Namespace) -> None:
@@ -889,6 +910,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     run.add_argument("--memory-capacity-mib", type=int)
     run.add_argument("--processors", type=int, choices=(1, 2, 4, 8), default=1)
+    run.add_argument(
+        "--cpu-profile",
+        metavar="ID",
+        help=(
+            "OpenVMM CPU profile: auto (OpenVMM's default) for the built-in "
+            "profile of the host's CPU, a built-in profile ID, or host to "
+            "derive a development profile from this host (doc/usage.md)"
+        ),
+    )
     run.add_argument("--mount", help="GUEST_TARGET,HOST_PATH,ro|rw")
     run.add_argument("--mount-deny", action="append", type=Path, default=[])
     run.add_argument(

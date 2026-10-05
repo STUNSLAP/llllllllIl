@@ -501,10 +501,11 @@ and executable (boot check `K1`).
 highest revision of the single pinned profile whose generation covers the
 host's vendor, family, model, and stepping as the VMM's host OS sees them (the
 L1 view on Azure). No match, or matches in more than one generation, is
-`E_PROFILE_HOST_UNKNOWN`, naming the host's signature and the available IDs;
-`auto` never falls back to a host profile, and host CPUID passthrough does not
-exist. A restore always uses the profile recorded in the snapshot; an explicit
-`--cpu-profile` must name the same profile, or be `host` for a host profile
+`E_PROFILE_HOST_UNKNOWN`, naming the host's signature and the available IDs,
+and, on an Intel CPU, pointing to `--cpu-profile host`; `auto` never falls
+back to a host profile, and host CPUID passthrough does not exist. A restore
+always uses the profile recorded in the snapshot; an explicit `--cpu-profile`
+must name the same profile, or be `host` for a host profile
 (`E_PROFILE_UNKNOWN`).
 
 **Host profiles.** `--cpu-profile host` is an

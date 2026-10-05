@@ -65,6 +65,7 @@ from nvx_tools.build_constants import (  # noqa: E402
     UbuntuBuildConstants,
     ZstdBuildConstants,
 )
+from nvx_tools.time_abi import HostCpu  # noqa: E402
 
 
 def _workflow_job(workflow: str, job_name: str) -> str:
@@ -1680,6 +1681,141 @@ class CliTests(unittest.TestCase):
             command[command.index("--microvm-report") + 1],
             "outcome.json",
         )
+
+    def test_run_forwards_the_cpu_profile(self):
+        def launched(*extra: str) -> list[str]:
+            args = nvx.parse_args(["run", *extra, "--dry-run"])
+            with (
+                patch.object(nvx, "require_file", return_value=Path("artifact")),
+                patch.object(
+                    nvx, "_format_command", return_value="formatted"
+                ) as format_command,
+            ):
+                nvx.command_run(args)
+            return format_command.call_args.args[0]
+
+        # Without the option, OpenVMM selects auto itself.
+        self.assertNotIn("--cpu-profile", launched())
+        for profile in ("host", "auto", "intel.alderlake.v1"):
+            command = launched("--cpu-profile", profile)
+            self.assertEqual(command[command.index("--cpu-profile") + 1], profile)
+        restored = launched("--restore-snapshot", "snapshot", "--cpu-profile", "host")
+        self.assertEqual(restored[restored.index("--cpu-profile") + 1], "host")
+
+    def test_run_explains_a_host_cpu_that_no_profile_serves(self):
+        tiger_lake = HostCpu("GenuineIntel", 6, 140, 1)
+        zen3 = HostCpu("AuthenticAMD", 25, 33, 0)
+
+        def run(
+            returncode: int,
+            cpu_profile: str | None,
+            cold_boot: bool = True,
+            host: HostCpu | None = tiger_lake,
+        ) -> tuple[int, str]:
+            stderr = io.StringIO()
+            completed = subprocess.CompletedProcess[bytes](["openvmm"], returncode)
+            with (
+                patch.object(nvx.sys, "stderr", stderr),
+                patch.object(nvx.subprocess, "run", return_value=completed) as launch,
+                patch.object(nvx, "host_cpu_signature", return_value=host),
+            ):
+                status = nvx._run_openvmm(  # pyright: ignore[reportPrivateUsage]
+                    ["openvmm"], cpu_profile, cold_boot
+                )
+            # OpenVMM keeps the terminal, its standard error included.
+            launch.assert_called_once_with(["openvmm"])
+            return status, stderr.getvalue()
+
+        status, output = run(1, None)
+        self.assertEqual(status, 1)
+        self.assertIn(
+            "nvx: no built-in CPU profile serves this host's CPU, "
+            "GenuineIntel 6/140/1, so a cold boot with --cpu-profile auto, the "
+            "default, fails on it with E_PROFILE_HOST_UNKNOWN;",
+            output,
+        )
+        self.assertIn("alderlake 6/151 and 6/154", output)
+        self.assertIn("rerun with --cpu-profile host", output)
+        self.assertIn("https://github.com/microsoft/nvx/issues/390", output)
+        self.assertEqual(run(1, "auto"), (1, output))
+        # Host profiles serve only Intel CPUs, so an AMD host gets no such
+        # suggestion, with either request, but the issue that tracks AMD.
+        status, output = run(1, None, host=zen3)
+        self.assertIn("AuthenticAMD 25/33/0", output)
+        self.assertNotIn("rerun with --cpu-profile host", output)
+        self.assertIn("host CPU profiles serve only Intel CPUs", output)
+        self.assertIn("https://github.com/microsoft/nvx/issues/396", output)
+        self.assertEqual(run(1, "host", host=zen3), (1, output))
+        # Successful runs, restores, other requests and CPUs, and an unknown
+        # CPU get no guidance.
+        for returncode, cpu_profile, cold_boot, host in (
+            (0, None, True, tiger_lake),
+            (1, None, False, tiger_lake),
+            (1, "host", True, tiger_lake),
+            (1, "intel.alderlake.v1", True, tiger_lake),
+            (1, None, True, HostCpu("GenuineIntel", 6, 154, 3)),
+            (1, None, True, None),
+        ):
+            with self.subTest(
+                returncode=returncode,
+                cpu_profile=cpu_profile,
+                cold_boot=cold_boot,
+                host=host,
+            ):
+                self.assertEqual(
+                    run(returncode, cpu_profile, cold_boot, host), (returncode, "")
+                )
+
+    def test_run_leaves_openvmm_the_terminal_to_restore(self):
+        """A guest-triggered shutdown can end OpenVMM while its console holds
+        the terminal in raw mode, and OpenVMM restores the terminal settings
+        only when its standard error is a terminal, so run must leave it
+        one."""
+        if sys.platform != "linux":
+            self.skipTest("needs a Linux pseudo-terminal")
+        import pty
+        import termios
+
+        openvmm = (
+            "import os, termios, tty\n"
+            # OpenVMM saves the settings through standard error, if it is a
+            # terminal, and its console makes standard input raw...
+            "saved = termios.tcgetattr(2) if os.isatty(2) else None\n"
+            "tty.setraw(0)\n"
+            # ...until the guest shuts down.
+            "if saved is not None:\n"
+            "    termios.tcsetattr(2, termios.TCSAFLUSH, saved)\n"
+        )
+        runner = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
+            "import nvx\n"
+            "sys.exit(nvx._run_openvmm("
+            f"[sys.executable, '-c', {openvmm!r}], None, cold_boot=False))\n"
+        )
+        primary, secondary = pty.openpty()
+        try:
+            before = termios.tcgetattr(secondary)
+            completed = subprocess.run(
+                [sys.executable, "-c", runner],
+                stdin=secondary,
+                stdout=secondary,
+                stderr=secondary,
+                timeout=60,
+                check=False,
+            )
+            after = termios.tcgetattr(secondary)
+            output = b""
+            while select.select([primary], [], [], 0)[0]:
+                chunk = os.read(primary, 65536)
+                if not chunk:
+                    break
+                output += chunk
+        finally:
+            os.close(secondary)
+            os.close(primary)
+        self.assertEqual(completed.returncode, 0, output.decode(errors="replace"))
+        self.assertEqual(after, before, "the terminal was left in raw mode")
 
     def test_run_exposes_restore_readiness(self):
         args = nvx.parse_args(

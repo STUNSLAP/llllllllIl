@@ -425,6 +425,7 @@ python3 scripts/nvx.py run
     [--memory-mib MIB]
     [--memory-capacity-mib MIB]
     [--processors {1,2,4,8}]
+    [--cpu-profile ID]
     [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]
     [--mount-deny HOST_PATH]...
     [--mount-owner {vmm,caller}]
@@ -455,6 +456,7 @@ python3 scripts/nvx.py run
 | `--memory-mib MIB` | guest-specific | Set guest memory in MiB. Defaults to 128 for Alpine, 512 for Ubuntu, and 512 for Azure Linux. |
 | `--memory-capacity-mib MIB` | none | Reserve an immutable, 128 MiB-aligned RAM capacity for a fresh microVM snapshot. |
 | `--processors {1,2,4,8}` | `1` | Select the microVM processor count. |
+| `--cpu-profile ID` | `auto` | Select the guest's [CPU profile](#cpu-profiles): `auto` for the built-in profile of the host's CPU, a built-in profile ID, or `host` for a development profile derived from this host. A restore uses the snapshot's profile, which `auto` and, for a host profile, `host` also name. |
 | `--mount GUEST_TARGET,HOST_PATH[,ro\|rw]` | none | Expose one host directory to the absolute guest target. An `rw` mapping accepts guest-created symbolic links, which the host never follows. Active snapshot restore requires the same canonical path, target, mode, and ownership mode; a dormant-slot restore may attach a new mapping that the resumed guest mounts explicitly. |
 | `--mount-deny HOST_PATH` | none | Hide one existing file or directory inside the mounted host root; repeat to deny multiple paths. |
 | `--mount-owner {vmm,caller}` | `vmm` | Select the host identity of the guest's operations on the `--mount` directory. `caller` performs each one as the guest caller's UID and GID and squashes guest root to the directory owner; it requires a Linux host. See [Run](run.md#file-ownership). |
@@ -480,6 +482,13 @@ The command requires the OpenVMM release binary, `build/vmlinux`, and the
 selected `build/initramfs*.cpio.gz`. Ubuntu selection never falls back to
 Alpine. See [Run](run.md) for host setup, guest shutdown, networking, and
 virtio-fs examples.
+
+If no built-in CPU profile serves the host's CPU, OpenVMM exits with
+`E_PROFILE_HOST_UNKNOWN` before it creates the VM. After a failed cold boot on
+such a CPU, `run` names the CPU, lists the CPUs that the built-in profiles
+cover, and gives the next steps described in [CPU profiles](#cpu-profiles),
+suggesting `--cpu-profile host` only on an Intel CPU. OpenVMM's own error,
+above the guidance, names the cause of the failure.
 
 ### `sandbox`
 
@@ -563,6 +572,50 @@ launches.
 
 See [Run](run.md) for artifact preparation, the security boundary, and current
 snapshot/configuration limitations.
+
+## CPU profiles
+
+Every microVM presents a CPU profile to its guest: the complete CPUID surface
+of one CPU generation, which OpenVMM pins and every backend shares (see the
+[time ABI](design/time-abi.md#cpu-profiles)). By default, OpenVMM selects the
+built-in profile of the host's CPU generation:
+
+| Profile | Generation | CPUs (display family/model) |
+| --- | --- | --- |
+| `intel.skylake-sp.v1` | `skylake-sp` | Intel Xeon Scalable, first generation (6/85, steppings 0 to 4) |
+| `intel.icelake-sp.v1` | `icelake-sp` | Intel Xeon Scalable, third generation (6/106) |
+| `intel.emeraldrapids.v1` | `emeraldrapids` | Intel Xeon Scalable, fifth generation (6/207) |
+| `intel.alderlake.v1` | `alderlake` | Intel Core, twelfth generation (6/151 and 6/154) |
+
+Any other CPU, including Cascade Lake, Sapphire Rapids, Tiger Lake, Raptor
+Lake, and every AMD CPU, fails with `E_PROFILE_HOST_UNKNOWN`. A host of a
+listed generation can still fail with `E_PROFILE_UNSUPPORTED` if its SKU or
+hypervisor lacks a feature of the profile: `intel.alderlake.v1` derives from
+one Core i9-12900H on WHP, so Alder Lake hosts on KVM, and SKUs without its
+features, are unverified.
+
+On an Intel development host that no built-in profile serves, `run
+--cpu-profile host` opts in to a host profile, `intel.host.v1`. OpenVMM
+fingerprints the hypervisor on this host and applies the built-in profiles'
+derivation policy to it, so the guest sees the same kind of filtered CPU
+surface, and verifies it as it verifies a built-in profile: a cold boot still
+fails with `E_PROFILE_UNSUPPORTED` if the hypervisor lacks a CPU feature that
+the time ABI requires. A host profile is for development only:
+
+- It is not pinned: a microcode, firmware, hypervisor, or OS update can change
+  it.
+- Each cold boot fingerprints the hypervisor first, which adds a few to tens
+  of milliseconds, depending on the hypervisor.
+- A snapshot records its host profile, and restores only on a host with the
+  same CPU model and stepping whose hypervisor supports the profile.
+- `doctor` never qualifies it, so benchmark and CI hosts need a built-in
+  profile.
+
+[#390](https://github.com/microsoft/nvx/issues/390) tracks built-in profiles
+for more CPUs, and [#396](https://github.com/microsoft/nvx/issues/396)
+profiles for AMD CPUs, which host profiles do not serve either. A profile
+derives from fingerprints of its generation's hosts on every backend that it
+serves; see `vmm_core/cpu_profile` in the OpenVMM submodule.
 
 ## Benchmarking
 
