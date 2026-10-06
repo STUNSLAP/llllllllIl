@@ -487,8 +487,11 @@ If no built-in CPU profile serves the host's CPU, OpenVMM exits with
 `E_PROFILE_HOST_UNKNOWN` before it creates the VM. After a failed cold boot on
 such a CPU, `run` names the CPU, lists the CPUs that the built-in profiles
 cover, and gives the next steps described in [CPU profiles](#cpu-profiles),
-suggesting `--cpu-profile host` only on an Intel CPU. OpenVMM's own error,
-above the guidance, names the cause of the failure.
+suggesting `--cpu-profile host` only on an Intel or AMD CPU. OpenVMM's own
+error, above the guidance, names the cause of the failure. A host whose
+hypervisor does not support its built-in profile fails with
+`E_PROFILE_UNSUPPORTED` instead, and on an Intel or AMD CPU OpenVMM's error
+itself names `--cpu-profile host`.
 
 ### `sandbox`
 
@@ -586,16 +589,24 @@ built-in profile of the host's CPU generation:
 | `intel.icelake-sp.v1` | `icelake-sp` | Intel Xeon Scalable, third generation (6/106) |
 | `intel.emeraldrapids.v1` | `emeraldrapids` | Intel Xeon Scalable, fifth generation (6/207) |
 | `intel.alderlake.v1` | `alderlake` | Intel Core, twelfth generation (6/151 and 6/154) |
+| `amd.milan.v1` | `milan` | AMD EPYC, third generation (25/1, Milan-X included) |
 
 Any other CPU, including Cascade Lake, Sapphire Rapids, Tiger Lake, Raptor
-Lake, and every AMD CPU, fails with `E_PROFILE_HOST_UNKNOWN`. A host of a
-listed generation can still fail with `E_PROFILE_UNSUPPORTED` if its SKU or
-hypervisor lacks a feature of the profile: `intel.alderlake.v1` derives from
-one Core i9-12900H on WHP, so Alder Lake hosts on KVM, and SKUs without its
-features, are unverified.
+Lake, and AMD's Genoa and Ryzen CPUs, fails with `E_PROFILE_HOST_UNKNOWN`. A
+host of a listed generation can still fail with `E_PROFILE_UNSUPPORTED` if its
+SKU or hypervisor lacks a feature of the profile, and on an Intel or AMD CPU
+OpenVMM's error then names `--cpu-profile host`: `intel.alderlake.v1` derives
+from one Core i9-12900H on WHP, and `amd.milan.v1` from one EPYC 7763 Azure
+VM on WHP, so Alder Lake and Milan hosts on KVM and MSHV, and SKUs without
+their features, are unverified. The Milan profile leaves out what KVM cannot
+present, `BTC_NO` and PSFD without a `SPEC_CTRL` control, and presents none
+of the speculation controls that the Azure VM's WHP withholds, so its Linux
+guests use retpolines and report SSB, SRSO, and TSA as vulnerable on every
+host.
 
-On an Intel development host that no built-in profile serves, `run
---cpu-profile host` opts in to a host profile, `intel.host.v1`. OpenVMM
+On an Intel or AMD development host that no built-in profile serves, or whose
+hypervisor does not support its built-in profile, `run --cpu-profile host`
+opts in to a host profile, `intel.host.v1` or `amd.host.v1`. OpenVMM
 fingerprints the hypervisor on this host and applies the built-in profiles'
 derivation policy to it, so the guest sees the same kind of filtered CPU
 surface, and verifies it as it verifies a built-in profile: a cold boot still
@@ -612,10 +623,10 @@ the time ABI requires. A host profile is for development only:
   profile.
 
 [#390](https://github.com/microsoft/nvx/issues/390) tracks built-in profiles
-for more CPUs, and [#396](https://github.com/microsoft/nvx/issues/396)
-profiles for AMD CPUs, which host profiles do not serve either. A profile
-derives from fingerprints of its generation's hosts on every backend that it
-serves; see `vmm_core/cpu_profile` in the OpenVMM submodule.
+for more CPUs, and [#396](https://github.com/microsoft/nvx/issues/396) for
+more AMD CPUs; host profiles serve no CPU of another vendor than Intel and
+AMD. A profile derives from fingerprints of its generation's hosts on every
+backend that it serves; see `vmm_core/cpu_profile` in the OpenVMM submodule.
 
 ## Benchmarking
 

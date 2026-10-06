@@ -53,7 +53,8 @@ Non-goals:
 - TSC scaling and RDTSC trapping.
 - Paravirtual clocks: kvmclock, the Hyper-V reference TSC page and reference
   counter, synthetic timers, VMGenID, and VMClock.
-- A virtual PMU. AMD profiles are deferred until an AMD host is registered.
+- A virtual PMU.
+- CPUs of vendors other than Intel and AMD, such as Hygon's.
 - Live migration, standard-machine guests, and guests other than the NVX
   Linux 6.18 kernel.
 - Snapshots older than manifest version 6. They are rejected with a recapture
@@ -145,6 +146,27 @@ booting from the PCAT BIOS, and standard-machine partitions keep those
 stubs. Linux 6.18 never accesses them. A fault on an MSR that the guest
 kernel accesses unchecked logs `unchecked MSR access error`, which the boot
 check (`C4`) and the violation watcher (`G_UNCHECKED_MSR`) reject.
+
+Under an AMD CPU profile, OpenVMM also serves two of AMD's configuration
+MSRs on every backend, with fixed values
+(`virt::time_abi::msr::AMD_CONFIG_MSRS`):
+
+| MSR | Name | Read | Write |
+| --- | --- | --- | --- |
+| `0xc0010015` | `HWCR` | `0x1000000`: only `TscFreqSel` (bit 24) | The value read changes nothing; any other value #GP |
+| `0xc0011029` | `DE_CFG` | `0x2`: only `LFENCE` serialization (bit 1) | The value read changes nothing; any other value #GP |
+
+Linux reads `HWCR` with an unchecked `rdmsr` on every AMD CPU with an
+invariant TSC, which the time ABI's CPUID always presents, and logs
+`[Firmware Bug]: TSC doesn't count with P0 frequency!` unless `TscFreqSel`
+is set. It sets `DE_CFG`'s `LFENCE` serialization bit, with safe accessors,
+on every CPU whose CPUID does not enumerate it, and relies on a serializing
+`LFENCE` to order `RDTSC`. It writes neither MSR on a profile's CPU: only
+the instructions-retired counter and CPUID faulting would make it, and the
+profiles clear both. KVM's MSR filter denies both MSRs, MSHV intercepts
+them, and WHP delivers them as unhandled-MSR exits. Booting Linux 6.18 on 4
+vCPUs on WHP reads `HWCR` once, on the BSP, and `DE_CFG` once per vCPU.
+Under an Intel profile, both keep the backend's handling.
 
 ### CPU time bits
 
@@ -275,9 +297,9 @@ settled cell on the registered hosts.
 
 | Obligation | KVM | MSHV | WHP |
 | --- | --- | --- | --- |
-| Identity CPUID (exact leaves, out-of-range rule) | `KVM_SET_CPUID2` with the identity and explicit zero leaves; every KVM `0x4xxxxxxx` entry removed. Other leaves in the range return KVM's Intel out-of-range result | No synthetic processor features, so the hypervisor reports no `0x400000xx` leaves; CPUID intercept results (`always_override`) for the identity leaves, while the explicit zero leaves already read zero in VP 0's view and get none (see the next row); preflight reads every entry back and requires VP 0 to read zero at six sentinel leaves (`0x40000006`, `0x40000081`, `0x400000ff`, `0x40000100`, `0x40000200`, and `0x4000ff00`) | CPUID exits for the six identity leaves, served from OpenVMM's table; with synthetic features off, WHP returns zero natively for `0x40000006..=0x400000ff` and the bases from `0x40000100`, which preflight asserts |
-| Profile CPUID and time bits | `KVM_SET_CPUID2` with the effective CPUID. KVM 6.3 and newer hide invariant TSC while KVM's own `HV_X64_MSR_TSC_INVARIANT_CONTROL` is 0, so the backend mirrors the guest-visible value, which core saves with the VM, into it with a host-initiated `KVM_SET_MSRS` after every accepted guest write and before a VP runs after a restore or reset; without it the guest loses `constant_tsc` and `nonstop_tsc` and boots about 160 ms slower | Processor feature banks derived from the profile (`hv_banks`), plus a CPUID intercept result (`always_override`, subleaf-specific where the entry has a subleaf) for every partition-wide entry of the effective CPUID that VP 0's own view does not already present under its mask. Once VP 0 exists, one bulk `HvCallGetVpCpuidValues` reads every partition-wide entry before any result is registered, and a failed bulk read registers every entry. That leaves 11 of 61 entries on the bare-metal host (the hypervisor bit, one leaf-2 descriptor byte, ARAT, the six identity leaves, and two brand leaves) and 12 of 65 on the nested Azure host (the same plus invariant TSC), at every vCPU count, because VP 0's own view already presents leaf 4's shared L3; registering them, the read included, takes 63 to 71 µs and about 90 µs, against 200 and about 300 µs for every entry. Profile masks never cover runtime-owned or VM-owned bits, so a pinned value that VP 0 presents at reset it presents always. Reserved entries pass through from the hypervisor's guest view, which reads zero at every one with no result registered, and verification requires every candidate to read zero (`E_CPU_UNLISTED`). Per-VP fields cannot be left to the hypervisor: it does not implement `0xB` for these partitions and reads `EDX` as 0 on every VP, so Linux would log `APIC ID mismatch` (`G_APIC_ID_MISMATCH`). The `0xB` and `0x1F` entries are therefore per-VP intercept results with the VP's x2APIC ID in `EDX`, registered as each VP is created: the hypervisor refuses a per-VP result for a VP that does not exist yet (`InvalidVpIndex`). Leaf 1's initial APIC ID is the hypervisor's own, which is correct | Processor feature banks derived from the profile (`hv_banks`), and every effective-CPUID entry outside the hypervisor range as a `CpuidResultList2` result (the banks cannot express the hypervisor bit, ARAT, or, on Azure, invariant TSC); reserved entries pass through from WHP's guest view, which verification requires to be zero (`E_CPU_UNLISTED`). CPUID exits only for the identity leaves and the leaves with per-VP APIC fields (`1`, `0xB`, and, where listed, `0x1F` and `0x8000001E`), 8 exits for every v1 profile: each exit-list entry adds about 25 µs to partition setup, and the legacy 269-entry list cost about 7 ms per restore. The exit handler presents the effective CPUID's `0xB` terminator, with the VP's x2APIC ID, instead of zeroing subleaves from 2 |
-| Identity MSRs routed to OpenVMM | `KVM_CAP_X86_USER_SPACE_MSR` (`UNKNOWN`, `FILTER`) and `KVM_X86_SET_MSR_FILTER` denying reads and writes of `0x40000000..=0x400001ff`; the filter takes precedence over KVM's in-kernel Hyper-V MSRs. A Linux boot takes four MSR exits, all on the BSP, at any vCPU count | MSR-index intercepts (`HV_INTERCEPT_TYPE_X64_MSR_INDEX`, `READ_WRITE`) for `0x40000002`, `0x40000022`, `0x40000023`, and `0x40000118`. The hypervisor itself raises #GP for writes to the three read-only MSRs and for every other MSR in the range. Native synthetic MSRs are forbidden: they pre-empt the intercepts, and the native `HV_X64_MSR_TSC_FREQUENCY` returns the destination's rate instead of `F`. Verified on hypervisor builds 26100.30000 (bare metal) and 26100.9444 (Azure) | `X64MsrExitBitmap` with `UnhandledMsrs` (capability `0x3f` on every host) and the offloaded APIC, no synthetic features and no `hv1_emulator`: the identity MSRs exit to OpenVMM, which raises #GP for every other MSR in the range |
+| Identity CPUID (exact leaves, out-of-range rule) | `KVM_SET_CPUID2` with the identity and explicit zero leaves; every KVM `0x4xxxxxxx` entry removed. Other leaves in the range return KVM's out-of-range result: Intel's under an Intel profile, and zero under an AMD one, as KVM answers a guest whose CPUID vendor is AMD | No synthetic processor features, so the hypervisor reports no `0x400000xx` leaves; CPUID intercept results (`always_override`) for the identity leaves, while the explicit zero leaves already read zero in VP 0's view and get none (see the next row); preflight reads every entry back and requires VP 0 to read zero at six sentinel leaves (`0x40000006`, `0x40000081`, `0x400000ff`, `0x40000100`, `0x40000200`, and `0x4000ff00`) | CPUID exits for the six identity leaves, served from OpenVMM's table; with synthetic features off, WHP returns zero natively for `0x40000006..=0x400000ff` and the bases from `0x40000100`, which preflight asserts |
+| Profile CPUID and time bits | `KVM_SET_CPUID2` with the effective CPUID. KVM 6.3 and newer hide invariant TSC while KVM's own `HV_X64_MSR_TSC_INVARIANT_CONTROL` is 0, so the backend mirrors the guest-visible value, which core saves with the VM, into it with a host-initiated `KVM_SET_MSRS` after every accepted guest write and before a VP runs after a restore or reset; without it the guest loses `constant_tsc` and `nonstop_tsc` and boots about 160 ms slower | Processor feature banks derived from the profile (`hv_banks`), plus a CPUID intercept result (`always_override`, subleaf-specific where the entry has a subleaf) for every partition-wide entry of the effective CPUID that VP 0's own view does not already present under its mask. Once VP 0 exists, one bulk `HvCallGetVpCpuidValues` reads every partition-wide entry before any result is registered, and a failed bulk read registers every entry. That leaves 11 of 61 entries on the bare-metal host (the hypervisor bit, one leaf-2 descriptor byte, ARAT, the six identity leaves, and two brand leaves) and 12 of 65 on the nested Azure host (the same plus invariant TSC), at every vCPU count, because VP 0's own view already presents leaf 4's shared L3; registering them, the read included, takes 63 to 71 µs and about 90 µs, against 200 and about 300 µs for every entry. Profile masks never cover runtime-owned or VM-owned bits, so a pinned value that VP 0 presents at reset it presents always. Reserved entries pass through from the hypervisor's guest view, which reads zero at every one with no result registered, and verification requires every candidate to read zero (`E_CPU_UNLISTED`). Per-VP fields cannot be left to the hypervisor: it does not implement `0xB` for these partitions and reads `EDX` as 0 on every VP, so Linux would log `APIC ID mismatch` (`G_APIC_ID_MISMATCH`). The `0xB` and `0x1F` entries are therefore per-VP intercept results with the VP's x2APIC ID in `EDX`, registered as each VP is created: the hypervisor refuses a per-VP result for a VP that does not exist yet (`InvalidVpIndex`). Under an AMD profile, so is `0x8000001E`, with the VP's extended APIC, compute unit, and node IDs (no AMD MSHV host has run it yet). Leaf 1's initial APIC ID is the hypervisor's own, which is correct | Processor feature banks derived from the profile (`hv_banks`), and every effective-CPUID entry outside the hypervisor range as a `CpuidResultList2` result (the banks cannot express the hypervisor bit, ARAT, or, on Azure, invariant TSC); reserved entries pass through from WHP's guest view, which verification requires to be zero (`E_CPU_UNLISTED`). CPUID exits only for the identity leaves and the leaves with per-VP APIC fields (`1`, `0xB`, and, where listed, `0x1F` and `0x8000001E`), 8 exits for every Intel v1 profile and 9 for `amd.milan.v1`: each exit-list entry adds about 25 µs to partition setup, and the legacy 269-entry list cost about 7 ms per restore. The exit handler presents the effective CPUID's `0xB` terminator, with the VP's x2APIC ID, instead of zeroing subleaves from 2 |
+| Identity MSRs routed to OpenVMM | `KVM_CAP_X86_USER_SPACE_MSR` (`UNKNOWN`, `FILTER`) and `KVM_X86_SET_MSR_FILTER` denying reads and writes of `0x40000000..=0x400001ff`, and under an AMD profile of `HWCR` and `DE_CFG` (see [MSRs](#msrs)); the filter takes precedence over KVM's in-kernel Hyper-V MSRs. Under an Intel profile, a Linux boot takes four MSR exits, all on the BSP, at any vCPU count; under an AMD profile, it also reads `HWCR` once, on the BSP, and `DE_CFG` once on each vCPU, so it takes 4 + 1 + N exits on N vCPUs (counted on WHP; no AMD KVM host has run it) | MSR-index intercepts (`HV_INTERCEPT_TYPE_X64_MSR_INDEX`, `READ_WRITE`) for `0x40000002`, `0x40000022`, `0x40000023`, and `0x40000118`, and under an AMD profile for `HWCR` and `DE_CFG`. The hypervisor itself raises #GP for writes to the three read-only MSRs and for every other MSR in the range. Native synthetic MSRs are forbidden: they pre-empt the intercepts, and the native `HV_X64_MSR_TSC_FREQUENCY` returns the destination's rate instead of `F`. Verified on hypervisor builds 26100.30000 (bare metal) and 26100.9444 (Azure) | `X64MsrExitBitmap` with `UnhandledMsrs` (capability `0x3f` on every host) and the offloaded APIC, no synthetic features and no `hv1_emulator`: the identity MSRs exit to OpenVMM, which raises #GP for every other MSR in the range; `HWCR` and `DE_CFG` exit too, and OpenVMM serves them under an AMD profile |
 | Native rate `F_d` | `KVM_GET_TSC_KHZ` × 1000 on VP 0 (1 kHz granularity) | `ProcessorClockFrequency` partition property | `WHvCapabilityCodeProcessorClockFrequency` |
 | No TSC scaling | Never `KVM_SET_TSC_KHZ`; every vCPU reports the host rate | No frequency override | No `ProcessorClockFrequency` partition property; the 1 GHz request is removed |
 | LAPIC rate `L` | In-kernel LAPIC at 1 GHz; `KVM_CAP_X86_APIC_BUS_CYCLES_NS` never set | The hypervisor's LAPIC at 200 MHz | Offloaded APIC at its fixed 200 MHz, verified at preflight (setting `InterruptClockFrequency` is not supported); the emulated APIC is not used |
@@ -329,6 +351,9 @@ immutable once released. A normative change creates a new revision; released
 revisions are never deleted, so old snapshots stay restorable. One surface
 serves all three backends: MSHV and WHP derive their processor feature banks
 from the profile's CPUID (`cpu_profile::hv_banks`) instead of from the host's,
+reading each feature where the profile's vendor enumerates it (AMD CPUs
+enumerate the speculation controls in `0x80000008` EBX and SVM in
+`0x80000001` ECX, and Intel's `PREFETCHW` feature controls no AMD bit),
 and each backend verifies at partition creation that it supports the profile.
 Every backend programs the whole surface explicitly and never relies on
 hypervisor defaults; WHP's default processor features, for example, omit
@@ -361,7 +386,7 @@ document in pretty form.
 | `id` | `<vendor>.<generation>.v<revision>`, each component `[a-z0-9-]+`, for example `intel.icelake-sp.v1` |
 | `description` | Free text |
 | `vendor` | The 12-byte CPUID vendor string |
-| `generation` | The generation `name` (`skylake-sp`, `icelake-sp`, `emeraldrapids`, or `alderlake`; `host` for a host profile, see **Host profiles**) and its `cpus`: `(family, model, stepping range)` display signatures; stepping ranges separate model 85's Skylake-SP (0 to 4), Cascade Lake, and Cooper Lake |
+| `generation` | The generation `name` (`skylake-sp`, `icelake-sp`, `emeraldrapids`, `alderlake`, or `milan`; `host` for a host profile, see **Host profiles**) and its `cpus`: `(family, model, stepping range)` display signatures; stepping ranges separate model 85's Skylake-SP (0 to 4), Cascade Lake, and Cooper Lake |
 | `cpuid` | A dense table of every leaf and subleaf in `[0, max basic]` and `[0x80000000, max extended]` with a value and a mask per register; mask bit 1 pins the value, mask bit 0 marks a VMM-owned or runtime-owned bit |
 | `xcr0`, `xss`, `xsave_components` | The XSAVE features the guest may enable, and the size, offset, and flags of every enabled component |
 | `physical_address_width` | The guest physical address width |
@@ -376,7 +401,15 @@ core per vCPU ([configuration boundary](configuration-boundary.md)), so in
 `CPUID.4` every cache reports the vCPU count less one as the cores per
 socket (`EAX[31:26]`), and the L3 cache reports it as the logical processors
 sharing the cache (`EAX[25:14]`) too; the L1 and L2 caches report 0 there,
-one vCPU each. Runtime-owned bits mirror control state: `OSXSAVE`, `OSPKE`,
+one vCPU each. AMD CPUs have no leaf 4, so the table differs by vendor: in
+AMD profiles, OpenVMM owns instead the core count and APIC ID size of
+`CPUID.80000008:ECX` (bits 7:0 and 15:12), the cache-sharing counts of
+`CPUID.8000001D:EAX[25:14]` (the L3 cache shared by every vCPU, the L1 and
+L2 caches by one), and the processor topology of `CPUID.8000001E` (each
+vCPU's extended APIC, compute unit, and node IDs, the threads per compute
+unit, and the nodes per processor). Intel profiles pin those AMD fields as
+before, so adding the AMD rows changed no Intel profile's encoding or
+digest. Runtime-owned bits mirror control state: `OSXSAVE`, `OSPKE`,
 and the XSAVE sizes for the current XCR0 and XSS.
 The time ABI owns `0x40000000..=0x4fffffff`, `0x15`, and `0x16`, and every
 profile pins the [CPU time bits](#cpu-time-bits). Invariant TSC and ARAT are
@@ -386,7 +419,12 @@ banks cannot express ARAT, and on Azure, WHP and nested MSHV cannot offer
 invariant TSC to guests through their feature banks although the host OS
 sees it. Host qualification measures them instead. Profiles also pin policy zeros
 (VMX and SVM, SGX, PT, RDT, PCONFIG, and the other features listed by the
-profiles' derivation policy). The effective guest CPUID is a pure function of
+profiles' derivation policy; in AMD profiles also IBS, LWP, SKINIT, the
+performance counter extensions, MONITORX, RDPRU, PPIN, CPPC, INVLPGB, the
+instructions-retired counter, SME and SEV, whose leaf `0x8000001F` is
+zero, `BTC_NO`, which KVM never enumerates, and PSFD unless a `SPEC_CTRL`
+control stays, without which KVM denies a guest `SPEC_CTRL`). The
+effective guest CPUID is a pure function of
 the profile, the VM topology, and the time ABI's identity leaves.
 
 **Effective CPUID.** The effective CPUID
@@ -439,8 +477,10 @@ on them. They are:
 - a `0xD` subleaf of a component that is not enabled.
 
 KVM answers them from the effective CPUID: zero, Intel's out-of-range result
-(the highest basic leaf's) above the maximum basic leaf, or, past the last
-topology level, an invalid level with the x2APIC ID. MSHV and WHP pass them
+(the highest basic leaf's) above the maximum basic leaf under an Intel
+profile, or, past the last topology level, an invalid level with the x2APIC
+ID. Under an AMD profile, KVM answers every out-of-range leaf with zero, as
+it answers any guest whose CPUID vendor is AMD. MSHV and WHP pass them
 through from their own guest views. Both read zero at every reserved entry
 their sweeps reach (below), so neither programs zero results there, which
 would cost about 5 µs per entry at partition setup: about 35 µs on WHP for
@@ -471,14 +511,19 @@ Informational fields:
 
 - The brand string (`0x80000002..=0x80000004`) is generic per generation:
   `Intel(R) Xeon(R) Processor (<name>)` with the generation's display name
-  (`Skylake-SP`, `Ice Lake-SP`, or `Emerald Rapids`), or
-  `Intel(R) Core(TM) Processor (Alder Lake)`, zero-padded, without a
+  (`Skylake-SP`, `Ice Lake-SP`, or `Emerald Rapids`),
+  `Intel(R) Core(TM) Processor (Alder Lake)`, or
+  `AMD EPYC Processor (Milan)`, zero-padded, without a
   frequency. Every host of a generation presents it whatever its SKU, and
   derivation needs no common brand across the source hosts. Host profiles
-  present `Intel(R) Processor (host profile)`.
-- The cache leaves (`0x2` and `0x4`, except their VMM-owned counts) come from
-  the reference hosts; other SKUs of the generation differ, and verification
-  does not compare them. Address widths are checked as limits.
+  present `Intel(R) Processor (host profile)` or
+  `AMD Processor (host profile)`.
+- The cache leaves (`0x2` and `0x4`, and AMD's `0x80000005`, `0x80000006`,
+  and `0x8000001D`, except their VMM-owned counts) come from the reference
+  hosts; other SKUs of the generation differ, and verification does not
+  compare them. Neither does it compare the copy of the CPU's signature in
+  AMD's `0x80000001` EAX, which describes the CPU as leaf 1 does. Address
+  widths are checked as limits.
 - `IA32_UCODE_REV` is not pinned: Linux disables its microcode loader and
   skips its microcode checks under a hypervisor, so the value only reaches
   `/proc/cpuinfo`, and it is outside the effective-CPUID record and every
@@ -502,11 +547,14 @@ highest revision of the single pinned profile whose generation covers the
 host's vendor, family, model, and stepping as the VMM's host OS sees them (the
 L1 view on Azure). No match, or matches in more than one generation, is
 `E_PROFILE_HOST_UNKNOWN`, naming the host's signature and the available IDs,
-and, on an Intel CPU, pointing to `--cpu-profile host`; `auto` never falls
-back to a host profile, and host CPUID passthrough does not exist. A restore
-always uses the profile recorded in the snapshot; an explicit `--cpu-profile`
-must name the same profile, or be `host` for a host profile
-(`E_PROFILE_UNKNOWN`).
+and, on an Intel or AMD CPU, pointing to `--cpu-profile host`; `auto` never
+falls back to a host profile, and host CPUID passthrough does not exist. A
+cold boot with `auto` whose profile the backend does not support fails with
+`E_PROFILE_UNSUPPORTED` (verification step 3), which on an Intel or AMD CPU
+points to `--cpu-profile host` too, because a host profile derives from what
+the backend supports. A restore always uses the profile recorded in the
+snapshot; an explicit `--cpu-profile` must name the same profile, or be
+`host` for a host profile (`E_PROFILE_UNKNOWN`).
 
 **Host profiles.** `--cpu-profile host` is an
 opt-in for development hosts that no pinned profile serves. Before it creates
@@ -523,8 +571,9 @@ partition's configuration (`cpu_profile::PartitionProfile`), so each VM of a
 process holds its own host profile. A host profile is neither reviewed nor
 immutable: a microcode, firmware, or hypervisor update can change it. Its
 fingerprint costs a probe partition, 2.6 to 5.5 ms on WHP, and the host
-identity at every cold boot. Only Intel CPUs have host profiles; another
-vendor fails with `E_PROFILE_HOST_UNKNOWN`, and a backend that lacks a CPU
+identity at every cold boot. Only Intel and AMD CPUs have host profiles,
+`intel.host.v1` and `amd.host.v1`; another vendor, such as Hygon, fails
+with `E_PROFILE_HOST_UNKNOWN`, and a backend that lacks a CPU
 feature that the time ABI requires fails with `E_PROFILE_UNSUPPORTED`. Host
 qualification never accepts a host profile, so CI and benchmark hosts need a
 pinned one.
@@ -580,7 +629,8 @@ reports every violation at once, naming the leaf, subleaf, register, and bit:
      (`0xF.1`, `0x10.1` to `0x10.3`, `0x12.1`, `0x12.2`, and `0x14.1`), 6
      on the Azure 8370C and 8573C runners, whose roots report no Intel PT,
      and 12 on the Core i9-12900H, among them `0xD.11`, `0xD.12`, `0x14.1`,
-     and `0x20`, which its root reads as non-zero.
+     and `0x20`, which its root reads as non-zero, and 2 on the EPYC 7763
+     WHP host, `0xD.11` and `0xD.12`.
      The supported surface of step 3 cannot serve: it derives from the
      root's CPUID, which shows values that a guest does not see there, so
      it would fail sound hosts.
@@ -590,8 +640,8 @@ reports every violation at once, naming the leaf, subleaf, register, and bit:
    - KVM answers reserved entries from the effective CPUID itself, so it
      needs no check.
 
-The catalog has four profiles, derived from the fingerprints of three
-bare-metal hosts (one per backend), fifteen Azure hosts, and one laptop:
+The catalog has five profiles, derived from the fingerprints of three
+bare-metal hosts (one per backend), sixteen Azure hosts, and one laptop:
 
 | ID | Generation | Hosts | Source backends |
 | --- | --- | --- | --- |
@@ -599,6 +649,7 @@ bare-metal hosts (one per backend), fifteen Azure hosts, and one laptop:
 | `intel.icelake-sp.v1` | 6/106 | Xeon Platinum 8370C runners | KVM, MSHV, WHP |
 | `intel.emeraldrapids.v1` | 6/207 | Xeon Platinum 8573C runners | MSHV, WHP (no KVM host exists) |
 | `intel.alderlake.v1` | 6/151 and 6/154 | One Core i9-12900H laptop (6/154, stepping 3) | WHP |
+| `amd.milan.v1` | 25/1 | One Azure Standard_D16as_v5 VM with an EPYC 7763 (25/1, stepping 1) and nested Hyper-V | WHP |
 
 The Alder Lake profile serves development hosts, not CI. Derived from one
 WHP fingerprint, it pins XCR0 `0x7`, because WHP offers that host only x87,
@@ -607,6 +658,36 @@ Alder Lake-S unverified; any of them that lacks one of its features fails
 with `E_PROFILE_UNSUPPORTED` until a later revision intersects their
 fingerprints. The policy needs nothing for the hybrid cores: it clears the
 hybrid flag, `CPUID.(7,0):EDX[15]`, and keeps no data in leaf `0x1A`.
+
+The Milan profile, the only AMD one, also serves development hosts, not CI;
+no CI microVM runner has an AMD CPU. Its generation takes every stepping of
+family 25 model 1, Milan-X's 2 included, which differs only in descriptive
+fields.
+Derived from one nested WHP fingerprint, it presents what that WHP offers
+its guests: XCR0 `0x7`, TOPOEXT with AMD's cache and topology leaves, and
+CLZERO, but none of the speculation controls of `0x80000008` EBX and
+nothing in `0x80000021`, which that WHP does not offer. Linux guests of the
+profile therefore mitigate Spectre v2 with retpolines and report SSB, SRSO,
+and TSA as vulnerable on every host. The policy's AMD rules keep data in
+`0x80000005`, `0x8000001D`, `0x8000001E`, and `0x80000021`, keep AMD's
+speculation controls and immunities where every source host offers them,
+except what KVM cannot present, and clear 3DNowPrefetch, which the root
+partition of a nested Azure host does not see although WHP presents it to
+guests, so that host's cold-boot support check would fail a profile that
+pinned it; Linux infers `PREFETCHW` from long mode. The WHP fingerprint
+offers PSFD and `BTC_NO` too, which the profile drops: KVM never enumerates
+`BTC_NO`, and Linux marks no CPU of family `0x19` or later as affected by
+RETBLEED, which is all the bit decides; PSFD is a bit of `SPEC_CTRL`,
+which KVM lets a guest access only beside IBRS, STIBP, or SSBD, and stays
+only with one of them, as OpenVMM's KVM backend keeps it in KVM's
+supported surface. A Milan host on KVM therefore fails the profile on
+neither bit. Milan hosts on KVM and MSHV, bare-metal ones, and other SKUs
+are still unverified, and so are the AMD paths of the KVM and MSHV
+backends: the AMD MSR contract and MSHV's per-VP `0x8000001E`. A host that
+lacks one of the profile's features fails with `E_PROFILE_UNSUPPORTED`,
+which names `--cpu-profile host`, until a later revision intersects their
+fingerprints, which could also add the speculation controls, and PSFD
+beside them, that bare-metal hosts offer.
 
 Sharing costs nothing on Ice Lake-SP and Emerald Rapids, where every backend
 offers the same features. On Skylake-SP, used only by the bare-metal
@@ -1625,7 +1706,7 @@ code.
 | `E_BACKEND_MISMATCH` | Snapshot taken on another backend | Restore |
 | `E_PROFILE_UNKNOWN` | Profile ID neither pinned in this OpenVMM nor a host profile, or a restore's explicit `--cpu-profile` names another profile than the snapshot's | Cold boot, restore |
 | `E_PROFILE_DIGEST` | The recorded profile digest or embedded document is not the pinned profile's of the same ID, or a host profile's embedded document is not a canonical host profile of the recorded ID and digest | Restore |
-| `E_PROFILE_HOST_UNKNOWN` | `--cpu-profile auto` maps the host to no profile, or to profiles of more than one generation, or `--cpu-profile host` runs on a CPU of another vendor than Intel | Cold boot |
+| `E_PROFILE_HOST_UNKNOWN` | `--cpu-profile auto` maps the host to no profile, or to profiles of more than one generation, or `--cpu-profile host` runs on a CPU of another vendor than Intel and AMD | Cold boot |
 | `E_PROFILE_TIME_BITS` | The profile is invalid or violates the CPU time bits | Cold boot, restore |
 | `E_CPU_GENERATION` | Host CPU vendor, family, model, or stepping not in the profile | Cold boot, restore |
 | `E_PROFILE_UNSUPPORTED` | Backend lacks a feature, limit, XSAVE layout, MSR value, or feature-bank bit of the profile, or the host is not qualified | Cold boot, restore |
@@ -1821,8 +1902,9 @@ most 2.1 ns.
 ### Generations and runner placement
 
 Generation names used in logs, reports, and job summaries are `skylake-sp`
-(family 6, model 85), `icelake-sp` (6/106), `emeraldrapids` (6/207), and
-`alderlake` (6/151 and 6/154), which no CI runner has.
+(family 6, model 85), `icelake-sp` (6/106), `emeraldrapids` (6/207),
+`alderlake` (6/151 and 6/154), and `milan` (25/1); no CI microVM runner has
+the last two.
 `validate-runner` and `nvx.py doctor` detect the generation at run time and
 report it, together with the selected profile, `F_d`, `L`, the `H4` rate
 metrics, and the skew metrics, in their log and the job summary; an unknown

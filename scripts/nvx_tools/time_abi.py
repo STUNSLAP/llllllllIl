@@ -68,7 +68,7 @@ CI_WARP_GAPS: tuple[str, ...] = (str(WARP_PROBE_IDLE_SECONDS),) * (
     WARP_PROBE_ROUNDS - 1
 )
 QUALIFICATION_WARP_GAPS: tuple[str, ...] = ("0.1", "1", "5", "1")
-PROFILE_VENDORS: Mapping[str, str] = {"GenuineIntel": "intel"}
+PROFILE_VENDORS: Mapping[str, str] = {"GenuineIntel": "intel", "AuthenticAMD": "amd"}
 # The generation of every host profile, which `openvmm --cpu-profile host`
 # derives from the host it runs on (doc/design/time-abi.md, "Selection"). No
 # pinned profile uses it, and host qualification never accepts one.
@@ -123,12 +123,14 @@ class CpuGeneration:
 # the submodule. Doctor uses it only without OpenVMM (--no-openvmm), and run
 # to explain a failed cold boot on a CPU that it lacks; otherwise OpenVMM
 # reports the generation and the profile itself. Model 85 also covers Cascade
-# Lake (steppings 5-7) and Cooper Lake (10-11), which have no profile.
+# Lake (steppings 5-7) and Cooper Lake (10-11), which have no profile; AMD's
+# family 25 model 1 is Milan's in every stepping, Milan-X's 2 included.
 CPU_GENERATIONS: tuple[CpuGeneration, ...] = (
     CpuGeneration("skylake-sp", "GenuineIntel", (CpuModel(6, 85, range(5)),)),
     CpuGeneration("icelake-sp", "GenuineIntel", (CpuModel(6, 106),)),
     CpuGeneration("emeraldrapids", "GenuineIntel", (CpuModel(6, 207),)),
     CpuGeneration("alderlake", "GenuineIntel", (CpuModel(6, 151), CpuModel(6, 154))),
+    CpuGeneration("milan", "AuthenticAMD", (CpuModel(25, 1),)),
 )
 
 
@@ -143,8 +145,8 @@ def describe_cpu_generations() -> str:
 PROFILE_HOST_UNKNOWN = "E_PROFILE_HOST_UNKNOWN"
 # The CPU vendors whose CPUs host profiles serve, as OpenVMM's
 # `cpu_profile::supports_host_profiles` decides.
-HOST_PROFILE_VENDORS = frozenset({"GenuineIntel"})
-# The issues that track CPU profiles for more CPUs, and for AMD CPUs.
+HOST_PROFILE_VENDORS = frozenset({"GenuineIntel", "AuthenticAMD"})
+# The issues that track CPU profiles for more CPUs, and for more AMD CPUs.
 CPU_SUPPORT_ISSUE = "https://github.com/microsoft/nvx/issues/390"
 AMD_SUPPORT_ISSUE = "https://github.com/microsoft/nvx/issues/396"
 
@@ -199,7 +201,7 @@ def host_cpu_unsupported_guidance(
     if not host_profiles:
         lines.append(
             f"nvx: --cpu-profile {HOST_PROFILE_GENERATION} cannot boot on it "
-            "either: host CPU profiles serve only Intel CPUs."
+            "either: host CPU profiles serve only Intel and AMD CPUs."
         )
     elif auto:
         lines.append(
@@ -208,7 +210,7 @@ def host_cpu_unsupported_guidance(
             'this host; doc/usage.md ("CPU profiles") explains its limits.'
         )
     if host.vendor == "AuthenticAMD":
-        lines.append(f"nvx: {AMD_SUPPORT_ISSUE} tracks CPU profiles for AMD CPUs.")
+        lines.append(f"nvx: {AMD_SUPPORT_ISSUE} tracks CPU profiles for more AMD CPUs.")
     else:
         lines.append(f"nvx: {CPU_SUPPORT_ISSUE} tracks CPU profiles for more CPUs.")
     return "\n".join(lines)

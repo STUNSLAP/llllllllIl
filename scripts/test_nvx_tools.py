@@ -1738,14 +1738,24 @@ class CliTests(unittest.TestCase):
         self.assertIn("rerun with --cpu-profile host", output)
         self.assertIn("https://github.com/microsoft/nvx/issues/390", output)
         self.assertEqual(run(1, "auto"), (1, output))
-        # Host profiles serve only Intel CPUs, so an AMD host gets no such
-        # suggestion, with either request, but the issue that tracks AMD.
+        # Host profiles serve AMD CPUs too, so an AMD host that no built-in
+        # profile serves gets the same suggestion, with the issue that tracks
+        # profiles for more AMD CPUs, and a host profile that fails on it
+        # fails for another reason, which OpenVMM explains.
         status, output = run(1, None, host=zen3)
         self.assertIn("AuthenticAMD 25/33/0", output)
-        self.assertNotIn("rerun with --cpu-profile host", output)
-        self.assertIn("host CPU profiles serve only Intel CPUs", output)
+        self.assertIn("rerun with --cpu-profile host", output)
         self.assertIn("https://github.com/microsoft/nvx/issues/396", output)
-        self.assertEqual(run(1, "host", host=zen3), (1, output))
+        self.assertNotIn("issues/390", output)
+        self.assertEqual(run(1, "host", host=zen3), (1, ""))
+        # Host profiles serve only Intel and AMD CPUs, so another vendor's
+        # host gets no such suggestion, with either request.
+        hygon = HostCpu("HygonGenuine", 24, 0, 1)
+        status, output = run(1, None, host=hygon)
+        self.assertIn("HygonGenuine 24/0/1", output)
+        self.assertNotIn("rerun with --cpu-profile host", output)
+        self.assertIn("host CPU profiles serve only Intel and AMD CPUs", output)
+        self.assertEqual(run(1, "host", host=hygon), (1, output))
         # Successful runs, restores, other requests and CPUs, and an unknown
         # CPU get no guidance.
         for returncode, cpu_profile, cold_boot, host in (
@@ -1754,6 +1764,7 @@ class CliTests(unittest.TestCase):
             (1, "host", True, tiger_lake),
             (1, "intel.alderlake.v1", True, tiger_lake),
             (1, None, True, HostCpu("GenuineIntel", 6, 154, 3)),
+            (1, None, True, HostCpu("AuthenticAMD", 25, 1, 1)),
             (1, None, True, None),
         ):
             with self.subTest(
