@@ -350,6 +350,18 @@ jobs:
           if [[ -r /dev/kvm && -w /dev/kvm ]]; then
             kvm=yes
           fi
+          # The CPU as NVX names it (vendor family/model/stepping), which
+          # decides the CPU profile that a cold boot's --cpu-profile auto
+          # selects (doc/usage.md, "CPU profiles").
+          cpu=$(awk -F': *' '
+            /^vendor_id/ { vendor = $2 }
+            /^cpu family/ { family = $2 }
+            /^model[ \t]*:/ { model = $2 }
+            /^stepping/ { stepping = $2 }
+            /^model name/ { name = $2 }
+            /^$/ { exit }
+            END { printf "%s %s/%s/%s (%s)", vendor, family, model, stepping, name }
+          ' /proc/cpuinfo)
           {
             echo "### NVX Copilot environment"
             echo
@@ -357,6 +369,7 @@ jobs:
             echo "| --- | --- |"
             echo "| Setup status | ${status} |"
             echo "| Failed steps | ${failed_list:-none} |"
+            echo "| CPU | ${cpu} |"
             echo "| CPUs / memory | $(nproc) / $(free -g | awk '/^Mem:/ { print $2 }') GiB |"
             echo "| Workspace free space | $(df -h --output=avail . | tail -n 1 | tr -d ' ') |"
             echo "| KVM access | ${kvm} |"
