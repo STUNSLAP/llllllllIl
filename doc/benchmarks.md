@@ -44,6 +44,17 @@ coordinator fills the `.sh.in` templates before use.
 | `linux-mshv-virtual-machine` | MSHV | Virtual machine |
 | `windows-whp-virtual-machine` | WHP | Virtual machine |
 
+The series names carry no CPU vendor: every CI microVM runner is an Azure virtual machine with an
+Intel Xeon CPU (Ice Lake-SP or Emerald Rapids), so each series has one vendor's samples. No CI
+microVM runner has an AMD CPU, so no AMD series exists yet. An AMD runner needs a built-in AMD
+[CPU profile](usage.md#cpu-profiles), because CI never uses host profiles, and only Milan CPUs have
+one so far, `amd.milan.v1`. Such a runner boots its guests on that profile through AMD-V, so its
+timings would skew an Intel series' baseline. Before an AMD runner joins CI, give it series of its
+own, named with an `-amd` suffix such as `linux-kvm-virtual-machine-amd`, in `PLATFORM_NAMES` and
+`OPENVMM_BACKENDS` in `scripts/nvx_tools/performance.py` and in the CI matrix, so their history
+lives in separate `data/` files. Local measurements on AMD hosts can use the names above, because
+only CI records history.
+
 CI runs the complete acceptance and performance suites and the five device metrics at one vCPU
 under the canonical microVM, and only the 512 MiB shell snapshot restore at `2`,
 `4`, and `8` vCPUs. This produces 37 p50 values per series, 34 at one vCPU and one at each higher
