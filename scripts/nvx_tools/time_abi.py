@@ -69,6 +69,28 @@ CI_WARP_GAPS: tuple[str, ...] = (str(WARP_PROBE_IDLE_SECONDS),) * (
 )
 QUALIFICATION_WARP_GAPS: tuple[str, ...] = ("0.1", "1", "5", "1")
 PROFILE_VENDORS: Mapping[str, str] = {"GenuineIntel": "intel"}
+# The generation of every host profile, which `openvmm --cpu-profile host`
+# derives from the host it runs on (doc/design/time-abi.md, "Selection"). No
+# pinned profile uses it, and host qualification never accepts one.
+HOST_PROFILE_GENERATION = "host"
+_PROFILE_ID = re.compile(r"([a-z0-9-]+)\.([a-z0-9-]+)\.v[1-9][0-9]*")
+
+
+@dataclass(frozen=True)
+class CpuModel:
+    """A CPU model of a generation: a display family and model, and the
+    steppings that the generation covers."""
+
+    family: int
+    model: int
+    steppings: range = range(16)
+
+    def describe(self) -> str:
+        """The model as messages name it, such as ``6/85 steppings 0-4``."""
+        name = f"{self.family}/{self.model}"
+        if self.steppings == range(16):
+            return name
+        return f"{name} steppings {self.steppings.start}-{self.steppings.stop - 1}"
 
 
 @dataclass(frozen=True)
@@ -77,23 +99,136 @@ class CpuGeneration:
 
     name: str
     vendor: str
-    family: int
-    model: int
-    steppings: range
+    cpus: tuple[CpuModel, ...]
 
     @property
     def profile_id(self) -> str:
         """The catalog's v1 profile, which every backend shares."""
         return f"{PROFILE_VENDORS[self.vendor]}.{self.name}.v1"
 
+    def contains(self, vendor: str, family: int, model: int, stepping: int) -> bool:
+        """Whether a CPU belongs to the generation."""
+        return self.vendor == vendor and any(
+            (cpu.family, cpu.model) == (family, model) and stepping in cpu.steppings
+            for cpu in self.cpus
+        )
 
-# Model 85 also covers Cascade Lake (steppings 5-7) and Cooper Lake (10-11),
-# which have no profile.
+    def describe(self) -> str:
+        """The generation and its CPUs, such as ``alderlake 6/151 and 6/154``."""
+        return f"{self.name} {' and '.join(cpu.describe() for cpu in self.cpus)}"
+
+
+# A copy of the generations of OpenVMM's pinned CPU profiles
+# (openvmm/vmm_core/cpu_profile/profiles), which test_time_abi compares with
+# the submodule. Doctor uses it only without OpenVMM (--no-openvmm), and run
+# to explain a failed cold boot on a CPU that it lacks; otherwise OpenVMM
+# reports the generation and the profile itself. Model 85 also covers Cascade
+# Lake (steppings 5-7) and Cooper Lake (10-11), which have no profile.
 CPU_GENERATIONS: tuple[CpuGeneration, ...] = (
-    CpuGeneration("skylake-sp", "GenuineIntel", 6, 85, range(5)),
-    CpuGeneration("icelake-sp", "GenuineIntel", 6, 106, range(16)),
-    CpuGeneration("emeraldrapids", "GenuineIntel", 6, 207, range(16)),
+    CpuGeneration("skylake-sp", "GenuineIntel", (CpuModel(6, 85, range(5)),)),
+    CpuGeneration("icelake-sp", "GenuineIntel", (CpuModel(6, 106),)),
+    CpuGeneration("emeraldrapids", "GenuineIntel", (CpuModel(6, 207),)),
+    CpuGeneration("alderlake", "GenuineIntel", (CpuModel(6, 151), CpuModel(6, 154))),
 )
+
+
+def describe_cpu_generations() -> str:
+    """The catalog's generations as messages list them."""
+    return ", ".join(generation.describe() for generation in CPU_GENERATIONS)
+
+
+# OpenVMM fails a cold boot with this code when no pinned CPU profile serves
+# the host's CPU, and `--cpu-profile host` is the opt-in alternative on the
+# CPUs that host profiles serve.
+PROFILE_HOST_UNKNOWN = "E_PROFILE_HOST_UNKNOWN"
+# The CPU vendors whose CPUs host profiles serve, as OpenVMM's
+# `cpu_profile::supports_host_profiles` decides.
+HOST_PROFILE_VENDORS = frozenset({"GenuineIntel"})
+# The issues that track CPU profiles for more CPUs, and for AMD CPUs.
+CPU_SUPPORT_ISSUE = "https://github.com/microsoft/nvx/issues/390"
+AMD_SUPPORT_ISSUE = "https://github.com/microsoft/nvx/issues/396"
+
+
+@dataclass(frozen=True)
+class HostCpu:
+    """A host CPU as the host OS identifies it: its CPUID vendor, and its
+    display family, model, and stepping."""
+
+    vendor: str
+    family: int
+    model: int
+    stepping: int
+
+    def describe(self) -> str:
+        """The CPU as messages name it, such as ``GenuineIntel 6/140/1``."""
+        return f"{self.vendor} {self.family}/{self.model}/{self.stepping}"
+
+
+def host_cpu_unsupported_guidance(
+    cpu_profile: str | None, host: HostCpu | None
+) -> str | None:
+    """Return the next steps after OpenVMM failed a cold boot with
+    ``--cpu-profile cpu_profile``, or with its default, ``auto``, if
+    ``cpu_profile`` is None, on the CPU ``host``, or None unless that request
+    cannot boot on the CPU because no built-in profile serves it.
+
+    Such a CPU fails ``auto`` with ``E_PROFILE_HOST_UNKNOWN``, and, unless host
+    profiles serve it, ``host`` too. An explicit profile ID fails with its own
+    code, which needs no guidance. OpenVMM keeps its standard error on the
+    terminal, so the caller cannot read the code that ended the run: the
+    guidance says what such a cold boot does on the CPU, and OpenVMM's own
+    error names this run's cause."""
+    if host is None or (
+        cpu_generation(host.vendor, host.family, host.model, host.stepping) is not None
+    ):
+        return None
+    host_profiles = host.vendor in HOST_PROFILE_VENDORS
+    auto = cpu_profile in (None, "auto")
+    # A host profile fails with the same code on a CPU that it cannot serve.
+    host_unknown = auto or (
+        cpu_profile == HOST_PROFILE_GENERATION and not host_profiles
+    )
+    if not host_unknown:
+        return None
+    lines = [
+        f"nvx: no built-in CPU profile serves this host's CPU, {host.describe()}, "
+        "so a cold boot with --cpu-profile auto, the default, fails on it with "
+        f"{PROFILE_HOST_UNKNOWN}; the built-in profiles cover "
+        f"{describe_cpu_generations()}."
+    ]
+    if not host_profiles:
+        lines.append(
+            f"nvx: --cpu-profile {HOST_PROFILE_GENERATION} cannot boot on it "
+            "either: host CPU profiles serve only Intel CPUs."
+        )
+    elif auto:
+        lines.append(
+            f"nvx: on a development host, rerun with --cpu-profile "
+            f"{HOST_PROFILE_GENERATION} to boot on a CPU profile derived from "
+            'this host; doc/usage.md ("CPU profiles") explains its limits.'
+        )
+    if host.vendor == "AuthenticAMD":
+        lines.append(f"nvx: {AMD_SUPPORT_ISSUE} tracks CPU profiles for AMD CPUs.")
+    else:
+        lines.append(f"nvx: {CPU_SUPPORT_ISSUE} tracks CPU profiles for more CPUs.")
+    return "\n".join(lines)
+
+
+def is_catalog_profile_id(profile_id: str) -> bool:
+    """Whether ``profile_id`` names a catalog profile: a revision of a pinned
+    generation's profile, ``<vendor>.<generation>.v<revision>``, and not a host
+    profile, whatever OpenVMM's catalog holds."""
+    match = _PROFILE_ID.fullmatch(profile_id)
+    return match is not None and match.group(2) != HOST_PROFILE_GENERATION
+
+
+def is_host_profile_id(profile_id: str) -> bool:
+    """Whether ``profile_id`` names a host profile, ``<vendor>.host.v<revision>``,
+    which qualification never accepts."""
+    match = _PROFILE_ID.fullmatch(profile_id)
+    return match is not None and match.group(2) == HOST_PROFILE_GENERATION
+
+
 # Guest boot markers that init prints once the guest is shell-ready. Only the
 # time ABI's initial clock step (C12) precedes them; the other boot checks
 # finish asynchronously.
@@ -127,12 +262,7 @@ def cpu_generation(
 ) -> CpuGeneration | None:
     """Return the time ABI generation of a CPU, or None if it has none."""
     for generation in CPU_GENERATIONS:
-        if (
-            generation.vendor == vendor
-            and generation.family == family
-            and generation.model == model
-            and stepping in generation.steppings
-        ):
+        if generation.contains(vendor, family, model, stepping):
             return generation
     return None
 

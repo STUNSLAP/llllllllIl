@@ -232,9 +232,9 @@ guest-to-host mapping without publishing guest ports. Guest-originated traffic
 remains subject to egress policy.
 
 Most `nvx.py run` options pass through unchanged: `--machine`, `--processors`,
-`--mount`, `--net`, `--network-profile`, `--cmdline`, `--restore-snapshot`,
-`--restore-processors`, and `--restore-ready-path`. The wrapper performs these
-translations and additions:
+`--cpu-profile`, `--mount`, `--net`, `--network-profile`, `--cmdline`,
+`--restore-snapshot`, `--restore-processors`, and `--restore-ready-path`. The
+wrapper performs these translations and additions:
 
 | `nvx.py run` | Direct OpenVMM option |
 | --- | --- |

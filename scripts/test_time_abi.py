@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import queue
 import re
 import shutil
@@ -123,18 +124,182 @@ class FieldParsingTests(unittest.TestCase):
         self.assertEqual(name(85, 4), "skylake-sp")
         self.assertEqual(name(106, 6), "icelake-sp")
         self.assertEqual(name(207, 2), "emeraldrapids")
+        # Alder Lake-S and Alder Lake-P and -H share one profile.
+        self.assertEqual(name(151, 2), "alderlake")
+        self.assertEqual(name(154, 3), "alderlake")
         # Cascade Lake and Cooper Lake share model 85 but have no profile.
         self.assertIsNone(name(85, 7))
         self.assertIsNone(name(85, 11))
         self.assertIsNone(name(143, 8))
+        # Tiger Lake and Raptor Lake have no profile either.
+        self.assertIsNone(name(140, 1))
+        self.assertIsNone(name(183, 1))
         self.assertIsNone(name(1, 1, "AuthenticAMD"))
 
     def test_names_the_catalog_profiles(self):
         # One profile per generation serves every backend.
         self.assertEqual(
             [generation.profile_id for generation in time_abi.CPU_GENERATIONS],
-            ["intel.skylake-sp.v1", "intel.icelake-sp.v1", "intel.emeraldrapids.v1"],
+            [
+                "intel.skylake-sp.v1",
+                "intel.icelake-sp.v1",
+                "intel.emeraldrapids.v1",
+                "intel.alderlake.v1",
+            ],
         )
+        self.assertEqual(
+            time_abi.describe_cpu_generations(),
+            "skylake-sp 6/85 steppings 0-4, icelake-sp 6/106, emeraldrapids 6/207, "
+            "alderlake 6/151 and 6/154",
+        )
+
+    def test_the_catalog_copy_matches_openvmm_pinned_profiles(self):
+        # NVX's copy must not drift from the profiles that OpenVMM pins. They
+        # are read from the gitlink's commit, not from the submodule's working
+        # tree, which can hold another revision: a self-hosted CI runner keeps
+        # an earlier job's OpenVMM checkout until the job checks out its own.
+        root = Path(__file__).resolve().parents[1]
+        submodule = root / "openvmm"
+        if not (submodule / ".git").exists():
+            self.skipTest("the OpenVMM submodule is not initialized")
+
+        def git(directory: Path, *arguments: str) -> str | None:
+            result = subprocess.run(
+                ["git", "-C", str(directory), *arguments],
+                capture_output=True,
+                encoding="utf-8",
+                check=False,
+            )
+            return result.stdout if result.returncode == 0 else None
+
+        pin = (git(root, "rev-parse", ":openvmm") or "").strip()
+        if not pin or git(submodule, "cat-file", "-e", f"{pin}^{{commit}}") is None:
+            self.skipTest(
+                f"the OpenVMM submodule lacks its pinned revision {pin or '(unknown)'}"
+            )
+        listing = git(
+            submodule,
+            "ls-tree",
+            "-z",
+            "--name-only",
+            pin,
+            "--",
+            "vmm_core/cpu_profile/profiles/",
+        )
+        assert listing is not None
+        pinned: dict[str, tuple[str, str, tuple[tuple[int, int, range], ...]]] = {}
+        for path in sorted(listing.split("\0")):
+            if not path.endswith(".json"):
+                continue
+            content = git(submodule, "show", f"{pin}:{path}")
+            assert content is not None
+            document = json.loads(content)
+            generation = document["generation"]
+            # Keyed by profile ID, so that a second pinned revision of a
+            # generation fails the comparison instead of replacing the first.
+            pinned[document["id"]] = (
+                generation["name"],
+                document["vendor"],
+                tuple(
+                    (
+                        cpu["family"],
+                        cpu["model"],
+                        range(cpu["steppings"][0], cpu["steppings"][1] + 1),
+                    )
+                    for cpu in generation["cpus"]
+                ),
+            )
+        self.assertTrue(pinned)
+        copy = {
+            generation.profile_id: (
+                generation.name,
+                generation.vendor,
+                tuple(
+                    (cpu.family, cpu.model, cpu.steppings) for cpu in generation.cpus
+                ),
+            )
+            for generation in time_abi.CPU_GENERATIONS
+        }
+        self.assertEqual(copy, pinned)
+
+    def test_tells_catalog_profiles_from_host_profiles(self):
+        for profile_id, catalog, host in (
+            ("intel.icelake-sp.v1", True, False),
+            ("intel.raptorlake.v2", True, False),
+            ("intel.host.v1", False, True),
+            # Host profile IDs take the revision syntax of every profile ID.
+            ("intel.host.v0", False, False),
+            ("interim.host.kvm.v1", False, False),
+            ("intel.icelake-sp.v2-rc", False, False),
+            ("intel.icelake-sp.v0", False, False),
+            ("none", False, False),
+            ("", False, False),
+        ):
+            with self.subTest(profile_id=profile_id):
+                self.assertEqual(time_abi.is_catalog_profile_id(profile_id), catalog)
+                self.assertEqual(time_abi.is_host_profile_id(profile_id), host)
+
+    def test_guides_hosts_that_no_built_in_profile_serves(self):
+        tiger_lake = time_abi.HostCpu("GenuineIntel", 6, 140, 1)
+        guidance = time_abi.host_cpu_unsupported_guidance(None, tiger_lake)
+        assert guidance is not None
+        # The guidance says what a cold boot with auto does on the CPU, not
+        # which code ended this run, which run cannot read.
+        self.assertIn(
+            "this host's CPU, GenuineIntel 6/140/1, so a cold boot with "
+            "--cpu-profile auto, the default, fails on it with "
+            "E_PROFILE_HOST_UNKNOWN;",
+            guidance,
+        )
+        self.assertIn(time_abi.describe_cpu_generations(), guidance)
+        self.assertIn("rerun with --cpu-profile host", guidance)
+        self.assertIn("https://github.com/microsoft/nvx/issues/390", guidance)
+        self.assertEqual(
+            guidance, time_abi.host_cpu_unsupported_guidance("auto", tiger_lake)
+        )
+        # Host profiles serve Intel CPUs, so a host profile fails on this one
+        # for another reason, which OpenVMM's own error explains.
+        self.assertIsNone(time_abi.host_cpu_unsupported_guidance("host", tiger_lake))
+
+        # Host profiles cannot serve an AMD CPU either: no suggestion, with
+        # either request, and the issue that tracks AMD CPUs.
+        zen4 = time_abi.HostCpu("AuthenticAMD", 25, 17, 1)
+        guidance = time_abi.host_cpu_unsupported_guidance(None, zen4)
+        assert guidance is not None
+        self.assertIn(
+            "this host's CPU, AuthenticAMD 25/17/1, so a cold boot with "
+            "--cpu-profile auto, the default, fails on it with "
+            "E_PROFILE_HOST_UNKNOWN;",
+            guidance,
+        )
+        self.assertIn(time_abi.describe_cpu_generations(), guidance)
+        self.assertNotIn("rerun with", guidance)
+        self.assertIn("host CPU profiles serve only Intel CPUs", guidance)
+        self.assertIn("https://github.com/microsoft/nvx/issues/396", guidance)
+        self.assertNotIn("issues/390", guidance)
+        self.assertEqual(guidance, time_abi.host_cpu_unsupported_guidance("host", zen4))
+        # Another vendor gets the general issue.
+        guidance = time_abi.host_cpu_unsupported_guidance(
+            "auto", time_abi.HostCpu("HygonGenuine", 24, 0, 1)
+        )
+        assert guidance is not None
+        self.assertIn("host CPU profiles serve only Intel CPUs", guidance)
+        self.assertIn("https://github.com/microsoft/nvx/issues/390", guidance)
+
+        # A CPU that a built-in profile serves, an explicit profile, and an
+        # unknown CPU get none.
+        alder_lake = time_abi.HostCpu("GenuineIntel", 6, 154, 3)
+        for cpu_profile, host in (
+            (None, alder_lake),
+            ("host", alder_lake),
+            ("intel.alderlake.v1", tiger_lake),
+            ("intel.alderlake.v1", zen4),
+            (None, None),
+        ):
+            with self.subTest(cpu_profile=cpu_profile, host=host):
+                self.assertIsNone(
+                    time_abi.host_cpu_unsupported_guidance(cpu_profile, host)
+                )
 
     def test_computes_the_checks_cpu_time_budget(self):
         # The spec's final budgets: a base plus an increment per additional
@@ -1356,6 +1521,12 @@ class DoctorTests(unittest.TestCase):
                 result = doctor.check_cpu(doctor_context(self.root))
             self.assertFalse(result.passed)
             self.assertTrue(result.detail.startswith("[E_PROFILE_HOST_UNKNOWN] "))
+            self.assertIn(time_abi.describe_cpu_generations(), result.detail)
+        alder_lake = dict(CPU, model="154", stepping="3")
+        with patch.object(doctor, "host_cpu", return_value=alder_lake):
+            result = doctor.check_cpu(doctor_context(self.root, "whp"))
+        self.assertTrue(result.passed, result.detail)
+        self.assertIn("generation=alderlake profile=intel.alderlake.v1", result.detail)
         emerald = dict(CPU, model="207", stepping="2")
         with patch.object(doctor, "host_cpu", return_value=emerald):
             for backend in ("kvm", "mshv", "whp"):
@@ -1423,6 +1594,18 @@ class DoctorTests(unittest.TestCase):
         # A later revision of the generation's profile is fine.
         revised = PROFILE_PASS.replace("icelake-sp.v1", "icelake-sp.v2")
         self.assertTrue(check(completed("", 0, revised))[0].passed)
+        # OpenVMM's catalog, not NVX's copy, decides which hosts it serves: a
+        # generation that only OpenVMM pins passes.
+        raptor_lake = PROFILE_PASS.replace("icelake-sp", "raptorlake")
+        result, context = check(
+            completed("", 0, raptor_lake), dict(CPU, model="183", stepping="1")
+        )
+        self.assertTrue(result.passed, result.detail)
+        self.assertIn(
+            "generation=raptorlake profile=intel.raptorlake.v1", result.detail
+        )
+        self.assertEqual(context.facts["generation"], "raptorlake")
+        self.assertEqual(context.facts["profile"], "intel.raptorlake.v1")
 
         unsupported = (
             "NVX-CPU-PROFILE: status=fail backend=whp generation=icelake-sp "
@@ -1468,19 +1651,68 @@ class DoctorTests(unittest.TestCase):
                         "generation=icelake-sp", "generation=emeraldrapids"
                     ),
                 ),
-                "generation emeraldrapids, not icelake-sp",
+                "CPU profile intel.icelake-sp.v1 of generation icelake-sp for "
+                "generation emeraldrapids",
             ),
             (
                 completed(
-                    "", 0, PROFILE_PASS.replace("intel.icelake", "intel.skylake")
+                    "",
+                    0,
+                    PROFILE_PASS.replace(
+                        "profile=intel.icelake-sp.v1", "profile=intel.icelake-sp.v2-rc"
+                    ),
                 ),
-                "profile intel.skylake-sp.v1, not a revision",
+                "CPU profile intel.icelake-sp.v2-rc, which is not a catalog profile ID",
+            ),
+            (
+                completed(
+                    "",
+                    0,
+                    PROFILE_PASS.replace(
+                        "generation=icelake-sp profile=intel.icelake-sp.v1",
+                        "generation=host profile=intel.host.v1",
+                    ),
+                ),
+                "host profile intel.host.v1, which qualification never accepts",
             ),
         ):
             with self.subTest(message=message):
                 result = check(output)[0]
                 self.assertFalse(result.passed)
                 self.assertIn(message, result.detail)
+        # A passing line that lacks the generation or the profile, or leaves
+        # one empty, says so instead of classifying a profile that OpenVMM did
+        # not report.
+        for output_line, unreported in (
+            (PROFILE_PASS.replace("generation=icelake-sp ", ""), "generation"),
+            (
+                PROFILE_PASS.replace("profile=intel.icelake-sp.v1 ", "profile= "),
+                "profile",
+            ),
+            (
+                PROFILE_PASS.replace(
+                    "generation=icelake-sp profile=intel.icelake-sp.v1 ", ""
+                ),
+                "generation and profile",
+            ),
+        ):
+            with self.subTest(unreported=unreported):
+                result, context = check(completed("", 0, output_line))
+                self.assertFalse(result.passed)
+                self.assertIn(
+                    "OpenVMM's CPU profile check passed without reporting its "
+                    f"{unreported};",
+                    result.detail,
+                )
+                self.assertNotIn("OpenVMM reported", result.detail)
+                self.assertEqual(
+                    context.facts["generation"],
+                    "none" if "generation" in unreported else "icelake-sp",
+                )
+                self.assertEqual(
+                    context.facts["profile"],
+                    "none" if "profile" in unreported else "intel.icelake-sp.v1",
+                )
         missing = doctor_context(self.root / "none")
         missing.fingerprint = fingerprint
         with patch.object(doctor, "host_cpu", return_value=dict(CPU)):
@@ -1511,6 +1743,47 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(fields["vendor_id"], "GenuineIntel")
         self.assertEqual(fields["model"], "85")
         self.assertIn("nonstop_tsc", fields["flags"])
+
+    def test_identifies_the_host_cpu_signature(self):
+        HostCpu = time_abi.HostCpu
+        with patch.object(doctor, "host_is_windows", return_value=True):
+            for processor, expected in (
+                (
+                    "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
+                    HostCpu("GenuineIntel", 6, 154, 3),
+                ),
+                (
+                    "AMD64 Family 25 Model 33 Stepping 0, AuthenticAMD",
+                    HostCpu("AuthenticAMD", 25, 33, 0),
+                ),
+                ("", None),
+            ):
+                with (
+                    self.subTest(processor=processor),
+                    patch.object(doctor.platform, "processor", return_value=processor),
+                ):
+                    self.assertEqual(doctor.host_cpu_signature(), expected)
+        cpuinfo = {
+            "vendor_id": "AuthenticAMD",
+            "cpu family": "25",
+            "model": "17",
+            "stepping": "1",
+        }
+        with patch.object(doctor, "host_is_windows", return_value=False):
+            for fields, expected in (
+                (cpuinfo, HostCpu("AuthenticAMD", 25, 17, 1)),
+                ({**cpuinfo, "model": "?"}, None),
+                ({"vendor_id": "AuthenticAMD"}, None),
+            ):
+                with (
+                    self.subTest(fields=fields),
+                    patch.object(doctor, "_linux_cpuinfo", return_value=fields),
+                ):
+                    self.assertEqual(doctor.host_cpu_signature(), expected)
+            with patch.object(
+                doctor, "_linux_cpuinfo", side_effect=FileNotFoundError("cpuinfo")
+            ):
+                self.assertIsNone(doctor.host_cpu_signature())
 
     def test_preflight_parses_openvmm_verification(self):
         # The line format of OpenVMM's openvmm_entry verify.rs.
@@ -1588,6 +1861,12 @@ class DoctorTests(unittest.TestCase):
                 completed(line.replace("intel.icelake-sp.v1", "interim.host.kvm.v1")),
                 "verified no catalog CPU profile: cpu_profile=interim.host.kvm.v1",
             ),
+            # Qualification never accepts a host profile.
+            (
+                completed(line.replace("intel.icelake-sp.v1", "intel.host.v1")),
+                "verified no catalog CPU profile: cpu_profile=intel.host.v1 (a host "
+                "profile, which qualification never accepts)",
+            ),
         )
         for result_value, message in cases:
             with self.subTest(message=message):
@@ -1595,6 +1874,12 @@ class DoctorTests(unittest.TestCase):
                     result = doctor.check_openvmm_preflight(context_with_files())
                 self.assertFalse(result.passed)
                 self.assertIn(message, result.detail)
+        # H3 records a missing profile as none, as H2 does.
+        context = context_with_files()
+        unprofiled = line.replace(" cpu_profile=intel.icelake-sp.v1", "")
+        with patch.object(doctor.subprocess, "run", return_value=completed(unprofiled)):
+            self.assertFalse(doctor.check_openvmm_preflight(context).passed)
+        self.assertEqual(context.facts["profile"], "none")
         for selected, passed in (
             ("intel.icelake-sp.v2", True),
             ("intel.skylake-sp.v1", False),
@@ -1616,6 +1901,17 @@ class DoctorTests(unittest.TestCase):
         missing = doctor.check_openvmm_preflight(doctor_context(self.root / "none"))
         self.assertFalse(missing.passed)
         self.assertIn("was not found", missing.detail)
+        # Without H2, a catalog profile of a generation that only OpenVMM pins
+        # passes.
+        with patch.object(
+            doctor.subprocess,
+            "run",
+            return_value=completed(
+                line.replace("intel.icelake-sp.v1", "intel.raptorlake.v1")
+            ),
+        ):
+            result = doctor.check_openvmm_preflight(context_with_files())
+        self.assertTrue(result.passed, result.detail)
 
     def test_rate_check_applies_the_spec_bounds_to_sleep_separated_samples(self):
         def records(

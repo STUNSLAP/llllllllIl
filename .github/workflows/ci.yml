@@ -370,14 +370,15 @@ jobs:
         with:
           backend: ${{ matrix.backend }}
 
-      - name: Validate NVX CLI
-        uses: ./.github/actions/validate-nvx
-
       - name: Checkout OpenVMM
         id: openvmm
         uses: ./.github/actions/checkout-openvmm
         with:
           ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}
+
+      # After the OpenVMM checkout: the CLI tests read the pinned revision.
+      - name: Validate NVX CLI
+        uses: ./.github/actions/validate-nvx
 
       - name: Set up retrying curl
         uses: ./.github/actions/setup-curl
@@ -604,14 +605,15 @@ jobs:
         with:
           backend: ${{ matrix.backend }}
 
-      - name: Validate NVX CLI
-        uses: ./.github/actions/validate-nvx
-
       - name: Checkout OpenVMM
         id: openvmm
         uses: ./.github/actions/checkout-openvmm
         with:
           ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}
+
+      # After the OpenVMM checkout: the CLI tests read the pinned revision.
+      - name: Validate NVX CLI
+        uses: ./.github/actions/validate-nvx
 
       - name: Set up retrying curl
         uses: ./.github/actions/setup-curl
