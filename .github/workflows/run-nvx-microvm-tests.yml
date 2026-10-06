@@ -437,6 +437,122 @@ jobs:
           python3 scripts/nvx.py sandbox deprovision --state-dir "${state}"
           rm -rf "${share}" "${scratch}"
 
+      - name: Run Ubuntu sandbox concurrent read-write and read-only shares on Linux
+        if: runner.os != 'Windows' && !inputs.debug-kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          uuid=$(
+            python3 -c 'import json; print(json.load(open("build/ubuntu-distro.erofs.manifest.json", encoding="utf-8"))["uuid"])'
+          )
+          scratch="build/ubuntu-shares-${{ inputs.backend }}.ext4"
+          workspace="build/ubuntu-shares-workspace-${{ inputs.backend }}"
+          toolcache="build/ubuntu-shares-toolcache-${{ inputs.backend }}"
+          outside="$(dirname "${workspace}")/nvx-outside-marker"
+          logs="build/test-results/ubuntu-${{ inputs.backend }}"
+          # Keep the control socket path short.
+          state=$(mktemp -d)
+          cleanup() {
+            if [ -f "${state}/runtime.json" ]; then
+              python3 scripts/nvx.py sandbox stop --state-dir "${state}" --timeout 30 || true
+            fi
+            mkdir -p "${logs}"
+            cp "${state}/openvmm.log" "${logs}/shares-openvmm.log" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          prepare_shares() {
+            rm -rf "${workspace}" "${toolcache}"
+            mkdir -p "${workspace}/nvx-denied" "${workspace}/nvx-links" \
+              "${toolcache}/nvx-denied"
+            printf 'host-to-guest\n' >"${workspace}/nvx-host-marker"
+            printf 'host-to-guest\n' >"${toolcache}/nvx-host-marker"
+            printf 'secret\n' >"${workspace}/nvx-denied/secret"
+            printf 'secret\n' >"${toolcache}/nvx-denied/secret"
+            printf 'host-outside\n' >"${outside}"
+            chmod 0777 "${workspace}" "${workspace}/nvx-links"
+            cp --reflink=auto build/ubuntu-smoke-scratch.ext4 "${scratch}"
+          }
+          # The guest writes to the read-write share, and neither it nor a link
+          # in the read-write share changes the read-only share.
+          check_shares() {
+            test "$(cat "${workspace}/nvx-guest-marker")" = guest-to-host
+            test -d "${workspace}/nvx-guest-directory"
+            test ! -L "${workspace}/nvx-cross-share-link"
+            test "$(ls -A "${toolcache}" | sort | tr '\n' ' ')" = "nvx-denied nvx-host-marker "
+            test "$(cat "${toolcache}/nvx-host-marker")" = host-to-guest
+            test "$(cat "${toolcache}/nvx-denied/secret")" = secret
+            test "$(cat "${workspace}/nvx-denied/secret")" = secret
+            test "$(cat "${outside}")" = host-outside
+          }
+          share_options=(
+            --mount "/workspace,${workspace},rw" --mount-deny nvx-denied
+            --mount "/opt/hostedtoolcache,${toolcache},ro" --mount-deny nvx-denied
+          )
+          smoke_arguments=(
+            --entrypoint /sbin/nvx-sandbox-smoke
+            --arg /workspace --arg rw --arg /opt/hostedtoolcache --arg ro
+          )
+          prepare_shares
+          python3 scripts/nvx.py sandbox \
+            --hypervisor "${{ inputs.backend }}" \
+            --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
+            --scratch "${scratch}" \
+            "${share_options[@]}" \
+            "${smoke_arguments[@]}" \
+            --workload-user 65534:65534 \
+            --memory-mib 256
+          check_shares
+          # A managed sandbox persists both shares and reattaches them on start.
+          prepare_shares
+          python3 scripts/nvx.py sandbox provision \
+            --state-dir "${state}" \
+            --hypervisor "${{ inputs.backend }}" \
+            --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
+            --scratch "${scratch}" \
+            "${share_options[@]}" \
+            --workload-user 65534:65534
+          python3 - "${state}/config.json" <<'EOF'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              config = json.load(stream)
+          shares = [
+              (mount["guest_target"], mount["access"], mount["denied_paths"])
+              for mount in config["mounts"]
+          ]
+          expected = [
+              ("/workspace", "rw", ["nvx-denied"]),
+              ("/opt/hostedtoolcache", "ro", ["nvx-denied"]),
+          ]
+          if config["format"] != 4 or "mount" in config or shares != expected:
+              sys.exit(f"managed sandbox did not persist both shares: {config}")
+          EOF
+          python3 scripts/nvx.py sandbox start --state-dir "${state}"
+          python3 scripts/nvx.py sandbox exec --state-dir "${state}" \
+            "${smoke_arguments[@]}"
+          python3 scripts/nvx.py sandbox stop --state-dir "${state}"
+          # A clean ext4 journal shows that stop unmounted both shares, the
+          # overlay, and scratch in order.
+          python3 - "${state}/outcome.json" "${scratch}" <<'EOF'
+          import json
+          import struct
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as report:
+              outcome = json.load(report)["outcome"]
+          expected = {"operation": "managed", "category": "success", "status_code": 0}
+          if outcome != expected:
+              sys.exit(f"managed sandbox outcome is invalid: {outcome}")
+          with open(sys.argv[2], "rb") as image:
+              image.seek(1024 + 0x60)
+              if struct.unpack("<I", image.read(4))[0] & 0x4:
+                  sys.exit("managed stop left the scratch filesystem mounted")
+          EOF
+          check_shares
+          python3 scripts/nvx.py sandbox deprovision --state-dir "${state}"
+          rm -rf "${workspace}" "${toolcache}" "${scratch}" "${outside}"
+
       - name: Run Ubuntu sandbox layer smoke test on Windows
         if: runner.os == 'Windows' && !inputs.debug-kernel
         shell: powershell
@@ -625,6 +741,110 @@ jobs:
           if ([IO.File]::ReadAllText((Join-Path $share "nvx-denied\secret")) -ne "secret`n") { throw "a managed guest link reached a denied file" }
           Invoke-Nvx sandbox deprovision --state-dir $state
           Remove-Item -Recurse -Force $share, $scratch, $outside
+
+      - name: Run Ubuntu sandbox concurrent read-write and read-only shares on Windows
+        if: runner.os == 'Windows' && !inputs.debug-kernel
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Invoke-Nvx {
+              python scripts\nvx.py @args
+              if ($LASTEXITCODE -ne 0) {
+                  throw "nvx.py $($args[0]) $($args[1]) failed with exit code $LASTEXITCODE"
+              }
+          }
+          $manifest = Get-Content -Raw build\ubuntu-distro.erofs.manifest.json |
+              ConvertFrom-Json
+          $layer = "distro,build\ubuntu-distro.erofs,$($manifest.uuid)"
+          $scratch = Join-Path $PWD "build\ubuntu-shares-${{ inputs.backend }}.ext4"
+          $workspace = Join-Path $PWD "build\ubuntu-shares-workspace-${{ inputs.backend }}"
+          $toolcache = Join-Path $PWD "build\ubuntu-shares-toolcache-${{ inputs.backend }}"
+          $state = Join-Path $PWD "build\ubuntu-shares-state-${{ inputs.backend }}"
+          $outside = Join-Path (Split-Path $workspace) "nvx-outside-marker"
+          $logs = "build\test-results\ubuntu-${{ inputs.backend }}"
+          $shareOptions = @(
+              "--mount", "/workspace,$workspace,rw", "--mount-deny", "nvx-denied",
+              "--mount", "/opt/hostedtoolcache,$toolcache,ro", "--mount-deny", "nvx-denied"
+          )
+          $smokeArguments = @(
+              "--entrypoint", "/sbin/nvx-sandbox-smoke",
+              "--arg", "/workspace", "--arg", "rw",
+              "--arg", "/opt/hostedtoolcache", "--arg", "ro"
+          )
+          function Initialize-Shares {
+              foreach ($path in $workspace, $toolcache, $state) {
+                  if (Test-Path $path) { Remove-Item -Recurse -Force $path }
+              }
+              New-Item -ItemType Directory -Force (Join-Path $workspace "nvx-denied"), (Join-Path $workspace "nvx-links"), (Join-Path $toolcache "nvx-denied") | Out-Null
+              foreach ($share in $workspace, $toolcache) {
+                  [IO.File]::WriteAllText((Join-Path $share "nvx-host-marker"), "host-to-guest`n")
+                  [IO.File]::WriteAllText((Join-Path $share "nvx-denied\secret"), "secret`n")
+              }
+              [IO.File]::WriteAllText($outside, "host-outside`n")
+              Copy-Item -Force build\ubuntu-smoke-scratch.ext4 $scratch
+          }
+          # The guest writes to the read-write share, and neither it nor a link
+          # in the read-write share changes the read-only share.
+          function Test-Shares {
+              if ([IO.File]::ReadAllText((Join-Path $workspace "nvx-guest-marker")) -ne "guest-to-host`n") {
+                  throw "guest write did not reach the read-write share"
+              }
+              if (-not (Test-Path (Join-Path $workspace "nvx-guest-directory") -PathType Container)) {
+                  throw "guest directory did not reach the read-write share"
+              }
+              if (Test-Path -LiteralPath (Join-Path $workspace "nvx-cross-share-link")) {
+                  throw "cross-share link removal did not reach the host"
+              }
+              $entries = (Get-ChildItem -Force -Name $toolcache | Sort-Object) -join " "
+              if ($entries -ne "nvx-denied nvx-host-marker") { throw "guest changed the read-only share: $entries" }
+              foreach ($share in $workspace, $toolcache) {
+                  if ([IO.File]::ReadAllText((Join-Path $share "nvx-denied\secret")) -ne "secret`n") { throw "guest changed a denied file" }
+              }
+              if ([IO.File]::ReadAllText((Join-Path $toolcache "nvx-host-marker")) -ne "host-to-guest`n") { throw "guest changed the read-only share" }
+              if ([IO.File]::ReadAllText($outside) -ne "host-outside`n") { throw "a guest link reached host data outside the shares" }
+          }
+          Initialize-Shares
+          Invoke-Nvx sandbox --hypervisor "${{ inputs.backend }}" --layer $layer --scratch $scratch @shareOptions @smokeArguments --workload-user 65534:65534 --memory-mib 256
+          Test-Shares
+          # A managed sandbox persists both shares and reattaches them on start.
+          Initialize-Shares
+          Invoke-Nvx sandbox provision --state-dir $state --hypervisor "${{ inputs.backend }}" --layer $layer --scratch $scratch @shareOptions --workload-user 65534:65534
+          $config = Get-Content -Raw (Join-Path $state "config.json") | ConvertFrom-Json
+          if ($config.format -ne 4 -or $config.mounts.Count -ne 2 -or $config.mounts[0].guest_target -ne "/workspace" -or $config.mounts[1].access -ne "ro") {
+              throw "managed sandbox did not persist both shares: $($config | ConvertTo-Json -Compress -Depth 5)"
+          }
+          try {
+              Invoke-Nvx sandbox start --state-dir $state
+              Invoke-Nvx sandbox exec --state-dir $state @smokeArguments
+              Invoke-Nvx sandbox stop --state-dir $state
+          } finally {
+              if (Test-Path (Join-Path $state "runtime.json")) {
+                  python scripts\nvx.py sandbox stop --state-dir $state --timeout 30
+              }
+              New-Item -ItemType Directory -Force $logs | Out-Null
+              $log = Join-Path $state "openvmm.log"
+              if (Test-Path $log) { Copy-Item -Force $log (Join-Path $logs "shares-openvmm.log") }
+          }
+          $outcome = (Get-Content -Raw (Join-Path $state "outcome.json") | ConvertFrom-Json).outcome
+          if ($outcome.operation -ne "managed" -or $outcome.category -ne "success" -or $outcome.status_code -ne 0) {
+              throw "managed sandbox outcome is invalid: $($outcome | ConvertTo-Json -Compress)"
+          }
+          # A clean ext4 journal shows that stop unmounted both shares, the
+          # overlay, and scratch in order.
+          $image = [IO.File]::OpenRead($scratch)
+          try {
+              $null = $image.Seek(1024 + 0x60, [IO.SeekOrigin]::Begin)
+              $incompat = New-Object byte[] 4
+              if ($image.Read($incompat, 0, 4) -ne 4) { throw "scratch superblock is truncated" }
+          } finally {
+              $image.Dispose()
+          }
+          if ([BitConverter]::ToUInt32($incompat, 0) -band 4) {
+              throw "managed stop left the scratch filesystem mounted"
+          }
+          Test-Shares
+          Invoke-Nvx sandbox deprovision --state-dir $state
+          Remove-Item -Recurse -Force $workspace, $toolcache, $scratch, $outside
 
       - name: Run aci_edge_sandboxes lifecycle test on Linux
         if: runner.os != 'Windows' && !inputs.debug-kernel

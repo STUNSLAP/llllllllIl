@@ -103,16 +103,22 @@ restore, the same write acknowledges completion of guest repair.
 
 ## Fixed virtio-mmio transport
 
-All eight fixed address slots are reserved, including the dedicated control
-console at `0xd0007000..0xd0007fff` on IRQ 3 (shared status at `0x3001c`).
+All nine fixed address slots are reserved, including the dedicated control
+console at `0xd0007000..0xd0007fff` on IRQ 3 (shared status at `0x3001c`) and
+the second virtio-fs slot at `0xd0008000..0xd0008fff` on IRQ 13 (shared status
+at `0x30020`).
 Every microVM cold-booted from the command line or the management RPC
-instantiates the virtio-fs slot, so it is discoverable before capture even
+instantiates the first virtio-fs slot, so it is discoverable before capture even
 without a host attachment; a restore keeps the slot only when the snapshot
-recorded it. Other optional devices are instantiated only when configured.
+recorded it. The second virtio-fs slot exists only with a second host
+attachment, so machines with one share or none keep their device inventory
+and command line. Other optional devices are instantiated only when configured.
 The control slot is instantiated for a control console, either a live
 authenticated local endpoint on Linux or Windows or an explicitly disconnected
 console. Every device uses virtio-mmio, is discovered only through
 profile-owned command-line tokens, and has packed-ring support masked.
+The MP table routes only the 16 ISA interrupts, and no other device uses
+IRQ 13 on KVM, MSHV, or WHP.
 
 | Device | Stable identity | MMIO range | IRQ | Availability |
 | --- | --- | ---: | ---: | --- |
@@ -124,6 +130,7 @@ profile-owned command-line tokens, and has packed-ring support masked.
 | `custom` virtio-blk | `blk:sandbox:custom` | `0xd0005000..0xd0005fff` | 9 | Optional read-only role |
 | `scratch` virtio-blk | `blk:sandbox:scratch` | `0xd0006000..0xd0006fff` | 11 | Required writable final role when blocks are present |
 | Control virtio-console | `console:microvm-control0` | `0xd0007000..0xd0007fff` | 3 | Optional authenticated local endpoint |
+| Second virtio-fs | `fs:microvm1` | `0xd0008000..0xd0008fff` | 13 | Optional; requires a HostFs attachment |
 
 Explicit placement metadata bypasses the standard sequential MMIO allocator.
 The worker validates the complete device count, kind, bus, address, IRQ, and
@@ -158,6 +165,7 @@ per fixed slot resides in the reserved shared-status page:
 | `custom` block | `0x30014` |
 | `scratch` block | `0x30018` |
 | Control virtio-console | `0x3001c` |
+| Second virtio-fs | `0x30020` |
 
 OpenVMM publishes config-change and used-buffer bits with a sequentially
 consistent compare-exchange loop. It pulses the device IRQ only when the old
@@ -342,11 +350,17 @@ traffic must establish fresh post-restore flows.
 
 ### Filesystem
 
-The filesystem slot is a no-DAX virtio-fs device with tag `microvm`, one
+Each filesystem slot is a no-DAX virtio-fs device with a fixed tag, `microvm`
+for the first slot and `microvm1` for the second, one
 high-priority queue, one request queue, direct I/O, and zero guest cache
 lifetimes. It requires FUSE 7.31 or newer and caps writes at 1 MiB. Without
-`--mount`, it has no HostFs backend or active filesystem policy but remains
-guest-discoverable. Its explicit profile rejects SectionFs, Aggregate,
+`--mount`, the first slot has no HostFs backend or active filesystem policy but remains
+guest-discoverable. A second `--mount` attaches a second, independent HostFs
+server with its own access mode and denied paths to the second slot. Guest
+targets and host roots of the two attachments must not equal or contain one
+another, so neither share can hide the other or reach its files under a
+different policy. Each attachment adds one `virtfs_dir=`, `virtfs_tag=`,
+`virtfs_mode=` token triplet, in slot order. Its explicit profile rejects SectionFs, Aggregate,
 alternate tags, extra queues, shared-memory windows, and PCI transport.
 The host root is pinned by its platform object identity and revalidated when
 the export is opened, and every operation stays confined to the export: on
@@ -383,7 +397,10 @@ ownership mode, FUSE negotiation, node
 and handle allocation, aliases (including those of symbolic links), lookup
 counts, directory snapshots and cookies, and the identities needed to reopen
 objects. Restore requires the same path,
-target, mode, denied-path set, ownership mode, root identity, and reopenable objects. A caller-owned
+target, mode, denied-path set, ownership mode, root identity, and reopenable
+objects for every captured attachment, supplied in slot order; the contract
+records the second attachment separately, so a restore can neither drop nor
+add it. A caller-owned
 capture records device-private schema version 6, which earlier releases reject
 instead of restoring the attachment as the VMM. A dormant capture instead
 saves explicit unattached state and may restore with no attachment or bind a

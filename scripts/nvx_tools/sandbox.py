@@ -25,6 +25,10 @@ SANDBOX_COMMAND_LINE_MAX_SIZE = (
 _HOSTNAME = re.compile(r"(?=^.{1,63}$)(?!-)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 DEFAULT_WORKLOAD_IDENTITY = (65534, 65534)
 MOUNT_ACCESS_MODES = ("ro", "rw")
+# OpenVMM attaches each live share to the next fixed virtio-fs slot, which has
+# its own guest-visible tag.
+MOUNT_TAGS = ("microvm", "microvm1")
+MAX_MOUNTS = len(MOUNT_TAGS)
 # `vmm` performs every share operation as OpenVMM; `caller` performs each as the
 # guest caller's identity, with guest root squashed to the share owner.
 MOUNT_OWNERS = ("vmm", "caller")
@@ -35,8 +39,8 @@ MOUNT_OWNERS = ("vmm", "caller")
 RESERVED_MOUNT_TARGETS = ("/proc", "/sys", "/dev", "/.nvx-agent")
 RESERVED_EXACT_MOUNT_TARGETS = ("/etc",)
 MAX_MOUNT_DENIED_PATHS = 128
-# OpenVMM appends exactly these virtio-fs bootstrap tokens for a live share.
-_MOUNT_COMMAND_LINE_FRAGMENT = " virtfs_dir={} virtfs_tag=microvm virtfs_mode={}"
+# OpenVMM appends exactly these virtio-fs bootstrap tokens for each live share.
+_MOUNT_COMMAND_LINE_FRAGMENT = " virtfs_dir={} virtfs_tag={} virtfs_mode={}"
 
 
 def parse_workload_identity(value: str) -> tuple[int, int]:
@@ -201,19 +205,110 @@ class SandboxMount:
             owner=self.owner,
         )
 
-    def openvmm_arguments(self) -> list[str]:
-        arguments = [
-            "--mount",
-            f"{self.guest_target},{os.fspath(self.host_path)},{self.access}",
-        ]
-        for denied in self.denied_paths:
-            arguments.extend(("--mount-deny", denied))
-        if self.owner != "vmm":
-            arguments.extend(("--mount-owner", self.owner))
-        return arguments
+    def absolute_denied_paths(self) -> tuple[str, ...]:
+        """Return the denied paths, with relative paths joined to the share."""
+        host_path = self.absolute().host_path
+        return tuple(
+            denied if Path(denied).is_absolute() else os.fspath(host_path / denied)
+            for denied in self.denied_paths
+        )
 
-    def command_line_fragment(self) -> str:
-        return _MOUNT_COMMAND_LINE_FRAGMENT.format(self.guest_target, self.access)
+    def command_line_fragment(self, tag: str = MOUNT_TAGS[0]) -> str:
+        return _MOUNT_COMMAND_LINE_FRAGMENT.format(self.guest_target, tag, self.access)
+
+
+def _targets_overlap(left: str, right: str) -> bool:
+    return left == right or left.startswith(f"{right}/") or right.startswith(f"{left}/")
+
+
+def validate_mounts(mounts: tuple[SandboxMount, ...]) -> None:
+    """Validate the live shares that one sandbox attaches, in slot order."""
+    if len(mounts) > MAX_MOUNTS:
+        raise ScriptError(f"a sandbox permits at most {MAX_MOUNTS} --mount options")
+    for index, mount in enumerate(mounts):
+        for other in mounts[:index]:
+            if _targets_overlap(other.guest_target, mount.guest_target):
+                raise ScriptError(
+                    f"sandbox mount targets {other.guest_target} and "
+                    f"{mount.guest_target} overlap; a share cannot hide another"
+                )
+    if len({mount.owner for mount in mounts}) > 1:
+        raise ScriptError("every sandbox --mount must use the same --mount-owner")
+
+
+def _directory_identity(path: Path) -> tuple[int, int]:
+    status = path.stat()
+    return status.st_dev, status.st_ino
+
+
+def validate_mount_host_paths(mounts: tuple[SandboxMount, ...]) -> None:
+    """Reject shares whose host directories overlap, or deny another's paths."""
+    if len(mounts) < 2:
+        return
+    roots = [mount.host_path.resolve() for mount in mounts]
+    # Resolving follows symbolic links but not bind mounts, so also compare the
+    # file identities that OpenVMM pins for each share: a root with the identity
+    # of another root, or of one of its ancestors, is that directory or lies
+    # inside a bind mount of it. On Linux, OpenVMM also compares the mount
+    # sources that each share reaches, which catches a bind mount that exposes
+    # part of one share inside the other.
+    lineages = [
+        [_directory_identity(path) for path in (root, *root.parents)] for root in roots
+    ]
+    for index, root in enumerate(roots):
+        for other_index, other in enumerate(roots[:index]):
+            if root == other or other in root.parents or root in other.parents:
+                raise ScriptError(
+                    f"sandbox mount host directories {other} and {root} overlap; "
+                    "a share could reach files of another under its access mode"
+                )
+            if (
+                lineages[index][0] in lineages[other_index]
+                or lineages[other_index][0] in lineages[index]
+            ):
+                raise ScriptError(
+                    f"sandbox mount host directories {other} and {root} are the "
+                    "same directory, or one is inside the other through a bind mount"
+                )
+    for mount, root in zip(mounts, roots, strict=True):
+        for denied in mount.absolute_denied_paths():
+            if root not in Path(denied).resolve().parents:
+                raise ScriptError(
+                    f"--mount-deny {denied} is not inside the host directory of "
+                    f"--mount {mount.guest_target}; with several shares, each "
+                    "--mount-deny follows the --mount whose directory it hides"
+                )
+
+
+def mounts_openvmm_arguments(mounts: tuple[SandboxMount, ...]) -> list[str]:
+    """Return the OpenVMM arguments that attach `mounts` in slot order."""
+    arguments: list[str] = []
+    for mount in mounts:
+        arguments.extend(
+            (
+                "--mount",
+                f"{mount.guest_target},{os.fspath(mount.host_path)},{mount.access}",
+            )
+        )
+    for mount in mounts:
+        # OpenVMM resolves a relative denied path in the only share, and
+        # attributes absolute denied paths to the share that contains them.
+        denied_paths = (
+            mount.denied_paths if len(mounts) == 1 else mount.absolute_denied_paths()
+        )
+        for denied in denied_paths:
+            arguments.extend(("--mount-deny", denied))
+    if mounts and mounts[0].owner != "vmm":
+        arguments.extend(("--mount-owner", mounts[0].owner))
+    return arguments
+
+
+def mounts_command_line_fragment(mounts: tuple[SandboxMount, ...]) -> str:
+    """Return the bootstrap tokens that OpenVMM appends for `mounts`."""
+    return "".join(
+        mount.command_line_fragment(tag)
+        for mount, tag in zip(mounts, MOUNT_TAGS[: len(mounts)], strict=True)
+    )
 
 
 @dataclass(frozen=True)
@@ -226,7 +321,7 @@ class SandboxLaunch:
     workload_identity: tuple[int, int] = DEFAULT_WORKLOAD_IDENTITY
     memory_max: int | None = None
     pids_max: int | None = None
-    mount: SandboxMount | None = None
+    mounts: tuple[SandboxMount, ...] = ()
 
     def __post_init__(self) -> None:
         if not 1 <= len(self.layers) <= len(LAYER_ROLES):
@@ -261,6 +356,7 @@ class SandboxLaunch:
         ):
             if value is not None and value <= 0:
                 raise ScriptError(f"--{name} must be positive")
+        validate_mounts(self.mounts)
 
     def validated(self) -> SandboxLaunch:
         for layer in self.layers:
@@ -268,8 +364,9 @@ class SandboxLaunch:
             _reject_disk_path(layer.path)
         require_file(self.scratch, "ext4 scratch image")
         _reject_disk_path(self.scratch)
-        if self.mount is not None:
-            self.mount.validated()
+        for mount in self.mounts:
+            mount.validated()
+        validate_mount_host_paths(self.mounts)
         return self
 
     def ordered_layers(self) -> tuple[SandboxLayer, ...]:
@@ -293,8 +390,7 @@ class SandboxLaunch:
                 f"{self.workload_identity[0]}:{self.workload_identity[1]}",
             )
         )
-        if self.mount is not None:
-            arguments.extend(self.mount.openvmm_arguments())
+        arguments.extend(mounts_openvmm_arguments(self.mounts))
         return arguments
 
     def kernel_command_line(self, user_command_line: str = "") -> str:
@@ -330,9 +426,7 @@ class SandboxLaunch:
         command_line = " ".join(token for token in tokens if token)
         # OpenVMM appends the live-share bootstrap tokens after this command line,
         # so they consume the same x86 budget.
-        mount_fragment = (
-            "" if self.mount is None else self.mount.command_line_fragment()
-        )
+        mount_fragment = mounts_command_line_fragment(self.mounts)
         if (
             len(command_line.encode("utf-8")) + len(mount_fragment.encode("utf-8")) + 1
             > SANDBOX_COMMAND_LINE_MAX_SIZE

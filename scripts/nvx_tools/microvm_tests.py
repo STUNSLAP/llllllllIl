@@ -86,6 +86,7 @@ MICROVM_TEST_SCENARIOS = (
     "denied-filesystem-paths",
     "endpoint-policy-snapshot",
     "filesystem-owner",
+    "filesystem-shares",
     "filesystem-snapshot",
     "guest-boot",
     "guest-identity",
@@ -181,6 +182,9 @@ FILESYSTEM_DORMANT_BEFORE_MARKER = b"NVX-FILESYSTEM-DORMANT-BEFORE"
 FILESYSTEM_DORMANT_ATTACHED_MARKER = b"NVX-FILESYSTEM-DORMANT-ATTACHED"
 FILESYSTEM_LIVE_BEFORE_MARKER = b"NVX-FILESYSTEM-LIVE-BEFORE"
 FILESYSTEM_LIVE_AFTER_MARKER = b"NVX-FILESYSTEM-LIVE-AFTER"
+FILESYSTEM_SHARES_MARKER = b"NVX-FILESYSTEM-SHARES-OK"
+FILESYSTEM_SHARES_BEFORE_MARKER = b"NVX-FILESYSTEM-SHARES-BEFORE"
+FILESYSTEM_SHARES_AFTER_MARKER = b"NVX-FILESYSTEM-SHARES-AFTER"
 NETWORK_BEFORE_MARKER = b"NVX-NETWORK-BEFORE"
 NETWORK_INVALIDATED_MARKER = b"NVX-NETWORK-OLD-FLOW-INVALIDATED"
 NETWORK_AFTER_MARKER = b"NVX-NETWORK-AFTER"
@@ -4218,6 +4222,219 @@ def run_filesystem_snapshot(
             )
 
 
+def _tree_contents(root: Path) -> dict[str, bytes | None]:
+    """Return the regular-file contents and directory names below `root`."""
+    contents: dict[str, bytes | None] = {}
+    for directory, names, files in os.walk(root):
+        for name in names:
+            contents[(Path(directory) / name).relative_to(root).as_posix()] = None
+        for name in files:
+            path = Path(directory) / name
+            contents[path.relative_to(root).as_posix()] = path.read_bytes()
+    return contents
+
+
+def _shares_command(
+    executable: Path,
+    backend: str,
+    kernel: Path,
+    initrd: Path,
+    memory_mib: int,
+    workspace: Path,
+    toolcache: Path,
+) -> list[str]:
+    command = workload_boot_command(
+        executable,
+        backend,
+        kernel,
+        initrd,
+        memory_mib,
+        "quiet loglevel=0",
+        mount=f"/workspace,{workspace},rw",
+    )
+    command.extend(("--mount", f"/opt/hostedtoolcache,{toolcache},ro"))
+    return command
+
+
+def run_filesystem_shares(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Attach a read-write workspace and a read-only tool cache together."""
+    with tempfile.TemporaryDirectory(prefix="nvx-filesystem-shares-") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        toolcache = root / "toolcache"
+        (workspace / "secrets").mkdir(parents=True)
+        (toolcache / "tools").mkdir(parents=True)
+        (toolcache / "credentials").mkdir()
+        (workspace / "seed").write_bytes(b"NVX-WORKSPACE")
+        (workspace / "secrets" / "token").write_bytes(b"NVX-SECRET")
+        (toolcache / "seed").write_bytes(b"NVX-TOOLCACHE")
+        (toolcache / "tools" / "node").write_bytes(b"NVX-TOOL")
+        (toolcache / "credentials" / "token").write_bytes(b"NVX-CREDENTIAL")
+        toolcache_contents = _tree_contents(toolcache)
+
+        command = _shares_command(
+            executable, backend, kernel, initrd, memory_mib, workspace, toolcache
+        )
+        command.extend(
+            (
+                "--mount-deny",
+                str(workspace / "secrets"),
+                "--mount-deny",
+                str(toolcache / "credentials"),
+            )
+        )
+        run_guest_script(
+            command,
+            _read_script("filesystem-shares.sh"),
+            FILESYSTEM_SHARES_MARKER,
+            timeout=timeout,
+            log_path=output_dir / "filesystem-shares.log",
+        )
+        if (workspace / "from-guest").read_bytes() != b"NVX-GUEST-WRITE\n":
+            raise RuntimeError("read-write share did not accept a guest write")
+        if not (workspace / "guest-directory").is_dir():
+            raise RuntimeError("read-write share did not accept a guest directory")
+        assert_guest_symlink(workspace / "toolcache-seed", "/opt/hostedtoolcache/seed")
+        if _tree_contents(toolcache) != toolcache_contents:
+            raise RuntimeError("guest modified the read-only share")
+        if (workspace / "secrets" / "token").read_bytes() != b"NVX-SECRET":
+            raise RuntimeError("guest modified a denied path")
+
+        third = root / "third"
+        third.mkdir()
+        nested = workspace / "nested"
+        nested.mkdir()
+        for name, arguments, expected in (
+            (
+                "three-shares",
+                ("--mount", f"/third,{third},ro"),
+                b"at most 2 filesystems",
+            ),
+            ("relative-deny", ("--mount-deny", "secrets"), b"absolute host path"),
+        ):
+            invalid = _shares_command(
+                executable, backend, kernel, initrd, memory_mib, workspace, toolcache
+            )
+            invalid.extend(arguments)
+            _expect_boot_failure(
+                invalid, output_dir / f"filesystem-shares-{name}.log", timeout, expected
+            )
+        for name, mount, expected in (
+            ("nested-target", f"/workspace/cache,{toolcache},ro", b"overlap"),
+            ("nested-host", f"/opt/hostedtoolcache,{nested},ro", b"must not overlap"),
+        ):
+            invalid = workload_boot_command(
+                executable,
+                backend,
+                kernel,
+                initrd,
+                memory_mib,
+                "quiet loglevel=0",
+                mount=f"/workspace,{workspace},rw",
+            )
+            invalid.extend(("--mount", mount))
+            _expect_boot_failure(
+                invalid, output_dir / f"filesystem-shares-{name}.log", timeout, expected
+            )
+
+        # Both shares belong to the snapshot contract, in slot order.
+        snapshot = root / "snapshot"
+        with OpenvmmProcess(
+            [
+                *_shares_command(
+                    executable,
+                    backend,
+                    kernel,
+                    initrd,
+                    memory_mib,
+                    workspace,
+                    toolcache,
+                ),
+                "--snapshot-destination",
+                str(snapshot),
+            ],
+            output_dir / "filesystem-shares-capture.log",
+        ) as process:
+            process.wait_for(BOOT_MARKER, timeout)
+            _stage_script(
+                process,
+                "/tmp/nvx-filesystem-shares",
+                "NVX_FILESYSTEM_SHARES",
+                _read_script("filesystem-shares-snapshot.sh"),
+            )
+            source = process.wait(timeout)
+        source_lines = _output_lines(source.output)
+        if source.returncode != 0 or (
+            source_lines.count(FILESYSTEM_SHARES_BEFORE_MARKER) != 1
+        ):
+            raise RuntimeError("two-share snapshot capture failed")
+        if FILESYSTEM_SHARES_AFTER_MARKER in source_lines:
+            raise RuntimeError("two-share snapshot source crossed the capture boundary")
+        fingerprint = _snapshot_fingerprint(snapshot)
+
+        workspace_mount = ("--mount", f"/workspace,{workspace},rw")
+        toolcache_mount = ("--mount", f"/opt/hostedtoolcache,{toolcache},ro")
+        for name, mounts, expected in (
+            ("missing-share", (workspace_mount,), b"2 --mount attachments"),
+            (
+                "swapped-shares",
+                (toolcache_mount, workspace_mount),
+                b"does not match the snapshot contract",
+            ),
+        ):
+            invalid = snapshot_restore_command(executable, backend, snapshot)
+            for mount in mounts:
+                invalid.extend(mount)
+            _expect_process_failure(
+                invalid,
+                output_dir / f"filesystem-shares-{name}.log",
+                timeout,
+                expected,
+                (FILESYSTEM_SHARES_AFTER_MARKER,),
+            )
+        restore = snapshot_restore_command(executable, backend, snapshot)
+        restore.extend((*workspace_mount, *toolcache_mount))
+        with OpenvmmProcess(
+            restore, output_dir / "filesystem-shares-restore.log"
+        ) as process:
+            process.wait_for(FILESYSTEM_SHARES_AFTER_MARKER, timeout)
+            restored = process.wait(timeout)
+        if restored.returncode != 0:
+            raise RuntimeError(
+                f"two-share snapshot restore exited with {restored.returncode}"
+            )
+        if _snapshot_fingerprint(snapshot) != fingerprint:
+            raise RuntimeError("two-share snapshot restore modified snapshot artifacts")
+        if (workspace / "journal").read_bytes() != b"NVX-BEFORENVX-AFTER":
+            raise RuntimeError("read-write share did not resume after restore")
+        if _tree_contents(toolcache) != toolcache_contents:
+            raise RuntimeError("restored guest modified the read-only share")
+
+
+def _expect_boot_failure(
+    command: list[str], log_path: Path, timeout: float, expected: bytes
+) -> None:
+    with OpenvmmProcess(command, log_path) as process:
+        result = process.wait(timeout)
+    if (
+        result.returncode == 0
+        or expected not in result.output
+        or BOOT_MARKER in result.output
+    ):
+        raise RuntimeError(
+            f"OpenVMM did not reject the invalid configuration before boot: {command}"
+        )
+
+
 def run_scratch_snapshot(
     executable: Path,
     kernel: Path,
@@ -4997,6 +5214,20 @@ def run(args: argparse.Namespace) -> int:
             f"OpenVMM/{args.backend}"
         )
         run_endpoint_policy_snapshot(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "filesystem-shares" in scenarios:
+        print(
+            "Running concurrent read-write and read-only microVM shares "
+            f"on OpenVMM/{args.backend}"
+        )
+        run_filesystem_shares(
             executable,
             kernel,
             initrd,

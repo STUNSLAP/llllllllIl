@@ -84,6 +84,7 @@ from nvx_tools.release import (
     verify_source_tree,
 )
 from nvx_tools.sandbox import (
+    MAX_MOUNTS,
     MOUNT_OWNERS,
     SandboxLaunch,
     SandboxLayer,
@@ -98,6 +99,48 @@ HYPERVISORS = ("auto", "whp", "kvm", "mshv")
 NETWORK_PROFILES = ("portable",)
 MAX_ENVIRONMENT_FILE_BYTES = 1024 * 1024
 SYSTEMD_ENTRYPOINTS = frozenset(("/usr/lib/systemd/systemd", "/lib/systemd/systemd"))
+
+
+class _MountDenyAction(argparse.Action):
+    """Record each --mount-deny with the index of the --mount before it."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | Sequence[object] | None,
+        option_string: str | None = None,
+    ) -> None:
+        mounts = cast(list[str], getattr(namespace, "mount", None) or [])
+        denied = list(
+            cast(list[tuple[int, str]], getattr(namespace, self.dest, None) or [])
+        )
+        denied.append((len(mounts) - 1, cast(str, values)))
+        setattr(namespace, self.dest, denied)
+
+
+def _sandbox_mounts(args: argparse.Namespace) -> tuple[SandboxMount, ...]:
+    """Attribute each --mount-deny to its share and parse the --mount options.
+
+    With one --mount, every --mount-deny hides a path in it. With several, each
+    --mount-deny hides a path in the --mount that precedes it.
+    """
+    mounts = cast(list[str], args.mount)
+    denied: list[list[str]] = [[] for _ in mounts]
+    for index, path in cast(list[tuple[int, str]], args.mount_deny):
+        if len(mounts) == 1:
+            index = 0
+        elif index < 0:
+            raise ScriptError(
+                "with several --mount options, each --mount-deny must follow the "
+                "--mount whose host directory it hides"
+            )
+        denied[index].append(path)
+    owner = args.mount_owner or "vmm"
+    return tuple(
+        SandboxMount.parse(value, tuple(paths), owner)
+        for value, paths in zip(mounts, denied, strict=True)
+    )
 
 
 def _run(
@@ -401,11 +444,13 @@ def command_run(args: argparse.Namespace) -> None:
             command.extend(["--memory-capacity", f"{args.memory_capacity_mib}M"])
     if args.cpu_profile is not None:
         command.extend(["--cpu-profile", args.cpu_profile])
-    if args.mount is not None:
-        if args.mount.count(",") not in (1, 2):
+    if len(args.mount) > MAX_MOUNTS:
+        raise ScriptError(f"--mount is accepted at most {MAX_MOUNTS} times")
+    for mount in args.mount:
+        if mount.count(",") not in (1, 2):
             raise ScriptError("--mount must be GUEST_TARGET,HOST_PATH[,ro|rw]")
-        command.extend(["--mount", args.mount])
-    elif args.mount_owner is not None:
+        command.extend(["--mount", mount])
+    if args.mount_owner is not None and not args.mount:
         raise ScriptError("--mount-owner requires --mount")
     for denied_path in args.mount_deny:
         command.extend(["--mount-deny", str(denied_path)])
@@ -518,11 +563,11 @@ def command_sandbox(args: argparse.Namespace) -> None:
         raise ScriptError(
             "--outcome-report is only valid for one-shot run or managed exec"
         )
-    if args.mount_deny and args.mount is None:
+    if args.mount_deny and not args.mount:
         raise ScriptError("--mount-deny requires --mount")
-    if args.mount_owner is not None and args.mount is None:
+    if args.mount_owner is not None and not args.mount:
         raise ScriptError("--mount-owner requires --mount")
-    if args.mount is not None and operation not in ("run", "provision"):
+    if args.mount and operation not in ("run", "provision"):
         raise ScriptError("--mount is only valid for sandbox run or provision")
     if operation in ("run", "provision"):
         if (args.net is None) != (args.network_profile is None):
@@ -539,15 +584,7 @@ def command_sandbox(args: argparse.Namespace) -> None:
             workload_identity=args.workload_user,
             memory_max=args.memory_max,
             pids_max=args.pids_max,
-            mount=(
-                None
-                if args.mount is None
-                else SandboxMount.parse(
-                    args.mount,
-                    tuple(args.mount_deny),
-                    args.mount_owner or "vmm",
-                )
-            ),
+            mounts=_sandbox_mounts(args),
         ).validated()
         _validate_sandbox_systemd_policy(launch)
     else:
@@ -919,7 +956,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "derive a development profile from this host (doc/usage.md)"
         ),
     )
-    run.add_argument("--mount", help="GUEST_TARGET,HOST_PATH,ro|rw")
+    run.add_argument(
+        "--mount",
+        action="append",
+        default=[],
+        metavar="GUEST_TARGET,HOST_PATH[,ro|rw]",
+        help=(
+            "live-share a host directory; repeat once for a second share with "
+            "its own guest target and mode"
+        ),
+    )
     run.add_argument("--mount-deny", action="append", type=Path, default=[])
     run.add_argument(
         "--mount-owner",
@@ -1042,15 +1088,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sandbox.add_argument("--hypervisor", choices=HYPERVISORS, default="auto")
     sandbox.add_argument(
         "--mount",
+        action="append",
+        default=[],
         metavar="GUEST_TARGET,HOST_PATH[,ro|rw]",
-        help="live-share one host directory inside the container rootfs",
+        help=(
+            "live-share a host directory inside the container rootfs; repeat "
+            f"to attach up to {MAX_MOUNTS} shares, each with its own target and "
+            "mode"
+        ),
     )
     sandbox.add_argument(
         "--mount-deny",
-        action="append",
+        action=_MountDenyAction,
         default=[],
         metavar="HOST_PATH",
-        help="hide one existing path inside the --mount host directory",
+        help=(
+            "hide one existing path inside a --mount host directory; with "
+            "several --mount options, it applies to the --mount before it"
+        ),
     )
     sandbox.add_argument(
         "--mount-owner",

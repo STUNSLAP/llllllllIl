@@ -229,7 +229,16 @@ no link read or modified host data outside the share or in the denied path. A
 managed sandbox then repeats
 the read-write check through `provision`, `start`, `exec`, and `stop`, and must
 report a successful outcome with a cleanly unmounted scratch filesystem, which
-shows that `stop` unmounted the share and overlay first. On Linux, a
+shows that `stop` unmounted the share and overlay first. Each backend then
+attaches a read-write `/workspace` share and a read-only
+`/opt/hostedtoolcache` share to one sandbox at the same time, each with its
+own denied subdirectory. The smoke script runs the read-write and read-only
+checks on the two shares and verifies that a link in the read-write share
+cannot write into the read-only share; the host requires the guest's writes in
+the workspace, an unchanged tool cache, and unchanged denied files, both for a
+one-shot run and for a managed sandbox whose format-4 configuration must
+persist both shares and whose `stop` must leave a cleanly unmounted scratch
+filesystem. On Linux, a
 world-writable share then runs with `--mount-owner caller`. The runners grant
 OpenVMM neither `CAP_SETUID` nor `CAP_SETGID`, so it can neither assume the
 65534 workload identity nor drop the backend group through which it opens

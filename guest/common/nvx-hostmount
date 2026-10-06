@@ -1,16 +1,56 @@
 #!/bin/sh
 
-vtag=$(sed -n 's/.*virtfs_tag=\([^ ]*\).*/\1/p' /proc/cmdline)
-[ -n "$vtag" ] || exit 0
+mount_share() {
+    vdir=$1
+    vtag=$2
+    vmode=$3
+    [ -n "$vtag" ] || return 0
+    [ -n "$vdir" ] || vdir=/mnt/host
+    [ -n "$vmode" ] || vmode=ro
+    mkdir -p "$vdir"
+    if ! mount -t virtiofs -o "$vmode" "$vtag" "$vdir" 2>/dev/null; then
+        echo "virtfs: failed to mount tag $vtag at $vdir" >&2
+        return 1
+    fi
+    echo "virtfs: mounted live host directory at $vdir (virtiofs,$vmode)"
+}
 
-vdir=$(sed -n 's/.*virtfs_dir=\([^ ]*\).*/\1/p' /proc/cmdline)
-[ -n "$vdir" ] || vdir=/mnt/host
-vmode=$(sed -n 's/.*virtfs_mode=\([^ ]*\).*/\1/p' /proc/cmdline)
-[ -n "$vmode" ] || vmode=ro
-
-mkdir -p "$vdir"
-if ! mount -t virtiofs -o "$vmode" "$vtag" "$vdir" 2>/dev/null; then
-    echo "virtfs: failed to mount tag $vtag at $vdir" >&2
-    exit 1
-fi
-echo "virtfs: mounted live host directory at $vdir (virtiofs,$vmode)"
+# OpenVMM appends one virtfs_dir=, virtfs_tag=, virtfs_mode= triplet per
+# attached share, in virtio-fs slot order; a repeated field starts the next.
+vdir=
+vtag=
+vmode=
+cmdline=$(cat /proc/cmdline)
+# Kernel command-line tokens are deliberately split on spaces.
+# shellcheck disable=SC2086
+set -f
+for token in $cmdline; do
+    case "$token" in
+        virtfs_dir=*)
+            if [ -n "$vdir" ]; then
+                mount_share "$vdir" "$vtag" "$vmode" || exit 1
+                vtag=
+                vmode=
+            fi
+            vdir=${token#*=}
+            ;;
+        virtfs_tag=*)
+            if [ -n "$vtag" ]; then
+                mount_share "$vdir" "$vtag" "$vmode" || exit 1
+                vdir=
+                vmode=
+            fi
+            vtag=${token#*=}
+            ;;
+        virtfs_mode=*)
+            if [ -n "$vmode" ]; then
+                mount_share "$vdir" "$vtag" "$vmode" || exit 1
+                vdir=
+                vtag=
+            fi
+            vmode=${token#*=}
+            ;;
+    esac
+done
+set +f
+mount_share "$vdir" "$vtag" "$vmode"
