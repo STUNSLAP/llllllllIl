@@ -41,7 +41,15 @@ CONFIG_FORMAT = 1
 MOUNT_CONFIG_FORMAT = 2
 # Likewise, format-2 readers would start a caller-owned share as the VMM.
 OWNER_CONFIG_FORMAT = 3
-CONFIG_FORMATS = (CONFIG_FORMAT, MOUNT_CONFIG_FORMAT, OWNER_CONFIG_FORMAT)
+# And earlier readers know only the single `mount` share, so a configuration
+# with several shares lists them under `mounts` in a format they reject.
+MULTI_MOUNT_CONFIG_FORMAT = 4
+CONFIG_FORMATS = (
+    CONFIG_FORMAT,
+    MOUNT_CONFIG_FORMAT,
+    OWNER_CONFIG_FORMAT,
+    MULTI_MOUNT_CONFIG_FORMAT,
+)
 OUTCOME_SCHEMA_VERSION = 1
 
 
@@ -181,8 +189,8 @@ def _serialize_launch(
     host_loopback_forward: tuple[str, ...],
     cmdline: str,
 ) -> dict[str, Any]:
-    return {
-        "format": _config_format(launch.mount),
+    config: dict[str, Any] = {
+        "format": _config_format(launch.mounts),
         "layers": [
             {
                 "role": layer.role,
@@ -209,19 +217,23 @@ def _serialize_launch(
         "network_proxy": network_proxy,
         "host_loopback_forward": list(host_loopback_forward),
         "cmdline": cmdline,
-        "mount": _serialize_mount(launch.mount),
     }
+    if len(launch.mounts) > 1:
+        config["mounts"] = [_serialize_mount(mount) for mount in launch.mounts]
+    else:
+        config["mount"] = _serialize_mount(launch.mounts[0]) if launch.mounts else None
+    return config
 
 
-def _config_format(mount: SandboxMount | None) -> int:
-    if mount is None:
-        return CONFIG_FORMAT
-    return OWNER_CONFIG_FORMAT if mount.owner == "caller" else MOUNT_CONFIG_FORMAT
+def _config_format(mounts: tuple[SandboxMount, ...]) -> int:
+    if len(mounts) > 1:
+        return MULTI_MOUNT_CONFIG_FORMAT
+    if len(mounts) == 1 and mounts[0].owner == "caller":
+        return OWNER_CONFIG_FORMAT
+    return MOUNT_CONFIG_FORMAT if mounts else CONFIG_FORMAT
 
 
-def _serialize_mount(mount: SandboxMount | None) -> dict[str, Any] | None:
-    if mount is None:
-        return None
+def _serialize_mount(mount: SandboxMount) -> dict[str, Any]:
     absolute = mount.absolute()
     return {
         "guest_target": absolute.guest_target,
@@ -232,9 +244,7 @@ def _serialize_mount(mount: SandboxMount | None) -> dict[str, Any] | None:
     }
 
 
-def _deserialize_mount(value: object) -> SandboxMount | None:
-    if value is None:
-        return None
+def _deserialize_mount(value: object) -> SandboxMount:
     if not isinstance(value, dict):
         raise TypeError("sandbox mount configuration must be an object")
     mount = cast(dict[str, Any], value)
@@ -249,6 +259,16 @@ def _deserialize_mount(value: object) -> SandboxMount | None:
         # Configurations written before ownership modes ran shares as the VMM.
         owner=str(mount.get("owner", "vmm")),
     )
+
+
+def _deserialize_mounts(config: dict[str, Any]) -> tuple[SandboxMount, ...]:
+    if config.get("format") == MULTI_MOUNT_CONFIG_FORMAT:
+        mounts = config["mounts"]
+        if not isinstance(mounts, list):
+            raise TypeError("sandbox mounts configuration must be a list")
+        return tuple(_deserialize_mount(mount) for mount in cast(list[object], mounts))
+    mount = config.get("mount")
+    return () if mount is None else (_deserialize_mount(mount),)
 
 
 def _deserialize_launch(config: dict[str, Any]) -> SandboxLaunch:
@@ -271,12 +291,12 @@ def _deserialize_launch(config: dict[str, Any]) -> SandboxLaunch:
                 None if config["memory_max"] is None else int(config["memory_max"])
             ),
             pids_max=None if config["pids_max"] is None else int(config["pids_max"]),
-            mount=_deserialize_mount(config.get("mount")),
+            mounts=_deserialize_mounts(config),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ScriptError("sandbox configuration is malformed") from error
-    if config.get("format") != _config_format(launch.mount):
-        raise ScriptError("sandbox configuration format does not match its mount")
+    if config.get("format") != _config_format(launch.mounts):
+        raise ScriptError("sandbox configuration format does not match its mounts")
     return launch.validated()
 
 

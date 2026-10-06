@@ -313,8 +313,9 @@ backing and are onlined before restore readiness.
 
 ## virtio-fs host mapping
 
-The microVM reserves one mapping slot with a fixed `microvm` tag. On a cold
-boot with `--mount`, the initramfs mounts it automatically:
+The microVM has two mapping slots with the fixed tags `microvm` and
+`microvm1`. On a cold boot with `--mount`, the initramfs mounts each mapping
+automatically:
 
 ```bash
 python3 scripts/nvx.py run --mount "/mnt/host,/absolute/host/share,rw"
@@ -328,11 +329,28 @@ python scripts\nvx.py run `
 ```
 
 Use `ro` for read-only access. The guest target must be an absolute Linux path.
-Host paths containing commas are unsupported. To expose multiple directories,
-place them under one exported host root. A snapshot captured with a mapping
-requires the same canonical host path, target, mode, and filesystem identity.
+Host paths containing commas are unsupported. Repeat `--mount` once to attach
+a second directory with its own target and access mode, for example a
+read-write workspace next to a read-only tool cache:
+
+```bash
+python3 scripts/nvx.py run \
+  --mount "/workspace,/srv/checkout,rw" \
+  --mount "/opt/hostedtoolcache,/opt/hostedtoolcache,ro"
+```
+
+The first mapping uses tag `microvm` and the second tag `microvm1`. OpenVMM
+enforces each mapping's access mode on the host, so a read-only mapping
+rejects writes with `EROFS` even if guest root remounts its tag read-write.
+Guest targets that equal or contain one another, host directories that equal
+or contain one another, and more than two mappings are rejected before boot.
+A snapshot captured with mappings requires the same mappings, in the same
+order, with the same canonical host paths, targets, modes, and filesystem
+identities.
 A repeatable `--mount-deny HOST_PATH` hides an existing file or directory
-inside that root. Denied names are omitted from directory listings and remain
+inside a mapped root. With two mappings, each `--mount-deny` must be an
+absolute path, and it applies to the mapping whose root contains it. Denied
+names are omitted from directory listings and remain
 inaccessible through `..`, a symlink/junction, or another mount of the same
 virtio-fs device. Unsafe, external, duplicate, overlapping, and nested-mount
 rules are rejected before boot.
@@ -353,7 +371,7 @@ captured with a mapping also requires the same `--mount-owner` mode. Capture
 and restore inspect and reopen the guest's open files as OpenVMM's user, so
 unless OpenVMM runs as root, they fail while the guest holds a file that only
 its caller can reach or reopen, such as one open for writing.
-A snapshot captured without a mapping may restore with a new `--mount`; after
+A snapshot captured without a mapping may restore with one new `--mount`; after
 resume, mount it explicitly inside the guest because the initramfs hook has
 already completed:
 
@@ -392,6 +410,8 @@ the fixed non-root account, and a scratch-backed `/tmp` write before clean
 guest exit. With `--arg TARGET --arg ro|rw`, it also checks a live share at
 `TARGET` as described below, including symbolic links in an `rw` share; the
 share needs a host-created, world-writable `nvx-links` directory for them.
+Repeat the pair to check several shares; with an `rw` and an `ro` share, it
+also verifies that a link in the `rw` share cannot write into the `ro` share.
 With `--mount-owner caller`, `--arg caller` performs the `rw` checks and also
 verifies that the workload owns what it creates, populates a directory it
 created, and creates links in its own `nvx-caller-links` directory, while
@@ -423,14 +443,14 @@ The outer agent retains the initramfs root; the capability-stripped child
 enters only the assembled root with `chroot`, because Linux cannot
 `pivot_root` away from an initramfs `rootfs`.
 
-### Live host-directory share
+### Live host-directory shares
 
-`sandbox run` and `sandbox provision` accept one
-`--mount GUEST_TARGET,HOST_PATH[,ro|rw]` (default `ro`) plus repeatable
-`--mount-deny HOST_PATH` rules. OpenVMM exports the host directory through its
-microVM virtio-fs device and enforces the access mode and denied paths on the
-host side, so edits are visible in both directions without staging or
-copy-back:
+`sandbox run` and `sandbox provision` accept up to two
+`--mount GUEST_TARGET,HOST_PATH[,ro|rw]` (default `ro`) options, each with its
+own guest target and access mode, plus repeatable `--mount-deny HOST_PATH`
+rules. OpenVMM exports each host directory through its own microVM virtio-fs
+device and enforces its access mode and denied paths on the host side, so
+edits are visible in both directions without staging or copy-back:
 
 ```bash
 python3 scripts/nvx.py sandbox \
@@ -438,28 +458,51 @@ python3 scripts/nvx.py sandbox \
   --scratch /var/lib/nvx/scratch.ext4 \
   --mount /workspace,/srv/checkout,rw \
   --mount-deny .git/credentials \
+  --mount /opt/hostedtoolcache,/opt/hostedtoolcache,ro \
   --entrypoint /bin/sh
 ```
 
-A relative `--mount-deny` path is resolved inside the exported host directory.
+A relative `--mount-deny` path is resolved inside its share's host directory.
+With one share, every `--mount-deny` applies to it. With two, each
+`--mount-deny` applies to the `--mount` before it and must name a path inside
+that share's directory. The guest targets and the host directories of the two
+shares must not equal or contain one another, because one share could
+otherwise hide the other or reach its files under a different access mode.
+NVX and OpenVMM compare the host directories by resolved path and by file
+identity, so one directory reached through two paths, such as a bind mount,
+is rejected too. NVX also compares each directory's identity with those of
+the other directory's ancestors, so a share inside a bind mount of the other
+share's directory is rejected before OpenVMM starts. On Linux, OpenVMM also
+compares the filesystem sources that each directory reaches, through the
+mount that contains it and every mount below it, so it also rejects a bind
+mount or nested mount that exposes part of one share inside the other. That
+check is Linux-only, so on Windows, don't share a directory that reaches the
+other share's files through a mount.
+Guest mount flags are not a security boundary: OpenVMM rejects every write to
+an `ro` share with `EROFS`, whichever mount or link inside the guest reaches
+it.
 After it assembles the container overlay and verifies the workload identity,
-the guest agent creates the target inside the container root and mounts the
-share there with `nosuid,nodev` before the workload enters its private mount
-namespace. A one-shot workload exit, a managed `stop`, and any failure after
-the share is mounted unmount it before the overlay is unmounted or the VM
-powers off. The target must be an absolute, canonical path; `/`, `/etc`, and
+the guest agent creates each target inside the container root and mounts the
+shares there in order with `nosuid,nodev` before the workload enters its
+private mount namespace. A one-shot workload exit, a managed `stop`, and any
+failure after a share is mounted unmount the mounted shares in reverse order
+before the overlay is unmounted or the VM powers off. Each target must be an
+absolute, canonical path; `/`, `/etc`, and
 the `/proc`, `/sys`, `/dev`, and `/.nvx-agent` trees are reserved for the
 container runtime.
 The guest refuses a target whose path crosses a symbolic link in a container
-layer, and any validation or mount failure aborts the sandbox with status 125
-instead of starting the workload without its share.
+layer, a repeated tag, and overlapping targets, and any validation or mount
+failure aborts the sandbox with status 125 instead of starting the workload
+without its shares.
 
 An `rw` share supports the symbolic links that package managers and
 language toolchains create; see
-[virtio-fs host mapping](#virtio-fs-host-mapping) for their semantics. One
-share per microVM and the existing OpenVMM file-identity policy apply. A
-managed sandbox stores the absolute host path and the ownership mode in its
-configuration and reattaches the share on every `start`.
+[virtio-fs host mapping](#virtio-fs-host-mapping) for their semantics. The
+existing OpenVMM file-identity policy applies to each share. A managed
+sandbox stores each share's absolute host path, mode, and denied paths and
+the ownership mode in its configuration, and reattaches every share on each
+`start`. A configuration with two shares uses format 4, which earlier NVX
+releases reject rather than start without the second share.
 
 #### File ownership
 

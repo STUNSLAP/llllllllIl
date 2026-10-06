@@ -51,6 +51,14 @@ export owner, that squashed root cannot chown files or create device nodes,
 that a foreign guest identity fails with `EPERM` unless OpenVMM holds
 `CAP_SETUID` and `CAP_SETGID`, in which case it owns what it creates, and
 pre-boot rejection of a root-owned export or, on Windows, of the mode itself.
+Concurrent-share coverage attaches a read-write workspace and a read-only tool
+cache, each with its own tag and denied path, and verifies guest writes to the
+workspace, guest-flag and link rejection of writes to the tool cache, and,
+with the tool cache's tag remounted read-write inside the guest, `EROFS` from
+OpenVMM for every mutation. It also rejects three shares, nested guest
+targets, nested host directories, and ambiguous denied paths before boot, and
+round-trips both shares through a snapshot whose restore must supply both in
+capture order.
 The native suite targets KVM, MSHV, and WHP; a passing run on one backend is
 not a fresh result for the others.
 Coverage also includes

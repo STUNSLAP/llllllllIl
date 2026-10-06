@@ -1205,6 +1205,146 @@ class FilesystemOwnerTests(unittest.TestCase):
             run_scenario(guest_writes=True)
 
 
+class FilesystemSharesScenarioTests(unittest.TestCase):
+    """The filesystem-shares scenario with OpenVMM and the guest simulated."""
+
+    @staticmethod
+    def _mounts(command: list[str]) -> list[str]:
+        return [
+            command[index + 1]
+            for index, value in enumerate(command)
+            if value == "--mount"
+        ]
+
+    def _run(self, *, guest_writes_toolcache: bool = False) -> list[list[str]]:
+        launched: list[list[str]] = []
+        mounts = self._mounts
+
+        def guest(
+            command: list[str], script: str, marker: bytes, **_kwargs: object
+        ) -> None:
+            launched.append(command)
+            self.assertEqual(marker, microvm_tests.FILESYSTEM_SHARES_MARKER)
+            self.assertIn("mount -t virtiofs -o rw microvm1", script)
+            workspace, toolcache = (
+                Path(mount.split(",", 2)[1]) for mount in mounts(command)
+            )
+            (workspace / "from-guest").write_bytes(b"NVX-GUEST-WRITE\n")
+            (workspace / "guest-directory").mkdir()
+            if guest_writes_toolcache:
+                (toolcache / "mutation").write_bytes(b"")
+
+        class FakeProcess:
+            def __init__(self, command: list[str], _log_path: Path) -> None:
+                launched.append(command)
+                self.command = command
+
+            def __enter__(self) -> "FakeProcess":
+                return self
+
+            def __exit__(self, *_exception: object) -> None:
+                return None
+
+            def wait_for(self, _marker: bytes, _timeout: float) -> None:
+                return None
+
+            def send_bytes(self, _data: bytes) -> None:
+                return None
+
+            def wait(self, _timeout: float) -> openvmm_process.OpenvmmProcessResult:
+                command = self.command
+                requested = mounts(command)
+                workspace = Path(requested[0].split(",", 2)[1])
+                if "--snapshot-destination" in command:
+                    snapshot = Path(
+                        command[command.index("--snapshot-destination") + 1]
+                    )
+                    snapshot.mkdir()
+                    for name in ("manifest.bin", "state.bin", "memory.bin"):
+                        (snapshot / name).write_bytes(name.encode())
+                    (workspace / "journal").write_bytes(b"NVX-BEFORE")
+                    return openvmm_process.OpenvmmProcessResult(
+                        0, b"NVX-FILESYSTEM-SHARES-BEFORE\n"
+                    )
+                if "--restore-snapshot" in command:
+                    if len(requested) == 1:
+                        error = b"requires 2 --mount attachments in snapshot order"
+                    elif not requested[0].startswith("/workspace,"):
+                        error = b"target does not match the snapshot contract"
+                    else:
+                        with (workspace / "journal").open("ab") as journal:
+                            journal.write(b"NVX-AFTER")
+                        return openvmm_process.OpenvmmProcessResult(
+                            0, b"NVX-FILESYSTEM-SHARES-AFTER\n"
+                        )
+                    return openvmm_process.OpenvmmProcessResult(1, error + b"\n")
+                if len(requested) == 3:
+                    error = b"microVM permits at most 2 filesystems"
+                elif "--mount-deny" in command:
+                    error = b"--mount-deny requires an absolute host path"
+                elif requested[1].startswith("/workspace/cache,"):
+                    error = b"guest mount targets overlap"
+                else:
+                    error = b"host directories must not overlap"
+                return openvmm_process.OpenvmmProcessResult(2, error + b"\n")
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests, "run_guest_script", side_effect=guest),
+            patch.object(microvm_tests, "OpenvmmProcess", FakeProcess),
+            patch.object(microvm_tests, "assert_guest_symlink") as symlink,
+        ):
+            microvm_tests.run_filesystem_shares(
+                Path("openvmm"),
+                Path("kernel"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=40,
+                output_dir=Path(temporary),
+            )
+        link, target = symlink.call_args.args
+        self.assertEqual(
+            (link.name, target), ("toolcache-seed", "/opt/hostedtoolcache/seed")
+        )
+        return launched
+
+    def test_scenario_attaches_both_shares_and_restores_them_in_order(self):
+        launched = self._run()
+        boot = launched[0]
+        workspace, toolcache = self._mounts(boot)
+        self.assertTrue(workspace.startswith("/workspace,"))
+        self.assertTrue(workspace.endswith(",rw"))
+        self.assertTrue(toolcache.startswith("/opt/hostedtoolcache,"))
+        self.assertTrue(toolcache.endswith(",ro"))
+        denied = [
+            Path(boot[index + 1]).name
+            for index, value in enumerate(boot)
+            if value == "--mount-deny"
+        ]
+        self.assertEqual(denied, ["secrets", "credentials"])
+
+        # Four invalid sets fail before boot, then a capture with both shares,
+        # two invalid restores, and the restore with both shares in order.
+        self.assertEqual(len(launched), 1 + 4 + 1 + 3)
+        capture = launched[5]
+        self.assertIn("--snapshot-destination", capture)
+        self.assertEqual(self._mounts(capture), [workspace, toolcache])
+        self.assertEqual(self._mounts(launched[6]), [workspace])
+        self.assertEqual(self._mounts(launched[7]), [toolcache, workspace])
+        self.assertEqual(self._mounts(launched[8]), [workspace, toolcache])
+
+    def test_scenario_rejects_a_write_to_the_read_only_share(self):
+        with self.assertRaisesRegex(RuntimeError, "modified the read-only share"):
+            self._run(guest_writes_toolcache=True)
+
+    def test_scenario_is_a_default_correctness_scenario(self):
+        self.assertIn("filesystem-shares", microvm_tests.MICROVM_TEST_SCENARIOS)
+        for name in ("filesystem-shares.sh", "filesystem-shares-snapshot.sh"):
+            script = microvm_tests._read_script(name)
+            self.assertIn("nvx-exit 0", script)
+
+
 class ControlSessionTests(unittest.TestCase):
     def test_named_pipe_connect_retries_transient_invalid_argument(self):
         error = OSError(control_session.errno.EINVAL, "Invalid argument")

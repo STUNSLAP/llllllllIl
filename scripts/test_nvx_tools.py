@@ -7741,16 +7741,20 @@ class SandboxShareAgentTests(unittest.TestCase):
         mount_log.unlink(missing_ok=True)
         functions = "".join(
             _shell_function(self.source, name)
-            for name in ("cmdline_value", "validate_share_target", "mount_live_share")
+            for name in (
+                "validate_share_target",
+                "mount_live_share",
+                "mount_live_shares",
+            )
         )
         script = (
             "set -eu\n"
-            "rootfs=$1\ncmdline=$2\nmount_log=$3\nshare_mountpoint=\n"
+            "rootfs=$1\ncmdline=$2\nmount_log=$3\nshare_mountpoints=\n"
             'fatal() { echo "FATAL: $*" >&2; exit 125; }\n'
             'mount() { printf "%s\\n" "$*" >>"$mount_log"; }\n'
             f"{functions}"
-            "mount_live_share\n"
-            'echo "mountpoint=$share_mountpoint"\n'
+            "mount_live_shares\n"
+            "echo \"mountpoints=$(printf '%s' \"$share_mountpoints\" | tr '\\n' ' ')\"\n"
         )
         result = subprocess.run(
             [
@@ -7770,7 +7774,7 @@ class SandboxShareAgentTests(unittest.TestCase):
         return result, log
 
     def _run_teardown(
-        self, script: str, *, share: bool, failing: str = ""
+        self, script: str, *, shares: tuple[str, ...], failing: str = ""
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         runtime = self.root / "run"
         runtime.mkdir(exist_ok=True)
@@ -7780,8 +7784,13 @@ class SandboxShareAgentTests(unittest.TestCase):
         log.unlink(missing_ok=True)
         functions = "".join(
             _shell_function(self.source, name)
-            for name in ("unmount_live_share", "fatal", "teardown")
+            for name in ("unmount_live_shares", "fatal", "teardown")
         ).replace("/sbin/nvx-exit", "nvx_exit")
+        # The agent records mounted shares one per line, most recent first.
+        # Windows drops a newline from a process argument, so pass a separator.
+        mountpoints = "|".join(
+            f"{self.rootfs.as_posix()}{target}" for target in reversed(shares)
+        )
         result = subprocess.run(
             [
                 self.shell,
@@ -7789,12 +7798,13 @@ class SandboxShareAgentTests(unittest.TestCase):
                 "--",
                 runtime.as_posix(),
                 log.as_posix(),
-                f"{self.rootfs.as_posix()}/workspace" if share else "",
+                mountpoints,
                 failing,
             ],
             input=(
                 "set -eu\n"
-                "runtime=$1\nlog=$2\nshare_mountpoint=$3\nfailing=$4\n"
+                "runtime=$1\nlog=$2\nfailing=$4\n"
+                "share_mountpoints=$(printf '%s' \"$3\" | tr '|' '\\n')\n"
                 "rootfs=$runtime/rootfs\nlayers=$runtime/layers\n"
                 "scratch=$runtime/scratch\n"
                 'umount() { printf "umount %s\\n" "$1" >>"$log"; '
@@ -7811,7 +7821,7 @@ class SandboxShareAgentTests(unittest.TestCase):
         return result, lines
 
     def test_agent_mounts_share_after_lifecycle_checks_for_both_lifecycles(self):
-        mount_call = self.source.index("\nmount_live_share\n")
+        mount_call = self.source.index("\nmount_live_shares\n")
         self.assertLess(
             self.source.index('fatal "configured workload home is unavailable"'),
             mount_call,
@@ -7830,7 +7840,7 @@ class SandboxShareAgentTests(unittest.TestCase):
         self.assertLess(managed_agent, self.source.index('\n    teardown "$status"\n'))
 
     def test_agent_teardown_unmounts_share_before_overlay_layers_and_scratch(self):
-        result, log = self._run_teardown("teardown 7", share=True)
+        result, log = self._run_teardown("teardown 7", shares=("/workspace",))
         runtime = (self.root / "run").as_posix()
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertEqual(
@@ -7847,13 +7857,45 @@ class SandboxShareAgentTests(unittest.TestCase):
         self.assertFalse((self.root / "run" / "workload-machine-id").exists())
         self.assertFalse((self.root / "run" / "container.pid").exists())
 
-        result, log = self._run_teardown("teardown 0", share=False)
+        result, log = self._run_teardown("teardown 0", shares=())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(log[0], f"umount {runtime}/rootfs")
 
+    def test_agent_teardown_unmounts_shares_in_reverse_mount_order(self):
+        rootfs = self.rootfs.as_posix()
+        runtime = (self.root / "run").as_posix()
+        result, log = self._run_teardown(
+            "teardown 0", shares=("/workspace", "/opt/hostedtoolcache")
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            log[:3],
+            [
+                f"umount {rootfs}/opt/hostedtoolcache",
+                f"umount {rootfs}/workspace",
+                f"umount {runtime}/rootfs",
+            ],
+        )
+
+        # A share that fails to unmount does not stop the others.
+        result, log = self._run_teardown(
+            "teardown 0",
+            shares=("/workspace", "/opt/hostedtoolcache"),
+            failing=f"{rootfs}/opt/hostedtoolcache",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("failed to unmount the live share", result.stderr)
+        self.assertEqual(
+            log[:2],
+            [f"umount {rootfs}/opt/hostedtoolcache", f"umount {rootfs}/workspace"],
+        )
+        self.assertEqual(log[-1], "exit 1")
+
     def test_agent_teardown_reports_share_unmount_failure(self):
         share = f"{self.rootfs.as_posix()}/workspace"
-        result, log = self._run_teardown("teardown 0", share=True, failing=share)
+        result, log = self._run_teardown(
+            "teardown 0", shares=("/workspace",), failing=share
+        )
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("failed to unmount the live share", result.stderr)
         self.assertEqual(log[0], f"umount {share}")
@@ -7861,21 +7903,37 @@ class SandboxShareAgentTests(unittest.TestCase):
         self.assertIn("NVX-SANDBOX-EXIT: status=1", result.stdout)
 
     def test_agent_fatal_unmounts_share_before_power_off(self):
-        result, log = self._run_teardown('fatal "synthetic failure"', share=True)
+        result, log = self._run_teardown(
+            'fatal "synthetic failure"', shares=("/workspace",)
+        )
         self.assertEqual(result.returncode, 125, result.stdout)
         self.assertIn("NVX-SANDBOX-ERROR: synthetic failure", result.stderr)
         self.assertEqual(
             log, [f"umount {self.rootfs.as_posix()}/workspace", "exit 125"]
         )
 
-        result, log = self._run_teardown('fatal "early failure"', share=False)
+        result, log = self._run_teardown('fatal "early failure"', shares=())
         self.assertEqual(result.returncode, 125, result.stdout)
         self.assertEqual(log, ["exit 125"])
+
+        rootfs = self.rootfs.as_posix()
+        result, log = self._run_teardown(
+            'fatal "late failure"', shares=("/workspace", "/opt/hostedtoolcache")
+        )
+        self.assertEqual(result.returncode, 125, result.stdout)
+        self.assertEqual(
+            log,
+            [
+                f"umount {rootfs}/opt/hostedtoolcache",
+                f"umount {rootfs}/workspace",
+                "exit 125",
+            ],
+        )
 
     def test_agent_skips_share_without_bootstrap_tokens(self):
         result, log = self._run("console=hvc0 nvx_sandbox=1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("mountpoint=\n", result.stdout)
+        self.assertIn("mountpoints=\n", result.stdout)
         self.assertEqual(log, "")
 
     def test_agent_mounts_share_inside_container_rootfs(self):
@@ -7904,9 +7962,133 @@ class SandboxShareAgentTests(unittest.TestCase):
                     ],
                 )
                 self.assertIn(
-                    f"mountpoint={self.rootfs.as_posix()}/opt/hostedtoolcache",
+                    f"mountpoints={self.rootfs.as_posix()}/opt/hostedtoolcache\n",
                     result.stdout,
                 )
+
+    def test_agent_mounts_every_share_in_slot_order(self):
+        rootfs = self.rootfs.as_posix()
+        result, log = self._run(
+            "nvx_sandbox=1 virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw "
+            "virtfs_dir=/opt/hostedtoolcache virtfs_tag=microvm1 virtfs_mode=ro"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            log.splitlines(),
+            [
+                f"-t virtiofs -o rw,nosuid,nodev microvm {rootfs}/workspace",
+                f"-t virtiofs -o ro,nosuid,nodev microvm1 {rootfs}/opt/hostedtoolcache",
+            ],
+        )
+        self.assertIn(
+            "NVX-SANDBOX-SHARE: target=/workspace mode=rw tag=microvm\n"
+            "NVX-SANDBOX-SHARE: target=/opt/hostedtoolcache mode=ro tag=microvm1\n",
+            result.stdout,
+        )
+        # Teardown unmounts the most recent share first.
+        self.assertIn(
+            f"mountpoints={rootfs}/opt/hostedtoolcache {rootfs}/workspace\n",
+            result.stdout,
+        )
+
+    def test_agent_rejects_colliding_tags_and_overlapping_targets(self):
+        for cmdline, message in (
+            (
+                "virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw "
+                "virtfs_dir=/opt/tools virtfs_tag=microvm virtfs_mode=ro",
+                "tag is not unique",
+            ),
+            (
+                "virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw "
+                "virtfs_dir=/workspace virtfs_tag=microvm1 virtfs_mode=ro",
+                "targets overlap",
+            ),
+            (
+                "virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw "
+                "virtfs_dir=/workspace/cache virtfs_tag=microvm1 virtfs_mode=ro",
+                "targets overlap",
+            ),
+            (
+                "virtfs_dir=/opt/tools/node virtfs_tag=microvm virtfs_mode=ro "
+                "virtfs_dir=/opt virtfs_tag=microvm1 virtfs_mode=rw",
+                "targets overlap",
+            ),
+        ):
+            with self.subTest(cmdline=cmdline):
+                result, log = self._run(cmdline)
+                self.assertEqual(result.returncode, 125, result.stdout)
+                self.assertIn(message, result.stderr)
+                # Only the first, valid share was mounted.
+                self.assertEqual(len(log.splitlines()), 1)
+
+        # A shared prefix that is not a path component is not an overlap.
+        result, log = self._run(
+            "virtfs_dir=/work virtfs_tag=microvm virtfs_mode=rw "
+            "virtfs_dir=/workspace virtfs_tag=microvm1 virtfs_mode=ro"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(log.splitlines()), 2)
+
+    def test_agent_parses_every_share_before_mounting_any(self):
+        for cmdline in (
+            "virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw "
+            "virtfs_dir=/opt/tools virtfs_tag=microvm1",
+            "virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw "
+            "virtfs_tag=microvm1 virtfs_dir=/opt/tools virtfs_mode=ro",
+            "virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw "
+            "virtfs_dir= virtfs_tag=microvm1 virtfs_mode=ro",
+        ):
+            with self.subTest(cmdline=cmdline):
+                result, log = self._run(cmdline)
+                self.assertEqual(result.returncode, 125, result.stdout)
+                self.assertIn("bootstrap is incomplete", result.stderr)
+                self.assertEqual(log, "")
+
+    def test_agent_fatal_unmounts_mounted_shares(self):
+        mount_log = self.root / "mount.log"
+        functions = "".join(
+            _shell_function(self.source, name)
+            for name in (
+                "unmount_live_shares",
+                "fatal",
+                "validate_share_target",
+                "mount_live_share",
+                "mount_live_shares",
+            )
+        ).replace("/sbin/nvx-exit", "nvx_exit")
+        result = subprocess.run(
+            [
+                self.shell,
+                "-s",
+                "--",
+                self.rootfs.as_posix(),
+                "virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw "
+                "virtfs_dir=/workspace/nested virtfs_tag=microvm1 virtfs_mode=ro",
+                mount_log.as_posix(),
+            ],
+            input=(
+                "set -eu\n"
+                "rootfs=$1\ncmdline=$2\nmount_log=$3\nshare_mountpoints=\n"
+                'mount() { printf "mount %s\\n" "$*" >>"$mount_log"; }\n'
+                'umount() { printf "umount %s\\n" "$1" >>"$mount_log"; }\n'
+                'nvx_exit() { printf "exit %s\\n" "$1" >>"$mount_log"; exit "$1"; }\n'
+                f"{functions}mount_live_shares\n"
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 125, result.stdout)
+        self.assertIn("targets overlap", result.stderr)
+        rootfs = self.rootfs.as_posix()
+        self.assertEqual(
+            mount_log.read_text(encoding="utf-8").splitlines(),
+            [
+                f"mount -t virtiofs -o rw,nosuid,nodev microvm {rootfs}/workspace",
+                f"umount {rootfs}/workspace",
+                "exit 125",
+            ],
+        )
 
     def test_agent_fails_closed_for_invalid_share_bootstrap(self):
         (self.rootfs / "file").write_text("x", encoding="utf-8")
@@ -7979,6 +8161,7 @@ class SandboxSmokeShareTests(unittest.TestCase):
                 "check_share_denied",
                 "expect_eperm",
                 "check_share_symlinks",
+                "check_shares_isolated",
             )
         ).replace("/tmp/nvx-tool", '"$scratch/nvx-tool"')
 
@@ -8052,6 +8235,34 @@ class SandboxSmokeShareTests(unittest.TestCase):
         self.share.chmod(0o755)
         result = self._run('check_share "$share" ro')
         self.assertEqual(result.returncode, 1, result.stdout)
+
+    def test_rw_share_link_cannot_write_into_ro_share(self):
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is not None and geteuid() == 0:
+            self.skipTest("root ignores file write permissions")
+        toolcache = self.root / "toolcache"
+        toolcache.mkdir()
+        marker = toolcache / "nvx-host-marker"
+        marker.write_text("host-to-guest\n", encoding="utf-8")
+        marker.chmod(0o444)
+        self.addCleanup(marker.chmod, 0o644)
+
+        call = f'check_shares_isolated "$share" "{toolcache.as_posix()}"'
+        result = self._run(call)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            f"NVX-UBUNTU-SANDBOX-SHARES-ISOLATED-OK rw={self.share.as_posix()} "
+            f"ro={toolcache.as_posix()}",
+            result.stdout,
+        )
+        self.assertFalse(os.path.lexists(self.share / "nvx-cross-share-link"))
+        self.assertEqual(marker.read_text(encoding="utf-8"), "host-to-guest\n")
+
+        # A write that reaches the read-only share fails the check.
+        marker.chmod(0o644)
+        result = self._run(call)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertNotIn("NVX-UBUNTU-SANDBOX-SHARES-ISOLATED-OK", result.stdout)
 
     def test_caller_share_owns_and_populates_its_own_directories(self):
         if sys.platform != "linux":
@@ -9367,7 +9578,7 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(writable.access, "rw")
         self.assertEqual(writable.denied_paths, ("logs", "secrets"))
         self.assertEqual(
-            writable.openvmm_arguments(),
+            sandbox.mounts_openvmm_arguments((writable,)),
             [
                 "--mount",
                 f"/opt/hostedtoolcache,{os.fspath(Path('host-dir'))},rw",
@@ -9400,13 +9611,13 @@ class SandboxTests(unittest.TestCase):
     def test_mount_owner_defaults_to_vmm_and_forwards_caller(self):
         default = sandbox.SandboxMount.parse("/workspace,host-dir,rw")
         self.assertEqual(default.owner, "vmm")
-        self.assertNotIn("--mount-owner", default.openvmm_arguments())
+        self.assertNotIn("--mount-owner", sandbox.mounts_openvmm_arguments((default,)))
 
         caller = sandbox.SandboxMount.parse(
             "/workspace,host-dir,rw", ("secrets",), "caller"
         )
         self.assertEqual(
-            caller.openvmm_arguments(),
+            sandbox.mounts_openvmm_arguments((caller,)),
             [
                 "--mount",
                 f"/workspace,{os.fspath(Path('host-dir'))},rw",
@@ -9532,7 +9743,7 @@ class SandboxTests(unittest.TestCase):
         launch = sandbox.SandboxLaunch(
             layers=(distro,),
             scratch=Path("scratch.ext4"),
-            mount=sandbox.SandboxMount.parse("/workspace,share,rw", ("secrets",)),
+            mounts=(sandbox.SandboxMount.parse("/workspace,share,rw", ("secrets",)),),
         )
 
         arguments = launch.openvmm_arguments()
@@ -9553,13 +9764,189 @@ class SandboxTests(unittest.TestCase):
 
         unmounted = sandbox.SandboxLaunch(layers=(distro,), scratch=Path("s.ext4"))
         base = unmounted.kernel_command_line()
-        fragment = launch.mount.command_line_fragment() if launch.mount else ""
+        fragment = sandbox.mounts_command_line_fragment(launch.mounts)
+        self.assertEqual(
+            fragment, " virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw"
+        )
         fitting = "x" * (
             sandbox.SANDBOX_COMMAND_LINE_MAX_SIZE - len(base) - len(fragment) - 2
         )
         launch.kernel_command_line(fitting)
         with self.assertRaisesRegex(common.ScriptError, "1024-byte"):
             launch.kernel_command_line(fitting + "x")
+
+    def test_launch_contract_attaches_two_shares_in_slot_order(self):
+        distro = sandbox.SandboxLayer.parse(
+            "distro,distro.erofs,11111111-1111-1111-1111-111111111111"
+        )
+        launch = sandbox.SandboxLaunch(
+            layers=(distro,),
+            scratch=Path("scratch.ext4"),
+            mounts=(
+                sandbox.SandboxMount.parse("/workspace,work,rw", ("secrets",)),
+                sandbox.SandboxMount.parse(
+                    "/opt/hostedtoolcache,tools,ro", ("credentials",)
+                ),
+            ),
+        )
+
+        arguments = launch.openvmm_arguments()
+        # With several shares, OpenVMM attributes each denied path to the share
+        # that contains it, so relative paths are joined to their share.
+        self.assertEqual(
+            arguments[arguments.index("--mount") :],
+            [
+                "--mount",
+                f"/workspace,{os.fspath(Path('work'))},rw",
+                "--mount",
+                f"/opt/hostedtoolcache,{os.fspath(Path('tools'))},ro",
+                "--mount-deny",
+                os.fspath(Path.cwd() / "work" / "secrets"),
+                "--mount-deny",
+                os.fspath(Path.cwd() / "tools" / "credentials"),
+            ],
+        )
+        fragment = sandbox.mounts_command_line_fragment(launch.mounts)
+        self.assertEqual(
+            fragment,
+            " virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw"
+            " virtfs_dir=/opt/hostedtoolcache virtfs_tag=microvm1 virtfs_mode=ro",
+        )
+        self.assertNotIn("virtfs_", launch.kernel_command_line())
+
+        # Every share's bootstrap tokens count toward the x86 budget.
+        base = sandbox.SandboxLaunch(
+            layers=(distro,), scratch=Path("s.ext4")
+        ).kernel_command_line()
+        fitting = "x" * (
+            sandbox.SANDBOX_COMMAND_LINE_MAX_SIZE - len(base) - len(fragment) - 2
+        )
+        launch.kernel_command_line(fitting)
+        with self.assertRaisesRegex(common.ScriptError, "1024-byte"):
+            launch.kernel_command_line(fitting + "x")
+
+        caller = tuple(
+            sandbox.SandboxMount(
+                guest_target=target, host_path=Path(path), owner="caller"
+            )
+            for target, path in (("/workspace", "work"), ("/tools", "tools"))
+        )
+        arguments = sandbox.mounts_openvmm_arguments(caller)
+        self.assertEqual(arguments.count("--mount-owner"), 1)
+        self.assertEqual(arguments[-2:], ["--mount-owner", "caller"])
+
+    def test_launch_rejects_invalid_share_sets(self):
+        distro = sandbox.SandboxLayer.parse(
+            "distro,distro.erofs,11111111-1111-1111-1111-111111111111"
+        )
+
+        def mount(value: str, owner: str = "vmm") -> sandbox.SandboxMount:
+            return sandbox.SandboxMount.parse(value, (), owner)
+
+        for mounts, message in (
+            ((mount("/a,a"), mount("/b,b"), mount("/c,c")), "at most 2"),
+            ((mount("/workspace,a,rw"), mount("/workspace,b")), "overlap"),
+            ((mount("/workspace,a,rw"), mount("/workspace/cache,b")), "overlap"),
+            ((mount("/opt/tools/node,a"), mount("/opt,b,rw")), "overlap"),
+            (
+                (mount("/workspace,a,rw"), mount("/tools,b", "caller")),
+                "same --mount-owner",
+            ),
+        ):
+            with self.subTest(mounts=[item.guest_target for item in mounts]):
+                with self.assertRaisesRegex(common.ScriptError, message):
+                    sandbox.SandboxLaunch(
+                        layers=(distro,), scratch=Path("s.ext4"), mounts=mounts
+                    )
+        # A shared prefix that is not a path component is not an overlap.
+        sandbox.SandboxLaunch(
+            layers=(distro,),
+            scratch=Path("s.ext4"),
+            mounts=(mount("/work,a,rw"), mount("/workspace,b")),
+        )
+
+    def test_launch_validation_rejects_overlapping_or_foreign_host_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            work = root / "work"
+            tools = root / "tools"
+            layer.write_bytes(b"layer")
+            scratch.write_bytes(b"scratch")
+            (work / "nested").mkdir(parents=True)
+            (tools / "credentials").mkdir(parents=True)
+
+            def launch(*mounts: sandbox.SandboxMount) -> sandbox.SandboxLaunch:
+                return sandbox.SandboxLaunch(
+                    layers=(
+                        sandbox.SandboxLayer(
+                            role="distro",
+                            path=layer,
+                            uuid="11111111-1111-1111-1111-111111111111",
+                        ),
+                    ),
+                    scratch=scratch,
+                    mounts=mounts,
+                )
+
+            workspace = sandbox.SandboxMount.parse(f"/workspace,{work},rw")
+            for host_path in (work / "nested", work, root):
+                with self.subTest(host_path=host_path):
+                    with self.assertRaisesRegex(common.ScriptError, "overlap"):
+                        launch(
+                            workspace,
+                            sandbox.SandboxMount.parse(
+                                f"/opt/hostedtoolcache,{host_path}"
+                            ),
+                        ).validated()
+
+            # Each denied path must be inside its own share.
+            foreign = sandbox.SandboxMount.parse(
+                f"/workspace,{work},rw", (os.fspath(tools / "credentials"),)
+            )
+            toolcache = sandbox.SandboxMount.parse(f"/opt/hostedtoolcache,{tools}")
+            with self.assertRaisesRegex(common.ScriptError, "not inside"):
+                launch(foreign, toolcache).validated()
+            with self.assertRaisesRegex(common.ScriptError, "not inside"):
+                launch(
+                    sandbox.SandboxMount.parse(f"/workspace,{work},rw", (".",)),
+                    toolcache,
+                ).validated()
+
+            validated = launch(
+                sandbox.SandboxMount.parse(f"/workspace,{work},rw", ("nested",)),
+                sandbox.SandboxMount.parse(
+                    f"/opt/hostedtoolcache,{tools}",
+                    (os.fspath(tools / "credentials"),),
+                ),
+            ).validated()
+            self.assertEqual(len(validated.mounts), 2)
+
+            # Resolving a path doesn't see through a bind mount, so one directory
+            # reached through two paths, or a share inside a bind mount of the
+            # other share's directory, is rejected by its file identities.
+            sandbox.validate_mount_host_paths((workspace, toolcache))
+            with patch.object(sandbox, "_directory_identity", return_value=(1, 1)):
+                with self.assertRaisesRegex(common.ScriptError, "same directory"):
+                    sandbox.validate_mount_host_paths((workspace, toolcache))
+            alias = root / "alias"
+            (alias / "cache").mkdir(parents=True)
+
+            def identity(path: Path) -> tuple[int, int]:
+                # `alias` is a bind mount of the workspace's directory.
+                if path in (work.resolve(), alias.resolve()):
+                    return 1, 1
+                return 0, hash(path)
+
+            cache = sandbox.SandboxMount.parse(
+                f"/opt/hostedtoolcache,{alias / 'cache'}"
+            )
+            with patch.object(sandbox, "_directory_identity", side_effect=identity):
+                sandbox.validate_mount_host_paths((workspace, toolcache))
+                for mounts in ((workspace, cache), (cache, workspace)):
+                    with self.assertRaisesRegex(common.ScriptError, "inside the other"):
+                        sandbox.validate_mount_host_paths(mounts)
 
     def test_launch_validation_requires_plain_mount_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -9580,8 +9967,10 @@ class SandboxTests(unittest.TestCase):
                         ),
                     ),
                     scratch=scratch,
-                    mount=sandbox.SandboxMount(
-                        guest_target="/workspace", host_path=host_path
+                    mounts=(
+                        sandbox.SandboxMount(
+                            guest_target="/workspace", host_path=host_path
+                        ),
                     ),
                 )
 
@@ -9593,8 +9982,7 @@ class SandboxTests(unittest.TestCase):
             share.unlink()
             share.mkdir()
             validated = launch(share).validated()
-            assert validated.mount is not None
-            self.assertEqual(validated.mount.host_path, share)
+            self.assertEqual(validated.mounts[0].host_path, share)
 
     def test_sandbox_command_forwards_mount_to_openvmm(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -9726,6 +10114,328 @@ class SandboxTests(unittest.TestCase):
                 with self.assertRaisesRegex(common.ScriptError, "only valid"):
                     nvx.command_sandbox(args)
 
+    def test_sandbox_command_attributes_mount_deny_to_the_preceding_mount(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            work = root / "work"
+            tools = root / "tools"
+            layer.write_bytes(b"distro")
+            scratch.write_bytes(b"scratch")
+            work.mkdir()
+            tools.mkdir()
+            common_args = [
+                "sandbox",
+                "--layer",
+                f"distro,{layer},11111111-1111-1111-1111-111111111111",
+                "--scratch",
+                str(scratch),
+            ]
+            args = nvx.parse_args(
+                [
+                    *common_args,
+                    "--mount",
+                    f"/workspace,{work},rw",
+                    "--mount-deny",
+                    "secrets",
+                    "--mount",
+                    f"/opt/hostedtoolcache,{tools},ro",
+                    "--mount-deny",
+                    "credentials",
+                    "--mount-deny",
+                    "logs",
+                    "--dry-run",
+                ]
+            )
+            mounts = nvx._sandbox_mounts(args)
+            self.assertEqual(
+                [(mount.guest_target, mount.denied_paths) for mount in mounts],
+                [
+                    ("/workspace", ("secrets",)),
+                    ("/opt/hostedtoolcache", ("credentials", "logs")),
+                ],
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(nvx, "require_file", side_effect=require),
+                patch.object(
+                    nvx, "_format_command", return_value="formatted"
+                ) as format_command,
+            ):
+                nvx.command_sandbox(args)
+
+            command = format_command.call_args.args[0]
+            self.assertEqual(
+                [
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "--mount"
+                ],
+                [f"/workspace,{work},rw", f"/opt/hostedtoolcache,{tools},ro"],
+            )
+            self.assertEqual(
+                [
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "--mount-deny"
+                ],
+                [
+                    os.fspath(work / "secrets"),
+                    os.fspath(tools / "credentials"),
+                    os.fspath(tools / "logs"),
+                ],
+            )
+
+            # With one share, a --mount-deny may come first; with several, it
+            # must follow the share whose directory it hides.
+            single = nvx.parse_args(
+                [*common_args, "--mount-deny", "secrets", "--mount", f"/w,{work},rw"]
+            )
+            self.assertEqual(nvx._sandbox_mounts(single)[0].denied_paths, ("secrets",))
+            leading = nvx.parse_args(
+                [
+                    *common_args,
+                    "--mount-deny",
+                    "secrets",
+                    "--mount",
+                    f"/workspace,{work},rw",
+                    "--mount",
+                    f"/opt/hostedtoolcache,{tools}",
+                ]
+            )
+            with self.assertRaisesRegex(common.ScriptError, "must follow the --mount"):
+                nvx.command_sandbox(leading)
+            three = nvx.parse_args(
+                [
+                    *common_args,
+                    "--mount",
+                    f"/a,{work}",
+                    "--mount",
+                    f"/b,{tools}",
+                    "--mount",
+                    f"/c,{root}",
+                ]
+            )
+            with self.assertRaisesRegex(common.ScriptError, "at most 2"):
+                nvx.command_sandbox(three)
+
+    def test_run_forwards_every_mount_in_order(self):
+        args = nvx.parse_args(
+            [
+                "run",
+                "--mount",
+                "/workspace,work,rw",
+                "--mount",
+                "/opt/hostedtoolcache,tools,ro",
+                "--dry-run",
+            ]
+        )
+        with (
+            patch.object(nvx, "require_file", return_value=Path("artifact")),
+            patch.object(
+                nvx, "_format_command", return_value="formatted"
+            ) as format_command,
+        ):
+            nvx.command_run(args)
+            command = format_command.call_args.args[0]
+            self.assertEqual(
+                [
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "--mount"
+                ],
+                ["/workspace,work,rw", "/opt/hostedtoolcache,tools,ro"],
+            )
+            three = nvx.parse_args(
+                ["run", "--mount", "/a,a", "--mount", "/b,b", "--mount", "/c,c"]
+            )
+            with self.assertRaisesRegex(common.ScriptError, "at most 2"):
+                nvx.command_run(three)
+
+    def test_managed_lifecycle_persists_and_replays_two_shares(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            layer_path = root / "distro.erofs"
+            scratch_path = root / "scratch.ext4"
+            work = root / "work"
+            tools = root / "tools"
+            layer_path.write_bytes(b"layer")
+            scratch_path.write_bytes(b"scratch")
+            work.mkdir()
+            tools.mkdir()
+            state = root / "state"
+            sandbox_lifecycle.provision(
+                state,
+                sandbox.SandboxLaunch(
+                    layers=(
+                        sandbox.SandboxLayer(
+                            role="distro",
+                            path=layer_path,
+                            uuid="11111111-1111-1111-1111-111111111111",
+                        ),
+                    ),
+                    scratch=scratch_path,
+                    mounts=(
+                        sandbox.SandboxMount.parse(
+                            f"/workspace,{work},rw", ("secrets",)
+                        ),
+                        sandbox.SandboxMount.parse(f"/opt/hostedtoolcache,{tools}"),
+                    ),
+                ),
+                hypervisor="whp",
+                memory_mib=256,
+                net=None,
+                network_profile=None,
+                network_egress=None,
+                network_ingress=None,
+                network_egress_allow=(),
+                network_egress_deny=(),
+                host_loopback=None,
+                network_proxy=None,
+                host_loopback_forward=(),
+                cmdline="quiet",
+            )
+
+            config = json.loads(
+                (state / sandbox_lifecycle.CONFIG_NAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                config["format"], sandbox_lifecycle.MULTI_MOUNT_CONFIG_FORMAT
+            )
+            # Older releases know only the single `mount`, and reject format 4.
+            self.assertNotIn("mount", config)
+            with self.assertRaisesRegex(common.ScriptError, "unsupported format"):
+                sandbox_lifecycle._read_json(
+                    state / sandbox_lifecycle.CONFIG_NAME,
+                    "sandbox configuration",
+                    version=(1, 2, 3),
+                )
+            self.assertEqual(
+                config["mounts"],
+                [
+                    {
+                        "guest_target": "/workspace",
+                        "host_path": os.fspath(work),
+                        "access": "rw",
+                        "denied_paths": ["secrets"],
+                        "owner": "vmm",
+                    },
+                    {
+                        "guest_target": "/opt/hostedtoolcache",
+                        "host_path": os.fspath(tools),
+                        "access": "ro",
+                        "denied_paths": [],
+                        "owner": "vmm",
+                    },
+                ],
+            )
+
+            process = MagicMock()
+            process.pid = 123
+            process.stdin = io.BytesIO()
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(sandbox_lifecycle, "require_file", side_effect=require),
+                patch.object(
+                    sandbox_lifecycle.subprocess, "Popen", return_value=process
+                ) as popen,
+                patch.object(
+                    sandbox_lifecycle, "_process_start_time", return_value=456
+                ),
+                patch.object(
+                    sandbox_lifecycle.ControlSession,
+                    "connect",
+                    return_value=MagicMock(),
+                ),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
+            command = popen.call_args.args[0]
+            self.assertEqual(
+                [
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value in ("--mount", "--mount-deny")
+                ],
+                [
+                    f"/workspace,{work},rw",
+                    f"/opt/hostedtoolcache,{tools},ro",
+                    os.fspath(work / "secrets"),
+                ],
+            )
+
+    def test_managed_configuration_format_binds_several_mounts(self):
+        def entry(target: str, path: str, owner: str = "vmm") -> dict[str, object]:
+            return {
+                "guest_target": target,
+                "host_path": path,
+                "access": "rw",
+                "denied_paths": [],
+                "owner": owner,
+            }
+
+        config: dict[str, object] = {
+            "format": sandbox_lifecycle.MULTI_MOUNT_CONFIG_FORMAT,
+            "layers": [
+                {
+                    "role": "distro",
+                    "path": "distro.erofs",
+                    "uuid": "11111111-1111-1111-1111-111111111111",
+                }
+            ],
+            "scratch": "scratch.ext4",
+            "hostname": "nvx-sandbox",
+            "workload_uid": 65534,
+            "workload_gid": 65534,
+            "memory_max": None,
+            "pids_max": None,
+            "mounts": [entry("/workspace", "work"), entry("/tools", "tools")],
+        }
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        def unchanged(mount: sandbox.SandboxMount) -> sandbox.SandboxMount:
+            return mount
+
+        def identity(path: Path) -> tuple[int, int]:
+            return 0, hash(path)
+
+        with (
+            patch.object(sandbox, "require_file", side_effect=require),
+            patch.object(sandbox.SandboxMount, "validated", unchanged),
+            patch.object(sandbox, "_directory_identity", side_effect=identity),
+        ):
+            launch = sandbox_lifecycle._deserialize_launch(config)
+            self.assertEqual(
+                [mount.guest_target for mount in launch.mounts],
+                ["/workspace", "/tools"],
+            )
+            # Format 4 always holds several shares, and only format 4 does.
+            config["mounts"] = [entry("/workspace", "work")]
+            with self.assertRaisesRegex(common.ScriptError, "does not match"):
+                sandbox_lifecycle._deserialize_launch(config)
+            config["mounts"] = {"guest_target": "/workspace"}
+            with self.assertRaisesRegex(common.ScriptError, "malformed"):
+                sandbox_lifecycle._deserialize_launch(config)
+            config["mounts"] = [entry("/workspace", "work"), entry("/a", "a", "caller")]
+            with self.assertRaisesRegex(common.ScriptError, "same --mount-owner"):
+                sandbox_lifecycle._deserialize_launch(config)
+            config["mounts"] = [entry("/workspace", "work"), entry("/workspace", "b")]
+            with self.assertRaisesRegex(common.ScriptError, "overlap"):
+                sandbox_lifecycle._deserialize_launch(config)
+            config["format"] = sandbox_lifecycle.MOUNT_CONFIG_FORMAT
+            config["mounts"] = [entry("/workspace", "work"), entry("/tools", "tools")]
+            with self.assertRaisesRegex(common.ScriptError, "does not match"):
+                sandbox_lifecycle._deserialize_launch(config)
+
     def test_managed_lifecycle_persists_and_replays_mount(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -9750,8 +10460,10 @@ class SandboxTests(unittest.TestCase):
                             ),
                         ),
                         scratch=scratch_path,
-                        mount=sandbox.SandboxMount.parse(
-                            "/workspace,share,rw", ("secrets",)
+                        mounts=(
+                            sandbox.SandboxMount.parse(
+                                "/workspace,share,rw", ("secrets",)
+                            ),
                         ),
                     ),
                     hypervisor="whp",
@@ -9843,7 +10555,7 @@ class SandboxTests(unittest.TestCase):
         with (
             patch.object(sandbox, "require_file", side_effect=require),
         ):
-            self.assertIsNone(sandbox_lifecycle._deserialize_launch(config).mount)
+            self.assertEqual(sandbox_lifecycle._deserialize_launch(config).mounts, ())
             config["format"] = sandbox_lifecycle.MOUNT_CONFIG_FORMAT
             with self.assertRaisesRegex(common.ScriptError, "does not match"):
                 sandbox_lifecycle._deserialize_launch(config)
@@ -9905,20 +10617,17 @@ class SandboxTests(unittest.TestCase):
         ):
             # A share configured before ownership modes runs as the VMM.
             launch = sandbox_lifecycle._deserialize_launch(config)
-            assert launch.mount is not None
-            self.assertEqual(launch.mount.owner, "vmm")
+            self.assertEqual(launch.mounts[0].owner, "vmm")
             mount["owner"] = "vmm"
             launch = sandbox_lifecycle._deserialize_launch(config)
-            assert launch.mount is not None
-            self.assertEqual(launch.mount.owner, "vmm")
+            self.assertEqual(launch.mounts[0].owner, "vmm")
             # Only format 3, which older releases reject, carries caller ownership.
             mount["owner"] = "caller"
             with self.assertRaisesRegex(common.ScriptError, "does not match"):
                 sandbox_lifecycle._deserialize_launch(config)
             config["format"] = sandbox_lifecycle.OWNER_CONFIG_FORMAT
             launch = sandbox_lifecycle._deserialize_launch(config)
-            assert launch.mount is not None
-            self.assertEqual(launch.mount.owner, "caller")
+            self.assertEqual(launch.mounts[0].owner, "caller")
             mount["owner"] = "vmm"
             with self.assertRaisesRegex(common.ScriptError, "does not match"):
                 sandbox_lifecycle._deserialize_launch(config)
@@ -9947,8 +10656,8 @@ class SandboxTests(unittest.TestCase):
                     ),
                 ),
                 scratch=scratch_path,
-                mount=sandbox.SandboxMount.parse(
-                    f"/workspace,{share},rw", (), "caller"
+                mounts=(
+                    sandbox.SandboxMount.parse(f"/workspace,{share},rw", (), "caller"),
                 ),
             )
 

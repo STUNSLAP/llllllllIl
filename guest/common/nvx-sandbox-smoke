@@ -136,13 +136,40 @@ check_share_symlinks() {
     echo "NVX-UBUNTU-SANDBOX-SYMLINK-OK target=$share"
 }
 
+# A share's access mode holds whichever share a path reaches it through: a
+# link in the read-write share cannot write into the read-only share.
+check_shares_isolated() {
+    rw_share=$1
+    ro_share=$2
+    ln -s "$ro_share/nvx-host-marker" "$rw_share/nvx-cross-share-link"
+    if (printf 'cross-share\n' >"$rw_share/nvx-cross-share-link") 2>/dev/null; then
+        exit 1
+    fi
+    [ "$(cat "$ro_share/nvx-host-marker")" = host-to-guest ]
+    rm "$rw_share/nvx-cross-share-link"
+    echo "NVX-UBUNTU-SANDBOX-SHARES-ISOLATED-OK rw=$rw_share ro=$ro_share"
+}
+
 [ "$(id -u)" = 65534 ]
 [ "$(id -g)" = 65534 ]
 [ "${HOME:-}" = /nonexistent ]
 grep -qx 'ID=ubuntu' /etc/os-release
 printf 'scratch-backed-write\n' >/tmp/nvx-ubuntu-sandbox-smoke
 [ "$(cat /tmp/nvx-ubuntu-sandbox-smoke)" = scratch-backed-write ]
-if [ "$#" -gt 0 ]; then
-    check_share "$1" "${2:-ro}"
+# Each share is a TARGET MODE pair; a final TARGET alone is read-only.
+rw_share=
+ro_share=
+while [ "$#" -gt 0 ]; do
+    share_mode=${2:-ro}
+    check_share "$1" "$share_mode"
+    case "$share_mode" in
+        rw) [ -n "$rw_share" ] || rw_share=$1 ;;
+        ro) [ -n "$ro_share" ] || ro_share=$1 ;;
+    esac
+    shift
+    [ "$#" -eq 0 ] || shift
+done
+if [ -n "$rw_share" ] && [ -n "$ro_share" ]; then
+    check_shares_isolated "$rw_share" "$ro_share"
 fi
 echo "NVX-UBUNTU-SANDBOX-OK uid=65534 gid=65534"
