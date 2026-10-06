@@ -31,12 +31,15 @@ Python 3.10 or newer and Git are required on every platform.
 
 By default, a microVM boots on the built-in
 [CPU profile](usage.md#cpu-profiles) of its host's CPU, so the host needs a CPU
-that one of OpenVMM's built-in profiles serves. On another Intel CPU,
+that one of OpenVMM's built-in profiles serves, four Intel generations and
+AMD's EPYC Milan, on a hypervisor that supports that profile. On another
+Intel or AMD CPU, or where the hypervisor does not support the built-in
+profile (`E_PROFILE_UNSUPPORTED`, whose message names this option),
 `nvx.py run --cpu-profile host` opts in to a development profile derived from
 the host, which OpenVMM verifies as it verifies a built-in profile: the cold
 boot still fails with `E_PROFILE_UNSUPPORTED` if the hypervisor lacks a CPU
-feature that the time ABI requires. AMD CPUs have no CPU profiles yet
-([#396](https://github.com/microsoft/nvx/issues/396)).
+feature that the time ABI requires. CPUs of other vendors have no CPU
+profiles.
 
 For Debian/Ubuntu hosts:
 

@@ -135,6 +135,20 @@ class FieldParsingTests(unittest.TestCase):
         self.assertIsNone(name(140, 1))
         self.assertIsNone(name(183, 1))
         self.assertIsNone(name(1, 1, "AuthenticAMD"))
+        # Milan's profile serves every stepping of AMD's family 25 model 1,
+        # Milan-X's 2 included, and no other vendor's CPU with its signature.
+        for stepping in (0, 1, 2, 15):
+            generation = time_abi.cpu_generation("AuthenticAMD", 25, 1, stepping)
+            assert generation is not None
+            self.assertEqual(generation.name, "milan")
+        for vendor, family, model in (
+            ("AuthenticAMD", 25, 17),
+            ("AuthenticAMD", 25, 33),
+            ("GenuineIntel", 25, 1),
+            ("HygonGenuine", 25, 1),
+        ):
+            with self.subTest(vendor=vendor, family=family, model=model):
+                self.assertIsNone(time_abi.cpu_generation(vendor, family, model, 1))
 
     def test_names_the_catalog_profiles(self):
         # One profile per generation serves every backend.
@@ -145,12 +159,13 @@ class FieldParsingTests(unittest.TestCase):
                 "intel.icelake-sp.v1",
                 "intel.emeraldrapids.v1",
                 "intel.alderlake.v1",
+                "amd.milan.v1",
             ],
         )
         self.assertEqual(
             time_abi.describe_cpu_generations(),
             "skylake-sp 6/85 steppings 0-4, icelake-sp 6/106, emeraldrapids 6/207, "
-            "alderlake 6/151 and 6/154",
+            "alderlake 6/151 and 6/154, milan 25/1",
         )
 
     def test_the_catalog_copy_matches_openvmm_pinned_profiles(self):
@@ -226,7 +241,9 @@ class FieldParsingTests(unittest.TestCase):
         for profile_id, catalog, host in (
             ("intel.icelake-sp.v1", True, False),
             ("intel.raptorlake.v2", True, False),
+            ("amd.milan.v1", True, False),
             ("intel.host.v1", False, True),
+            ("amd.host.v1", False, True),
             # Host profile IDs take the revision syntax of every profile ID.
             ("intel.host.v0", False, False),
             ("interim.host.kvm.v1", False, False),
@@ -261,10 +278,11 @@ class FieldParsingTests(unittest.TestCase):
         # for another reason, which OpenVMM's own error explains.
         self.assertIsNone(time_abi.host_cpu_unsupported_guidance("host", tiger_lake))
 
-        # Host profiles cannot serve an AMD CPU either: no suggestion, with
-        # either request, and the issue that tracks AMD CPUs.
-        zen4 = time_abi.HostCpu("AuthenticAMD", 25, 17, 1)
-        guidance = time_abi.host_cpu_unsupported_guidance(None, zen4)
+        # Host profiles serve AMD CPUs too: an AMD CPU without a built-in
+        # profile, such as Genoa, gets the same suggestion as an Intel one,
+        # and the issue that tracks profiles for more AMD CPUs.
+        genoa = time_abi.HostCpu("AuthenticAMD", 25, 17, 1)
+        guidance = time_abi.host_cpu_unsupported_guidance(None, genoa)
         assert guidance is not None
         self.assertIn(
             "this host's CPU, AuthenticAMD 25/17/1, so a cold boot with "
@@ -273,27 +291,33 @@ class FieldParsingTests(unittest.TestCase):
             guidance,
         )
         self.assertIn(time_abi.describe_cpu_generations(), guidance)
-        self.assertNotIn("rerun with", guidance)
-        self.assertIn("host CPU profiles serve only Intel CPUs", guidance)
+        self.assertIn("rerun with --cpu-profile host", guidance)
         self.assertIn("https://github.com/microsoft/nvx/issues/396", guidance)
         self.assertNotIn("issues/390", guidance)
-        self.assertEqual(guidance, time_abi.host_cpu_unsupported_guidance("host", zen4))
-        # Another vendor gets the general issue.
-        guidance = time_abi.host_cpu_unsupported_guidance(
-            "auto", time_abi.HostCpu("HygonGenuine", 24, 0, 1)
-        )
+        self.assertIsNone(time_abi.host_cpu_unsupported_guidance("host", genoa))
+        # Another vendor gets no suggestion, with either request.
+        hygon = time_abi.HostCpu("HygonGenuine", 24, 0, 1)
+        guidance = time_abi.host_cpu_unsupported_guidance("auto", hygon)
         assert guidance is not None
-        self.assertIn("host CPU profiles serve only Intel CPUs", guidance)
+        self.assertNotIn("rerun with", guidance)
+        self.assertIn("host CPU profiles serve only Intel and AMD CPUs", guidance)
         self.assertIn("https://github.com/microsoft/nvx/issues/390", guidance)
+        self.assertEqual(
+            guidance, time_abi.host_cpu_unsupported_guidance("host", hygon)
+        )
 
         # A CPU that a built-in profile serves, an explicit profile, and an
         # unknown CPU get none.
         alder_lake = time_abi.HostCpu("GenuineIntel", 6, 154, 3)
+        milan = time_abi.HostCpu("AuthenticAMD", 25, 1, 1)
         for cpu_profile, host in (
             (None, alder_lake),
             ("host", alder_lake),
+            (None, milan),
+            ("host", milan),
             ("intel.alderlake.v1", tiger_lake),
-            ("intel.alderlake.v1", zen4),
+            ("intel.alderlake.v1", genoa),
+            ("intel.skylake-sp.v1", milan),
             (None, None),
         ):
             with self.subTest(cpu_profile=cpu_profile, host=host):
